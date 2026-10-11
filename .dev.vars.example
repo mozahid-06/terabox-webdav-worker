@@ -4,10 +4,11 @@
 # WebDAV basic auth credentials (comma/newline separated "user:password").
 USERS=user:password
 
-# Terabox session cookie: the FULL browser cookie string (ndus + stoken +
-# lang + …). A bare ndus value is gated by Terabox now (400141). Copy it
-# from your logged-in browser session on www.terabox.com.
-COOKIE=ndus=REPLACE_ME; stoken=REPLACE_ME; lang=en
+# Terabox session cookie: paste the FULL browser cookie string — a bare ndus
+# value is gated by Terabox now (400141). `stoken` in it is NOT required
+# (verified 2026-10-11) but harmless. Copy it from your logged-in browser
+# session on www.terabox.com.
+COOKIE=ndus=REPLACE_ME; lang=en
 
 # Optional: alternate Terabox mirror host. Defaults to https://www.terabox.com.
 # TERABOX_DOMAIN=https://www.terabox.com

@@ -34,7 +34,7 @@ is an ordinary (optional) Variable:
 | Key | Type | Example | Notes |
 | --- | --- | --- | --- |
 | `USERS` | **Secret** | `alice:s3cret,bob:hunter2` | comma/newline separated `user:pass` pairs |
-| `COOKIE` | **Secret** | `ndus=...; stoken=...; lang=en` | **full** Terabox cookie string from your browser (all cookies — `stoken` matters for uploads) |
+| `COOKIE` | **Secret** | `ndus=...; lang=en` | Terabox session cookie (bare `ndus` accepted). `stoken` is **not** required — uploads verified live without it (see `docs/terabox-limits.md` §5) |
 | `JSTOKEN` | **Secret**, optional | `a1b2c3...` | pre-minted `window.jsToken` from the terabox.com console (same as Alist/CLI); skips automatic minting |
 | `TERABOX_DOMAIN` | Variable, optional | `https://dm.terabox.com` | origin mirror (default `https://www.terabox.com`). **Regional accounts must set their own** — the wrong origin rejects the cookie with `errno -6`; upload clusters come from this origin's locateupload |
 | `MIN_GAP_MS` | Variable, optional | `400` | pacing between Terabox calls (default `400`; bclone parity) |
@@ -181,4 +181,4 @@ The test-suite mocks the Terabox API behind a stubbed global fetch, so the
 whole stack (auth, routing, WebDAV, uploads) is exercised without a real
 account. You still need a real Terabox session cookie to try a live account —
 the **full** browser cookie string (a bare `ndus` value is gated by Terabox
-now; `stoken` matters for uploads).
+now; `stoken` in it is **not** required — verified 2026-10-11).

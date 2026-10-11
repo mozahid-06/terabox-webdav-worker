@@ -118,7 +118,10 @@ for dashboard deploy, retested):
   cssxsh/baidu-client `OTHER.md`, bypy#511). Not a wrong-cluster error:
   all `c*-jp` clusters reject the `ndus`-only cookie; www APIs accept it.
   **Alist/OpenList/TeraboxUploaderCLI all have users paste the FULL browser
-  cookie (ndus + stoken + BAIDUID …).**
+  cookie (ndus + stoken + BAIDUID …).** — **superseded 2026-10-11**: a
+  cookie with no `stoken` ran precreate → superfile2 → create to `errno 0`
+  on the `dm*` cluster; the `31045`/cluster rejection is an origin problem,
+  not a missing `stoken` (see "Root cause found" below).
 - **jsToken minting** (`GET /` → `window.jsToken` snippet) is IP/session
   sensitive: the root answers 302 `/simple-verify` when gated. Mitigations
   now in code: optional `JSTOKEN` secret (paste `window.jsToken`, Alist/CLI
