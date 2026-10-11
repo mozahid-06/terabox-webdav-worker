@@ -27,6 +27,7 @@ import type { Dentry, TeraboxItem } from './types';
 export function resetDavVolatileState(): void {
   resetDavStoreState();
   metaCache.clear();
+  dlUrlCache.clear();
   metaGenState.value = -1;
   metaGenState.checkedAt = 0;
 }
@@ -453,6 +454,72 @@ async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<T
 }
 
 /**
+ * Read-side download-URL cache — the final signed CDN URL from the last
+ * successful ladder walk, remembered so repeat GETs (video reopen, player
+ * seeks) skip the whole mint chain: no filemetas re-mint, no PCS round-trip,
+ * no API pacing floor. That chain is 2.5-4+ s of TTFB per open; a cache hit
+ * is one direct CDN fetch.
+ *
+ * Entries are keyed by path but validated against the item's identity
+ * (fs_id + size + mtime) that metaCache already carries — so an external
+ * rewrite (seen through a fresh meta within 60 s) can never be served from a
+ * stale URL, keeping the 60 s staleness contract exactly as before. Writes
+ * through this worker invalidate immediately via the same hooks and the DO
+ * generation bump as metaCache. The signed URL itself self-heals: any
+ * upstream refusal drops the entry and re-walks the ladder, so TTL is a
+ * memory bound (30 min of disuse), not a correctness deadline.
+ */
+const DLURL_TTL_MS = 30 * 60_000;
+/** Hard cap mirroring metaCache: FIFO eviction, a few hundred bytes per
+ *  entry — 1000 entries stays well under a megabyte. */
+const DLURL_MAX_ENTRIES = 1000;
+interface DlUrlEntry {
+  url: string;
+  fsId: string;
+  size: number;
+  mtimeMs: number;
+  expires: number;
+}
+const dlUrlCache = new Map<string, DlUrlEntry>();
+
+/** Insert through the same sweep + FIFO discipline as metaCache. */
+function dlUrlCacheWrite(absPath: string, item: TeraboxItem, url: string): void {
+  const now = Date.now();
+  for (const [key, entry] of dlUrlCache) {
+    if (entry.expires <= now) dlUrlCache.delete(key);
+  }
+  while (dlUrlCache.size >= DLURL_MAX_ENTRIES) {
+    const oldest = dlUrlCache.keys().next();
+    if (oldest.done) break;
+    dlUrlCache.delete(oldest.value);
+  }
+  dlUrlCache.set(absPath, {
+    url,
+    fsId: String(item.fs_id ?? ''),
+    size: item.size || 0,
+    mtimeMs: safeMtimeSeconds(item) * 1000,
+    expires: now + DLURL_TTL_MS,
+  });
+}
+
+/** Validated lookup: the entry's identity must match the item about to be
+ *  served, else it is dropped and the ladder re-walks. */
+function dlUrlCacheGet(absPath: string, item: TeraboxItem): string | undefined {
+  const entry = dlUrlCache.get(absPath);
+  if (!entry) return undefined;
+  const valid =
+    entry.expires > Date.now() &&
+    entry.fsId === String(item.fs_id ?? '') &&
+    entry.size === (item.size || 0) &&
+    entry.mtimeMs === safeMtimeSeconds(item) * 1000;
+  if (!valid) {
+    dlUrlCache.delete(absPath);
+    return undefined;
+  }
+  return entry.url;
+}
+
+/**
  * Drop a mutated path, everything beneath it, and the parent's own entry —
  * then bump the generation held in the Durable Object so every OTHER isolate
  * drops its own copy too. The read cache is per isolate, so without that bump
@@ -466,10 +533,14 @@ async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<T
  */
 async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> {
   metaCache.delete(absPath);
+  dlUrlCache.delete(absPath);
   const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
   for (const key of [...metaCache.keys()]) if (key.startsWith(prefix)) metaCache.delete(key);
+  for (const key of [...dlUrlCache.keys()]) if (key.startsWith(prefix)) dlUrlCache.delete(key);
   const slash = absPath.lastIndexOf('/');
-  metaCache.delete(slash <= 0 ? '/' : absPath.slice(0, slash));
+  const parent = slash <= 0 ? '/' : absPath.slice(0, slash);
+  metaCache.delete(parent);
+  dlUrlCache.delete(parent);
   if (!store) return;
   try {
     await store.metaGeneration(true);
@@ -499,7 +570,10 @@ async function syncMetaGeneration(store: DavStore): Promise<void> {
   metaGenState.checkedAt = now;
   try {
     const gen = await store.metaGeneration(false);
-    if (metaGenState.value !== -1 && gen !== metaGenState.value) metaCache.clear();
+    if (metaGenState.value !== -1 && gen !== metaGenState.value) {
+      metaCache.clear();
+      dlUrlCache.clear();
+    }
     metaGenState.value = gen;
   } catch {
     // advisory only — see doc comment
@@ -1776,12 +1850,20 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   }
 
   let lastError: unknown = new TeraboxError(-5, 'No usable download link');
+  /** Final post-302 capability URL of the last fetch that got a verdict —
+   *  set per tryUrl call, so a truthy tryUrl result always pairs with the
+   *  URL that actually served (the download-URL cache keys on that). */
+  let servedUrl: string | undefined;
   /** Try one candidate; resolves the ready-to-stream Response or records why it failed. */
-  const tryUrl = async (downloadUrl: string): Promise<Response | undefined> => {
+  const tryUrl = async (
+    downloadUrl: string,
+    opts?: { resolved?: boolean },
+  ): Promise<Response | undefined> => {
     try {
       // Paced, cookie-authenticated stream fetch: retries a jsToken gate once
       // and raises an errno-shaped body as TeraboxError instead of streaming it.
-      const upstream = await client.fetchDownload(downloadUrl, range);
+      const { response: upstream, finalUrl } = await client.fetchDownload(downloadUrl, range, opts);
+      servedUrl = finalUrl;
       if (upstream.status === 416) {
         // Range not satisfiable: pass the CDN's verdict through instead of
         // burning the remaining ladder phases on ranges it will also refuse.
@@ -1850,13 +1932,30 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     }
   };
 
+  /** A candidate that served: remember its capability URL so the next open
+   *  skips the mint chain (identity-validated, write-invalidated, self-healing). */
+  const serveSucceeded = (res: Response): Response => {
+    if (servedUrl) dlUrlCacheWrite(absPath, item, servedUrl);
+    return res;
+  };
+
+  // Phase 0: a previously served capability URL — one direct CDN fetch, no
+  // filemetas re-mint, no PCS round-trip, no pacing floor. Dropped on any
+  // refusal so the ladder below (and a refreshed cache entry) takes over.
+  const cachedUrl = dlUrlCacheGet(absPath, item);
+  if (cachedUrl) {
+    const res = await tryUrl(cachedUrl, { resolved: true });
+    if (res) return serveSucceeded(res);
+    dlUrlCache.delete(absPath);
+  }
+
   // Phase 1: the PCS app-protocol route (mobile/desktop parity) — cookie in,
   // 302 straight to the CDN, no /file/<hash> dlink hop (that hop gates
   // datacenter IPs with 400141 "need verify"). No minting, so the happy path
   // costs a single upstream call.
   for (const url of client.pcsDownloadUrls(absPath)) {
     const res = await tryUrl(url);
-    if (res) return res;
+    if (res) return serveSucceeded(res);
   }
   // Phase 2: the official /api/download dlink (token-bearing, Alist parity) —
   // minted lazily so the fast path never pays for home/info + sign.
@@ -1865,7 +1964,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
       const official = await client.downloadLink(String(item.fs_id));
       if (official) {
         const res = await tryUrl(official);
-        if (res) return res;
+        if (res) return serveSucceeded(res);
       }
     } catch {
       // official mint failed (sign/home info) — the filemetas dlink still may work
@@ -1874,7 +1973,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   // Phase 3: the plain filemetas dlink; every flavour gated rethrows the last error.
   if (item.dlink) {
     const res = await tryUrl(item.dlink);
-    if (res) return res;
+    if (res) return serveSucceeded(res);
   }
   throw lastError;
 }

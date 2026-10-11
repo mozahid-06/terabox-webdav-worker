@@ -55,6 +55,12 @@ export class MockTerabox {
 	/** /api/create calls that finalize a chunked upload — pins that racing
 	 *  finalizes reach upstream exactly once. */
 	createCalls = 0;
+	/** PCS app-protocol download attempts — lets tests assert the download
+	 *  ladder did (or did not) run for a given GET. */
+	pcsCalls = 0;
+	/** Direct /dl/ CDN fetches served — a repeat GET with a flat pcsCalls
+	 *  count is a download-URL cache hit. */
+	dlCalls = 0;
 
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
@@ -207,6 +213,7 @@ export class MockTerabox {
 
 		// Direct download links served by the CDN mock.
 		if (pathname.startsWith('/dl/')) {
+			this.dlCalls++;
 			const flavour = (url.searchParams.get('via') || 'plain') as 'plain' | 'official' | 'pcs';
 			const gated =
 				this.gateDl.includes(flavour) ||
@@ -470,6 +477,7 @@ export class MockTerabox {
 		// PCS app-protocol download (the ladder's first candidate): the session
 		// cookie in, 302 straight to the CDN — no /file/<hash> dlink hop.
 		if (pathname === '/rest/2.0/pcs/file' && url.searchParams.get('method') === 'download') {
+			this.pcsCalls++;
 			if (this.gatePcs) {
 				return json({ request_id: 'mock-pcs-gate', error_code: 400141, error_msg: 'need verify' });
 			}

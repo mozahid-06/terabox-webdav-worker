@@ -557,6 +557,80 @@ describe('metadata cache (read-path filemetas collapse)', () => {
 	});
 });
 
+describe('GET download-URL cache (repeat-open TTFB)', () => {
+	// After the first successful ladder walk the final signed CDN URL is
+	// remembered; repeat GETs (video reopen, player seeks) fetch it directly
+	// — no filemetas re-mint, no PCS round-trip, no pacing floor. The entry
+	// is validated against the item's identity, invalidated by writes and
+	// isolate resets, and self-heals by dropping back to the ladder when the
+	// signed URL stops working.
+	it('serves a repeat GET directly from the cached CDN URL — no ladder round-trip', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		expect(tb.filemetasCalls).toBe(1);
+		expect(tb.dlCalls).toBe(2);
+	});
+
+	it('forwards Range on the cached URL (player seeks skip the ladder)', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		const ranged = await request('/a.txt', { headers: { Range: 'bytes=0-2' } });
+		expect(ranged.status).toBe(206);
+		expect(await ranged.text()).toBe('the');
+		expect(ranged.headers.get('Content-Range')).toBe(
+			`bytes 0-2/${tb.find('/a.txt')!.size}`,
+		);
+		expect(tb.pcsCalls).toBe(1);
+	});
+
+	it('re-runs the ladder when the file identity changed (fs_id/mtime)', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		// Unchanged identity: served straight from the cache.
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		// An external rewrite landed on Terabox: fresh meta shows a new
+		// identity, so the cached URL must not serve it.
+		metaCacheSeedForTest('/a.txt', { ...tb.find('/a.txt')!, server_mtime: 9_999_999 });
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(2);
+	});
+
+	it('drops a gated cached URL, re-walks the ladder and serves the refresh', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		// The cached via=pcs URL stops working (live 400141 "need verify").
+		tb.gateDl = ['pcs'];
+		expect((await request('/a.txt')).status).toBe(200);
+		// The refreshed entry now answers without touching the ladder again.
+		const before = tb.pcsCalls;
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(before);
+	});
+
+	it('invalidates the cached URL on writes through the worker', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		const put = await request('/a.txt', { method: 'PUT', body: 'new bytes' });
+		expect(put.status).toBe(204);
+		const res = await request('/a.txt');
+		expect(await res.text()).toBe('new bytes');
+		expect(tb.pcsCalls).toBe(2);
+	});
+
+	it('resetDavVolatileState clears the URL cache (test isolation)', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(1);
+		resetDavVolatileState();
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.pcsCalls).toBe(2);
+	});
+});
+
 describe('PUT and MKCOL parents', () => {
 	it('PUT to a new file returns 201', async () => {
 		const res = await request('/put-new.txt', {

@@ -176,3 +176,25 @@ describe('upstream network failures stay TeraboxErrors (lockbomb 500 fix)', () =
 		expect(signals[0]).toBeInstanceOf(AbortSignal);
 	});
 });
+
+describe('fetchDownload resolved URLs (download-URL cache path)', () => {
+	it('fetches a resolved URL verbatim — no browser rewrite, and reports the final URL', async () => {
+		// The cache stores the final post-302 capability URL: re-running the
+		// browser /file/ host rewrite on it would send the fetch somewhere the
+		// bytes never came from, so the resolved flag must bypass it.
+		const seen: string[] = [];
+		vi.stubGlobal('fetch', async (input: unknown) => {
+			seen.push(String(input));
+			return new Response('bytes', { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		const { response, finalUrl } = await client.fetchDownload(
+			'https://d.mock.terabox.com/file/abc',
+			undefined,
+			{ resolved: true },
+		);
+		expect(seen[0]).toBe('https://d.mock.terabox.com/file/abc');
+		expect(finalUrl).toBe('https://d.mock.terabox.com/file/abc');
+		expect(response.status).toBe(200);
+	});
+});

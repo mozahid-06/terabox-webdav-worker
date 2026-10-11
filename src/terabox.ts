@@ -729,10 +729,18 @@ export class TeraboxClient {
    * it becomes a TeraboxError stamped with `dlink@<host>` so live failures
    * name the exact host that gated.
    */
-  async fetchDownload(url: string, range?: string | null): Promise<Response> {
+  async fetchDownload(
+    url: string,
+    range?: string | null,
+    opts: { resolved?: boolean } = {},
+  ): Promise<{ response: Response; finalUrl: string }> {
     // Follow the browser: fetch the rewritten main-origin URL, not the gated
-    // <prefix>-d data-gateway host the raw dlink points at.
-    url = browserDlinkUrl(url, new URL(this.baseUrl).hostname);
+    // <prefix>-d data-gateway host the raw dlink points at. A `resolved` URL
+    // is a final post-302 capability URL recalled by the download-URL cache:
+    // it was never a raw dlink, so the browser /file/ rewrite must not touch
+    // it — re-running the rewrite would send the fetch somewhere the bytes
+    // never came from.
+    if (!opts.resolved) url = browserDlinkUrl(url, new URL(this.baseUrl).hostname);
     let lastError: TeraboxError | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       let target = url;
@@ -753,19 +761,24 @@ export class TeraboxClient {
       };
       if (range) headers['Range'] = range;
 
-      await this.pace(); // rate-limit guard before the download stream too
+      // API-origin pacing guard before the stream. A resolved capability URL
+      // is a CDN host outside the API rate domain: pacing it would only add
+      // the 400 ms floor to every repeat open, which is the TTFB this cache
+      // exists to remove.
+      if (!opts.resolved) await this.pace();
       let response: Response;
       let finalUrl = target;
       try {
         response = await fetch(target, { headers, redirect: 'manual' });
         // Follow the CDN hop ourselves: the redirect target is a capability
         // URL that serves bytes with no session, so only the UA (and Range)
-        // cross the hop.
+        // cross the hop. No pacing here: the capability host is not the API
+        // origin, and the 400 ms floor it used to pay was pure added TTFB
+        // on every cold open.
         for (let hop = 0; response.status >= 300 && response.status < 400 && hop < 4; hop++) {
           const location = response.headers.get('Location');
           if (!location) break;
           finalUrl = new URL(location, finalUrl).toString();
-          await this.pace();
           const hopHeaders: Record<string, string> = { 'User-Agent': WEB_USER_AGENT, Accept: '*/*' };
           if (range) hopHeaders['Range'] = range;
           response = await fetch(finalUrl, { headers: hopHeaders, redirect: 'manual' });
@@ -779,7 +792,7 @@ export class TeraboxClient {
 
       const host = downloadHost(finalUrl, target);
       const verdict = await this.classifyDownload(response, host);
-      if (!verdict.error) return verdict.response;
+      if (!verdict.error) return { response: verdict.response, finalUrl };
       if (attempt === 0 && JS_TOKEN_ERRORS.has(verdict.error.errno)) {
         lastError = verdict.error;
         continue; // remedy: fresh jsToken, exactly like the API retry

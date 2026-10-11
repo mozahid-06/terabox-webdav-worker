@@ -30,14 +30,14 @@ service from Cloudflare.
 | jsToken | mintable from any root page (`/main?category=all`, `about`, `privacy`) with desktop `sec-ch-ua` headers; 128 hex chars | worker mints + caches (`JS_TOKEN_CACHE`, 5 min TTL), refreshes on `4000023` / `450016` |
 | Missing token | `filemanager` without jsToken → `450016 need verify` (HTTP 200 body) | worker always attaches token |
 | **IP-reputation gate (400141)** | **web dlink path (`/file/<hash>`) answers `400141 need verify` from datacenter IPs on every origin and flavour — plain `filemetas` dlink, `origin=dlna`, official `/api/download` token dlink, even host-rewritten browser URLs. A fresh jsToken does not clear it.** | **solved**: download uses the app-protocol **PCS route** `/rest/2.0/pcs/file?method=download` which 302s to CDN with no jsToken/sign (see §3) |
-| Rate on API | ~1 req / 400 ms → a paced 3-step GET ≈ 2.9 s TTFB (measured) | ladder is lazy: extra phases only run if a phase fails |
+| Rate on API | ~1 req / 400 ms → a paced 3-step GET ≈ 2.7 s **cold** TTFB (measured); repeat opens hit the download-URL cache instead (~0.12 s) | ladder is lazy: extra phases only run if a phase fails; CDN hops are unpaced (not the API origin) |
 | jsToken ↔ IP/session | refreshing it from a different IP invalidates the session context; keep it same-IP | worker mints from its own egress only |
 
 ## 3. Download paths
 
 - **Two-hop shape**: signed dlink `/api/.../file/<hash>` → **302** → CDN
   capability URL. The CDN hop needs **no cookie at all**; the signed hop does.
-- **Expiry**: `filemetas` dlinks ≈ **8 h**, official `/api/download` dlinks ≈ **1 h** (measured). The worker mints on demand — no URL cache yet (each GET re-mints; ~2.9 s TTFB).
+- **Expiry**: `filemetas` dlinks ≈ **8 h**, official `/api/download` dlinks ≈ **1 h** (measured). The worker mints on demand but then **caches the final signed CDN capability URL** (per isolate, identity-validated, self-healing — §6): a cold GET pays the ladder (~2.7 s), every repeat open is one direct CDN fetch (~0.12 s).
 - **Gate** (above): from datacenter IPs only the **PCS app-protocol route** survives:
   `GET /rest/2.0/pcs/file?method=download&app_id=250528&path=<path>` + session
   cookie → immediate `302` to CDN. Same route family as `locateupload`
@@ -52,7 +52,10 @@ service from Cloudflare.
   - 4 parallel `Range` GETs: all `206`, parts reassemble to the correct md5;
     aggregate ≈ same link cap (~1.4–1.8 MB/s) — bandwidth to the CDN appears
     capped per path, so extra transfers cut latency, not total time
-  - TTFB ≈ **2.9 s** = the three paced API hops; the byte stream itself is not throttled
+  - TTFB: **≈2.7 s cold** (filemetas → PCS → CDN hop, hop unpaced) vs
+    **≈0.12 s on repeat open** and **≈0.96 s after the 60 s meta expiry**
+    (measured 2026-10-11, Range 0-0 probe) — the byte stream itself is not
+    throttled
   - this is a **TeraBox free-tier CDN/account** speed, identical for every
     client; the worker adds zero per-byte delay (pacing is per *call*, not per byte)
   - **Worker Placement cannot raise it** (tested 2026-10-11): Smart never
@@ -143,8 +146,15 @@ service from Cloudflare.
   The Google Drive worker auto-creates parents on PUT/MKCOL instead; this
   worker follows the RFC (litmus `basic` 16/16) — clients build the tree
   level by level, which every mainstream WebDAV client already does.
-- **Lazily re-minted dlinks / TTFB**: no isolate-global dlink cache yet; would
-  be a worker optimization (cache signed URLs up to min(1 h, 8 h) expiry).
+- **Download-URL cache (shipped 2026-10-11, was "TTFB / no URL cache")**:
+  the final signed CDN capability URL from a successful ladder walk is kept
+  per isolate (30 min TTL, FIFO 1000) and replayed directly on the next GET —
+  no filemetas re-mint, no PCS round-trip, no pacing floor. Entries are
+  validated against the served item's `fs_id` + size + mtime (the 60 s meta
+  staleness contract is unchanged), dropped by the same write-invalidation
+  hooks and DO generation bump as `metaCache`, and any upstream refusal
+  self-heals by falling back to the ladder. Measured: repeat-open TTFB
+  2.4-5.1 s → **0.12-0.24 s**.
 - **No parallel-range bandwidth gain**: limited by the CDN path cap, not by the
   worker.
 
