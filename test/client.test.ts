@@ -238,3 +238,89 @@ describe('account-wide slot reserver (pace hook)', () => {
 		expect(calls).toBe(1);
 	});
 });
+
+describe('resolved fetches honour the session cookie boundary (review R14 #1)', () => {
+	it('omits Cookie/Referer on a post-hop capability replay, keeps them on every credentialed path', async () => {
+		// The session cookie only ever crosses to API origins: the hop loop's
+		// UA-only headers are the documented shape. A cached post-302 URL
+		// lives on the CDN host, so replaying it with the cookie would leak
+		// the session off-origin — while a cached URL that never hopped (or
+		// the ladder's own first fetch) still NEEDS the cookie or the gate 403s.
+		const seen: Array<{ url: string; cookie: string | null; referer: string | null; ua: string | null }> = [];
+		vi.stubGlobal('fetch', async (input: unknown, init?: { headers?: Record<string, string> }) => {
+			seen.push({
+				url: String(input),
+				cookie: init?.headers?.['Cookie'] ?? null,
+				referer: init?.headers?.['Referer'] ?? null,
+				ua: init?.headers?.['User-Agent'] ?? null,
+			});
+			return new Response('bytes', { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=secret', BASE, { minGapMs: 0 });
+
+		// (A) cookieless capability URL (post-302 CDN hop): no credentials.
+		await client.fetchDownload('https://kul-cdn.example/file/real', null, {
+			resolved: true,
+			cookieless: true,
+		});
+		expect(seen[0]!.cookie).toBeNull();
+		expect(seen[0]!.referer).toBeNull();
+		expect(seen[0]!.ua).toBeTruthy();
+
+		// (B) a resolved URL that never hopped still answers only to the session.
+		await client.fetchDownload('https://dm.terabox.com/file/abc', null, {
+			resolved: true,
+			cookieless: false,
+		});
+		expect(seen[1]!.cookie).toContain('ndus=secret');
+		expect(seen[1]!.referer).toBe(BASE);
+
+		// (C) the ladder's first fetch keeps its credentials (no over-correction).
+		await client.fetchDownload('https://dm.terabox.com/file/abc');
+		expect(seen[2]!.cookie).toContain('ndus=secret');
+	});
+
+	it('makes no jsToken remedy attempt for a resolved replay — one fetch, then the ladder owns recovery', async () => {
+		// A resolved URL is a post-verification artifact: re-walking the ladder
+		// is the correct remedy for a gate, not a token mint against a URL that
+		// was minted under a previous token.
+		let calls = 0;
+		vi.stubGlobal('fetch', async () => {
+			calls++;
+			return new Response(JSON.stringify({ request_id: 'r1', errno: 400141, errmsg: 'need verify' }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await expect(
+			client.fetchDownload('https://kul-cdn.example/file/real', null, { resolved: true, cookieless: true }),
+		).rejects.toThrow();
+		expect(calls).toBe(1);
+	});
+
+	it('bounds the header phase of a resolved replay so a hanging URL aborts into the ladder (review R14 #2)', async () => {
+		// A cached URL that accept-then-hangs must not stick for the cache TTL:
+		// there is no retry left once the cache exists. The timer covers only
+		// the header phase — it clears before the body is read, so a healthy
+		// 70 MB stream is never raced against it.
+		let capturedSignal: AbortSignal | undefined;
+		vi.stubGlobal('fetch', async (_input: unknown, init?: { signal?: AbortSignal | null }) => {
+			capturedSignal = init?.signal ?? undefined;
+			return new Promise<Response>((_resolve, reject) => {
+				const signal = init?.signal;
+				if (!signal) return; // never settles — the assertion below fails first
+				signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+			});
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		const pending = client.fetchDownload('https://kul-cdn.example/file/hang', null, {
+			resolved: true,
+			cookieless: true,
+			headerTimeoutMs: 50,
+		});
+		await new Promise((r) => setTimeout(r, 10));
+		expect(capturedSignal).toBeInstanceOf(AbortSignal);
+		await expect(pending).rejects.toThrow();
+	});
+});

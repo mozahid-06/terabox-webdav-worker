@@ -591,15 +591,23 @@ account-wide; the isolate floor is the backstop).
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-11, post review rounds 4–13 + perf work): `main` =
+Branch state (2026-10-11, post review rounds 4–14 + perf work): `main` =
 production; deploys are **manual** `wrangler deploy` after `npm run review`
 (the optional dashboard Git integration is documented in README — do not
 assume a push deploys). Current verification: **litmus 138/138** (basic,
 copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
-**347 unit tests**. Latest shipped work: download-URL cache (repeat-open TTFB
+**350 unit tests**. Latest shipped work: download-URL cache (repeat-open TTFB
 0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
 (`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
-cap is TeraBox free-tier, colo-independent). It includes the RFC 7233 GET/ETag
+cap is TeraBox free-tier, colo-independent), review round 14 (session cookie
+never replays to a CDN host: the cookieless boundary is recorded when a URL
+hops and replayed from the cache; resolved fetches skip the jsToken remedy —
+the ladder re-mints — and run a 15 s header-phase bound so a hung capability
+URL self-heals instead of sticking for the cache TTL; DO slot test now asserts
+a delta so a stale timeline can't flake it). Note: hitting the Workers free
+tier daily quota (`Exceeded allowed rows written in Durable Objects free
+tier`) 500s EVERY request until the 00:00 UTC reset — this is environmental,
+not a code regression; wait for the reset rather than debugging. It includes the RFC 7233 GET/ETag
 conformance hardening (merged `d065d53`, deployed) and the full-repo audit
 hardening (merged `4d87f47`: traversal containment, metaCache cap, errno→status
 maps, DO-backed lock/prop tests, docs/config fixes — see the Phase 2–4 commit

@@ -34,6 +34,11 @@ const DEFAULT_MIN_GAP_MS = 400;
  *  only bounded by the transfer itself. */
 const API_TIMEOUT_MS = 30_000;
 const MINT_TIMEOUT_MS = 15_000;
+/** Header-phase bound for resolved (cache-recalled) download fetches: a
+ *  capability URL that accept-then-hangs would otherwise stick for the whole
+ *  cache TTL with no retry left. Cleared the moment headers land, so bodies
+ *  stream unbounded like every other download. */
+const RESOLVED_HEADER_TIMEOUT_MS = 15_000;
 /** Next free upstream slot, shared by every request handled by THIS isolate.
  *  Within one isolate the reservation in pace() is race-free (no await
  *  between read and write), so concurrent requests here cannot burst — but
@@ -381,7 +386,12 @@ export class TeraboxClient {
 
   /** One account-wide reservation under a hard budget: this call sits on the
    *  hot path of every upstream request, so a sick DO may delay a request by
-   *  at most API_SLOT_TIMEOUT_MS before the cooldown skips it entirely. */
+   *  at most API_SLOT_TIMEOUT_MS before the cooldown skips it entirely.
+   *  A reservation that times out still consumed its slot on the DO timeline
+   *  (the response was merely lost): later reservations queue briefly behind
+   *  a gap nobody waits on — a phantom delay. Accepted: it happens at most
+   *  once per cooldown window, the local floor already bounds the burst, and
+   *  the timeline re-syncs on the next successful reservation. */
   private reserveAccountSlot(reserver: (minGapMs: number) => Promise<number>): Promise<number> {
     return new Promise<number>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('api slot reservation timed out')), API_SLOT_TIMEOUT_MS);
@@ -776,12 +786,20 @@ export class TeraboxClient {
    * the redirect. An errno-shaped body must never stream out as file content:
    * it becomes a TeraboxError stamped with `dlink@<host>` so live failures
    * name the exact host that gated.
+   *
+   * A `resolved` replay of a post-302 capability URL passes `cookieless`
+   * (recorded at write time: a hop happened, so the final URL lives on a CDN
+   * host the session must never reach — replaying it with Cookie/Referer
+   * would leak the session off-origin). Resolved fetches skip the jsToken
+   * remedy (re-walking the ladder re-mints under the current token) and run
+   * a header-phase timeout so a hung capability URL self-heals instead of
+   * sticking for the cache TTL.
    */
   async fetchDownload(
     url: string,
     range?: string | null,
-    opts: { resolved?: boolean } = {},
-  ): Promise<{ response: Response; finalUrl: string }> {
+    opts: { resolved?: boolean; cookieless?: boolean; headerTimeoutMs?: number } = {},
+  ): Promise<{ response: Response; finalUrl: string; cookieless: boolean }> {
     // Follow the browser: fetch the rewritten main-origin URL, not the gated
     // <prefix>-d data-gateway host the raw dlink points at. A `resolved` URL
     // is a final post-302 capability URL recalled by the download-URL cache:
@@ -789,8 +807,12 @@ export class TeraboxClient {
     // it — re-running the rewrite would send the fetch somewhere the bytes
     // never came from.
     if (!opts.resolved) url = browserDlinkUrl(url, new URL(this.baseUrl).hostname);
+    const credentialLess = Boolean(opts.resolved && opts.cookieless);
     let lastError: TeraboxError | undefined;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // Resolved replays get exactly one attempt: a gate on a cached artifact
+    // means re-mint, not re-token — the ladder below owns recovery.
+    const maxAttempts = opts.resolved ? 1 : 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let target = url;
       if (attempt > 0) {
         await this.ensureJsToken(true); // fresh account-bound token for the retry
@@ -800,13 +822,17 @@ export class TeraboxClient {
           target = withToken.toString();
         }
       }
-      const headers: Record<string, string> = {
-        Referer: this.baseUrl,
-        Cookie: this.cookie,
-        'User-Agent': WEB_USER_AGENT,
-        Accept: '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-      };
+      // Credential-free shape mirrors the hop loop below: only UA/Accept/Range
+      // cross to a host that never received the session in the first place.
+      const headers: Record<string, string> = credentialLess
+        ? { 'User-Agent': WEB_USER_AGENT, Accept: '*/*' }
+        : {
+            Referer: this.baseUrl,
+            Cookie: this.cookie,
+            'User-Agent': WEB_USER_AGENT,
+            Accept: '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+          };
       if (range) headers['Range'] = range;
 
       // API-origin pacing guard before the stream. A resolved capability URL
@@ -816,8 +842,13 @@ export class TeraboxClient {
       if (!opts.resolved) await this.pace();
       let response: Response;
       let finalUrl = target;
+      let hopped = false;
+      const controller = opts.resolved ? new AbortController() : undefined;
+      const headerTimer = controller
+        ? setTimeout(() => controller.abort(), opts.headerTimeoutMs ?? RESOLVED_HEADER_TIMEOUT_MS)
+        : undefined;
       try {
-        response = await fetch(target, { headers, redirect: 'manual' });
+        response = await fetch(target, { headers, redirect: 'manual', signal: controller?.signal });
         // Follow the CDN hop ourselves: the redirect target is a capability
         // URL that serves bytes with no session, so only the UA (and Range)
         // cross the hop. No pacing here: the capability host is not the API
@@ -826,21 +857,26 @@ export class TeraboxClient {
         for (let hop = 0; response.status >= 300 && response.status < 400 && hop < 4; hop++) {
           const location = response.headers.get('Location');
           if (!location) break;
+          hopped = true;
           finalUrl = new URL(location, finalUrl).toString();
           const hopHeaders: Record<string, string> = { 'User-Agent': WEB_USER_AGENT, Accept: '*/*' };
           if (range) hopHeaders['Range'] = range;
-          response = await fetch(finalUrl, { headers: hopHeaders, redirect: 'manual' });
+          response = await fetch(finalUrl, { headers: hopHeaders, redirect: 'manual', signal: controller?.signal });
         }
       } catch (error) {
         throw new TeraboxError(
           -5,
           `Terabox download network error: ${error instanceof Error ? error.message : String(error)}`,
         );
+      } finally {
+        // Headers landed (or we bailed): the body must stream unbounded —
+        // clearing the timer also disarms the controller before any read.
+        if (headerTimer !== undefined) clearTimeout(headerTimer);
       }
 
       const host = downloadHost(finalUrl, target);
       const verdict = await this.classifyDownload(response, host);
-      if (!verdict.error) return { response: verdict.response, finalUrl };
+      if (!verdict.error) return { response: verdict.response, finalUrl, cookieless: hopped };
       if (attempt === 0 && JS_TOKEN_ERRORS.has(verdict.error.errno)) {
         lastError = verdict.error;
         continue; // remedy: fresh jsToken, exactly like the API retry

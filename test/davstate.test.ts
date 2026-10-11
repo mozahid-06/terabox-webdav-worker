@@ -483,12 +483,14 @@ describe('account-wide API pacing (pace → DavState /api-slot)', () => {
 	it('offers an account-wide slot reservation on the remote store', async () => {
 		const store = createDavStore(env);
 		expect(typeof store.apiSlot).toBe('function');
-		// First reservation is immediate; the second queues behind the gap —
-		// the DO's single-threaded route makes the pair race-free.
+		// Serialisation proof: the second reservation queues one full gap
+		// behind the first. Asserted as a DELTA, not an absolute bound on
+		// the first call — the DO's in-memory timeline is not reset between
+		// tests, so a stale nextApiSlot (or a scheduling pause) would break
+		// `first < 50` while the contract itself is perfectly held.
 		const first = await store.apiSlot!(200);
 		const second = await store.apiSlot!(200);
-		expect(first).toBeLessThan(50);
-		expect(second).toBeGreaterThanOrEqual(50);
+		expect(second - first).toBeGreaterThanOrEqual(100);
 	});
 
 	it('wires the reservation into every paced upstream call of a request', async () => {

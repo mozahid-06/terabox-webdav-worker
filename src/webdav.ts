@@ -479,11 +479,14 @@ interface DlUrlEntry {
   size: number;
   mtimeMs: number;
   expires: number;
+  /** True when the fetch that minted this URL hopped (302) to it — i.e. the
+   *  URL lives on a CDN host the session cookie must never be sent to. */
+  cookieless: boolean;
 }
 const dlUrlCache = new Map<string, DlUrlEntry>();
 
 /** Insert through the same sweep + FIFO discipline as metaCache. */
-function dlUrlCacheWrite(absPath: string, item: TeraboxItem, url: string): void {
+function dlUrlCacheWrite(absPath: string, item: TeraboxItem, url: string, cookieless: boolean): void {
   const now = Date.now();
   for (const [key, entry] of dlUrlCache) {
     if (entry.expires <= now) dlUrlCache.delete(key);
@@ -499,12 +502,14 @@ function dlUrlCacheWrite(absPath: string, item: TeraboxItem, url: string): void 
     size: item.size || 0,
     mtimeMs: safeMtimeSeconds(item) * 1000,
     expires: now + DLURL_TTL_MS,
+    cookieless,
   });
 }
 
 /** Validated lookup: the entry's identity must match the item about to be
- *  served, else it is dropped and the ladder re-walks. */
-function dlUrlCacheGet(absPath: string, item: TeraboxItem): string | undefined {
+ * served, else it is dropped and the ladder re-walks. Returns the replay
+ * shape (URL + the cookieless boundary recorded when it was minted). */
+function dlUrlCacheGet(absPath: string, item: TeraboxItem): { url: string; cookieless: boolean } | undefined {
   const entry = dlUrlCache.get(absPath);
   if (!entry) return undefined;
   const valid =
@@ -516,7 +521,7 @@ function dlUrlCacheGet(absPath: string, item: TeraboxItem): string | undefined {
     dlUrlCache.delete(absPath);
     return undefined;
   }
-  return entry.url;
+  return { url: entry.url, cookieless: entry.cookieless };
 }
 
 /**
@@ -1859,16 +1864,20 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
    *  set per tryUrl call, so a truthy tryUrl result always pairs with the
    *  URL that actually served (the download-URL cache keys on that). */
   let servedUrl: string | undefined;
+  /** Whether that served URL hopped to a host the session must never reach
+   *  (recorded per fetch; cached and replayed as the cookieless boundary). */
+  let servedCookieless = false;
   /** Try one candidate; resolves the ready-to-stream Response or records why it failed. */
   const tryUrl = async (
     downloadUrl: string,
-    opts?: { resolved?: boolean },
+    opts?: { resolved?: boolean; cookieless?: boolean; headerTimeoutMs?: number },
   ): Promise<Response | undefined> => {
     try {
       // Paced, cookie-authenticated stream fetch: retries a jsToken gate once
       // and raises an errno-shaped body as TeraboxError instead of streaming it.
-      const { response: upstream, finalUrl } = await client.fetchDownload(downloadUrl, range, opts);
+      const { response: upstream, finalUrl, cookieless } = await client.fetchDownload(downloadUrl, range, opts);
       servedUrl = finalUrl;
+      servedCookieless = cookieless;
       if (upstream.status === 416) {
         // Range not satisfiable: pass the CDN's verdict through instead of
         // burning the remaining ladder phases on ranges it will also refuse.
@@ -1940,17 +1949,21 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   /** A candidate that served: remember its capability URL so the next open
    *  skips the mint chain (identity-validated, write-invalidated, self-healing). */
   const serveSucceeded = (res: Response): Response => {
-    if (servedUrl) dlUrlCacheWrite(absPath, item, servedUrl);
+    if (servedUrl) dlUrlCacheWrite(absPath, item, servedUrl, servedCookieless);
     return res;
   };
 
   // Phase 0: a previously served capability URL — one direct CDN fetch, no
   // filemetas re-mint, no PCS round-trip, no pacing floor. Dropped on any
   // refusal so the ladder below (and a refreshed cache entry) takes over.
-  const cachedUrl = dlUrlCacheGet(absPath, item);
-  if (cachedUrl) {
-    const res = await tryUrl(cachedUrl, { resolved: true });
-    if (res) return serveSucceeded(res);
+  // The cookieless boundary recorded at mint time replays with the fetch: a
+  // post-302 URL lives on a CDN host the session must never reach. A hit
+  // returns without re-writing — the replay itself never hops, and writing
+  // its `false` would clobber the flag that keeps the cookie off-origin.
+  const cached = dlUrlCacheGet(absPath, item);
+  if (cached) {
+    const res = await tryUrl(cached.url, { resolved: true, cookieless: cached.cookieless });
+    if (res) return res;
     dlUrlCache.delete(absPath);
   }
 
