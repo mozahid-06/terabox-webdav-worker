@@ -591,8 +591,15 @@ account-wide; the isolate floor is the backstop).
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-11, post review rounds 4–6): `main` = production,
-auto-deploys on push (litmus 105/105, 277 unit tests). It includes the RFC 7233 GET/ETag
+Branch state (2026-10-11, post review rounds 4–13 + perf work): `main` =
+production; deploys are **manual** `wrangler deploy` after `npm run review`
+(the optional dashboard Git integration is documented in README — do not
+assume a push deploys). Current verification: **litmus 138/138** (basic,
+copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
+**347 unit tests**. Latest shipped work: download-URL cache (repeat-open TTFB
+0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
+(`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
+cap is TeraBox free-tier, colo-independent). It includes the RFC 7233 GET/ETag
 conformance hardening (merged `d065d53`, deployed) and the full-repo audit
 hardening (merged `4d87f47`: traversal containment, metaCache cap, errno→status
 maps, DO-backed lock/prop tests, docs/config fixes — see the Phase 2–4 commit
