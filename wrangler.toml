@@ -60,6 +60,7 @@ storage = "sqlite"
 
 # USERS and COOKIE are Secrets — set them per-instance in the dashboard
 # (Settings → Variables and Secrets) or with `wrangler secret put`, never
-# as commented-out vars in this public file. The Terabox cookie must be the
-# FULL browser cookie string (ndus + stoken + …); a bare ndus value is
-# gated by Terabox now (400141). See README "Setup".
+# as commented-out vars in this public file. Only the `ndus` cookie is
+# required — a bare value is accepted (the worker normalizes it to
+# `ndus=…; lang=en`); full cookie strings also work. `stoken` is not a
+# TeraBox field. See README "Getting your TeraBox COOKIE".

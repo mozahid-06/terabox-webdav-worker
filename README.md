@@ -49,9 +49,10 @@ git clone git@github.com:taxin-404/terabox-webdav-worker.git
 cd terabox-webdav-worker
 npm install --legacy-peer-deps
 
-wrangler secret put USERS     # e.g. "alice:s3cret,bob:hunter2"
-wrangler secret put COOKIE    # your TeraBox cookie
-npx wrangler deploy           # gives you https://<worker>.<subdomain>.workers.dev
+npx wrangler login
+npx wrangler secret put USERS   # e.g. "alice:s3cret,bob:hunter2"
+npx wrangler secret put COOKIE  # your TeraBox cookie
+npx wrangler deploy             # gives you https://<worker>.<subdomain>.workers.dev
 
 # 3. Mount it with rclone:
 rclone config create terabox webdav \
@@ -66,7 +67,7 @@ rclone lsd terabox:
 
 | Area | Behavior |
 | --- | --- |
-| WebDAV surface | `PROPFIND`, `MKCOL`, `GET`, `PUT`, `DELETE`, `MOVE`, `COPY`, `LOCK`, `UNLOCK`, `PROPPATCH` per RFC 4918 |
+| WebDAV surface | `OPTIONS`, `PROPFIND`, `PROPPATCH`, `MKCOL`, `GET`, `HEAD`, `PUT`, `DELETE`, `MOVE`, `COPY`, `LOCK`, `UNLOCK` per RFC 4918 |
 | Auth | HTTP Basic over `USERS`; **fails closed** (`500 WebDAV server not configured`) when `USERS`/`COOKIE` are unset; a TeraBox session that dies mid-flight maps to `401` so clients re-authenticate |
 | Locks & properties | Real `LOCK`/`UNLOCK` with 423 enforcement and dead properties, backed by a `DavState` Durable Object (one serialized instance for the whole account) |
 | Downloads | Terabox CDN links with `Range` support; `HEAD` answers from metadata only |
@@ -79,7 +80,7 @@ rclone lsd terabox:
 | File | Responsibility |
 | --- | --- |
 | [`src/index.ts`](src/index.ts) | Entry point: Basic auth, env wiring, error → HTTP status mapping (see [Troubleshooting](#troubleshooting-faq)) |
-| [`src/terabox.ts`](src/terabox.ts) | `TeraboxClient`: the private web API — listing, metadata, mkdir, downloads, filemanager ops (async copy polling), chunked uploads |
+| [`src/terabox.ts`](src/terabox.ts) | `TeraboxClient`: the private web API — listing, metadata, mkdir, downloads, filemanager ops (copy/move/rename/delete in adaptive async mode; upstream has no poll endpoint), chunked uploads |
 | [`src/sign.ts`](src/sign.ts) | Signature/path helpers: `valuedCookie`, jsToken scraping, chunk sizing, RC4-style download signature |
 | [`src/md5.ts`](src/md5.ts) | Dependency-free MD5 (Workers WebCrypto omits MD5; TeraBox chunk checksums need it) |
 | [`src/webdav.ts`](src/webdav.ts) | RFC 4918 surface mapped over `TeraboxClient` |
@@ -153,8 +154,8 @@ What matters:
 ### Optional JSTOKEN
 
 - The jsToken is an anti-bot token TeraBox derives from page HTML.
-- The worker **scrapes and caches it automatically** (5 min TTL, refreshed
-  on `4000023`/`450016`), minted from its own egress IP.
+- The worker **scrapes and caches it automatically** (5 min TTL, re-minted on
+  `4000023`/`400141`/`450016`), minted from its own egress IP.
 - A token minted in your browser console (`window.jsToken`) is bound to your
   browser's IP and session context — from the worker's datacenter IP it can
   be rejected. **Recommended: leave `JSTOKEN` unset.** It exists only for
@@ -166,9 +167,10 @@ What matters:
 
 ```sh
 npm install --legacy-peer-deps
-wrangler secret put USERS
-wrangler secret put COOKIE
-# optional: wrangler secret put JSTOKEN
+npx wrangler login
+npx wrangler secret put USERS
+npx wrangler secret put COOKIE
+# optional: npx wrangler secret put JSTOKEN
 npx wrangler deploy
 ```
 
@@ -251,8 +253,9 @@ https://<worker>.<subdomain>.workers.dev/dav/ /mnt/terabox davfs noauto,user,uid
 
 Then `mount /mnt/terabox` (no sudo). Credentials go in `~/.davfs2/secrets`
 (or `/etc/davfs2/secrets` for system-wide mounts), one line per URL with
-three whitespace-separated fields — **`user:password` on a colon is parsed
-as username-only** and triggers an interactive password prompt:
+three whitespace-separated fields — `URL user password`. davfs2's parser
+does **not** split `user:password` on a colon: that form parses as
+username-only and triggers an interactive password prompt:
 
 ```
 https://<worker>.<subdomain>.workers.dev/dav/ alice hunter2
@@ -279,8 +282,9 @@ Two behaviors worth knowing:
 
 - davfs2 **downloads an entire file on `open()`** (it never sends `Range`),
   and it is single-threaded — a multi-gigabyte video ties up the mount
-  while it downloads (~1.5 MB/s, roughly ten minutes per gigabyte). Use
-  rclone for those files.
+  while it downloads (~1.5 MB/s; a 1.1 GB file took ≈ 12 minutes in the
+  investigation, `docs/davfs2-etag-hang-investigation.md`). Use rclone for
+  those files.
 - `lost+found/` in the mount is davfs2's own directory for failed uploads —
   it exists only in the client's view, never on the server.
 
@@ -357,7 +361,7 @@ per-request, but not shared across isolates. The Worker keeps serving.
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 265 cases over a mocked TeraBox API
+npm test                         # Vitest: 296 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)
