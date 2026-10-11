@@ -61,6 +61,8 @@ rclone config create terabox webdav \
   user alice \
   pass <your-webdav-password>
 rclone lsd terabox:
+# Linux: mount it as a real directory (details in "rclone mount" below):
+mkdir -p /mnt/terabox && rclone mount terabox: /mnt/terabox --vfs-cache-mode full --daemon
 ```
 
 ## Features
@@ -242,6 +244,59 @@ rclone config create terabox webdav \
 If you did not set the `PATH` variable, drop the `/dav/` suffix. Uploads are
 buffered in memory and sent as TeraBox chunks.
 
+#### rclone mount (Linux FUSE)
+
+`rclone config create` only registers the remote; to use it as a real
+directory on Linux, mount it with FUSE:
+
+```sh
+mkdir -p /mnt/terabox
+rclone mount terabox: /mnt/terabox \
+  --vfs-cache-mode full \
+  --daemon            # run in the background
+
+ls /mnt/terabox               # normal directory from here on
+fusermount -u /mnt/terabox    # unmount (fusermount3 -u on newer distros)
+```
+
+- `--vfs-cache-mode full` writes through a local disk cache
+  (`~/.cache/rclone`), which is what makes large-file playback, seeking and
+  random reads usable; without it every read is a fresh pass through the
+  worker. Keep that cache directory on a disk with room for your biggest
+  open file.
+- Drop `--daemon` to keep the mount in the foreground (Ctrl-C unmounts).
+- `--read-only` is available if you only ever browse.
+- Files show up empty until written — rclone uploads on close, like davfs2.
+
+Autostart at login with a systemd **user** unit
+(`~/.config/systemd/user/terabox-rclone.service`; adjust the rclone path to
+`command -v rclone`):
+
+```ini
+[Unit]
+Description=rclone FUSE mount of the TeraBox WebDAV worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rclone mount terabox: /mnt/terabox --vfs-cache-mode full
+ExecStop=/bin/fusermount -u /mnt/terabox
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now terabox-rclone
+```
+
+(Use a system unit in `/etc/systemd/system/` instead if the remote was
+created with `sudo rclone config`.)
+
 ### davfs2 (Linux)
 
 Mount it like any WebDAV server. Non-root mounts require an `/etc/fstab`
@@ -361,7 +416,7 @@ per-request, but not shared across isolates. The Worker keeps serving.
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 296 cases over a mocked TeraBox API
+npm test                         # Vitest: 307 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)
