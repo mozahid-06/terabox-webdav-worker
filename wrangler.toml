@@ -10,6 +10,15 @@ preview_urls = true
 # deleted by deploys either way.
 keep_vars = true
 
+# No [placement] block — deliberately. Worker Placement was tested end to
+# end for the "slow downloads" report: Smart never moved (all traffic
+# enters at HKG), and the Region hint `aws:ap-northeast-1` ran the worker
+# at remote-NRT yet measured the identical ~1.8 MB/s cap (HKG 1.80 vs NRT
+# 1.83 on the same 70 MB file). That cap is TeraBox's free-tier CDN speed
+# (docs/terabox-limits.md: md5-verified, same aggregate under 4 parallel
+# ranges, every colo), not egress location — placement only bought
+# cross-region Durable Object latency. Revisit only if that doc changes.
+
 [observability]
 enabled = true
 

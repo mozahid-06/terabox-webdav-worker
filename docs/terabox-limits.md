@@ -55,6 +55,13 @@ service from Cloudflare.
   - TTFB ≈ **2.9 s** = the three paced API hops; the byte stream itself is not throttled
   - this is a **TeraBox free-tier CDN/account** speed, identical for every
     client; the worker adds zero per-byte delay (pacing is per *call*, not per byte)
+  - **Worker Placement cannot raise it** (tested 2026-10-11): Smart never
+    moved the worker (all traffic enters at HKG), and the Region hint
+    `aws:ap-northeast-1` — `cf-placement: remote-NRT` confirmed — served
+    the same 70 MB file at **1.83 MB/s vs 1.80 MB/s at HKG** (and a second
+    file/cluster at 1.28 MB/s). Egress colo is irrelevant to the cap, so
+    placement was reverted: it bought nothing but cross-region Durable
+    Object latency.
 - The user's own ISP path (TH → KL peering, ~29 KB/s measured) is bypassed
   entirely: bytes flow TeraBox CDN → Cloudflare → client.
 
