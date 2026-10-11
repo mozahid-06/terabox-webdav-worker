@@ -249,6 +249,34 @@ export function validateXml(body: string): string | null {
     if (!/^[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?$/.test(qname)) {
       return 'invalid element name';
     }
+    // After the element name only well-formed attributes may follow:
+    // `Name = "…"` / `Name = '…'` pairs, space-separated, nothing else.
+    // Without this grammar check the `attrRe` pass below only resolves
+    // prefixes and lets through `a=c` (unquoted AttValue), `a="1" a="2"`
+    // (duplicate attribute) and `<X:foo bar>` (bare junk after the name).
+    // PROPPATCH/LOCK store that markup RAW and re-emit it in every later
+    // PROPFIND 207 / lockdiscovery — strict clients (libxml2, Go encoding/
+    // xml, litmus) then fail to parse the WHOLE multistatus: a permanent,
+    // client-caused browse DoS, the exact failure class the NUL / `]]>` /
+    // `<`-in-attribute guards above already close (XML 1.0 §3.1 AttValue,
+    // §3.1 duplicate-attribute ban).
+    {
+      let k = nameMatch.index + nameMatch[0].length;
+      const seenAttrs = new Set<string>();
+      while (k < inner.length) {
+        const ws = /^\s*/.exec(inner.slice(k))![0]!;
+        k += ws.length;
+        if (k >= inner.length) break;
+        const am = /^([A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)\s*=\s*("[^"<]*"|'[^'<]*')/.exec(
+          inner.slice(k),
+        );
+        if (!am) return 'invalid attribute';
+        const attrName = am[1]!;
+        if (seenAttrs.has(attrName)) return `duplicate attribute "${attrName}"`;
+        seenAttrs.add(attrName);
+        k += am[0].length;
+      }
+    }
 
     const parentScope = scopeStack[scopeStack.length - 1] ?? new Map<string, string>();
     const decls = declsIn(inner);

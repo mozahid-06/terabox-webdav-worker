@@ -1512,6 +1512,18 @@ describe('XML request validation', () => {
 			// Numeric references must name a legal XML character (§2.2).
 			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
 				'<X:foo xmlns:X="urn:x">&#0;</X:foo></D:prop></D:set></D:propertyupdate>',
+			// AttValue must be quoted (§3.1): `a=c` is not XML.
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x" a=c>v</X:foo></D:prop></D:set></D:propertyupdate>',
+			// Duplicate attribute names are banned (§3.1).
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x" a="1" a="2">v</X:foo></D:prop></D:set></D:propertyupdate>',
+			// Only attributes may follow the element name: a bare name is junk.
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x" bare>v</X:foo></D:prop></D:set></D:propertyupdate>',
+			// Junk after a well-formed attribute, too.
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x" a="1" junk>v</X:foo></D:prop></D:set></D:propertyupdate>',
 		];
 		for (const body of bodies) {
 			const res = await request('/a.txt', {
@@ -2255,13 +2267,16 @@ describe('lock enforcement', () => {
 
 	it('a resource-tag If does not substitute for a lockinfo body', async () => {
 		// `(<http://host/a.txt>)` is a resource-tag condition (§10.4.1), not a
-		// lock token: letting it satisfy the gate would mint a whole new lock
-		// from a body-less LOCK that §9.10.1 defines as a refresh.
+		// lock token: it must not satisfy the body-less-refresh gate and mint
+		// a whole new lock (§9.10.1 defines body-less LOCK as refresh). The
+		// header is present and yields no usable refresh credential → §9.10.6
+		// 412 (round 11: was 400, which called a well-formed header malformed;
+		// PUT answers 412 for the same shape).
 		const res = await request('/dest.txt', {
 			method: 'LOCK',
 			headers: { If: `(<${ORIGIN}/a.txt>)` },
 		});
-		expect(res.status).toBe(400);
+		expect(res.status).toBe(412);
 		expect((await request('/dest.txt', { method: 'PUT', body: 'no lock taken' })).status).toBe(204);
 	});
 
@@ -3243,6 +3258,10 @@ describe('round 10 pins: 412 refresh gate, volatile grace, stream cap, JSON path
 	}
 
 	it('body-less LOCK with only another resource\'s live token answers 412 (§9.10.6)', async () => {
+		// End-to-end RFC pin: the answer must be 412 no matter which layer
+		// produces it (refresh gate or lockAcquire's owned-elsewhere rule).
+		// The gate-SPECIFIC detector is the bogus-token pin in the round-9
+		// describe — without the gate that one mints (200) instead of 412.
 		const other = `/r10foreign-${crypto.randomUUID().slice(0, 8)}.txt`;
 		tb.seed(other, { content: 'locked elsewhere' });
 		tb.seed('/r10target.txt', { content: 'fresh target' });
@@ -3256,8 +3275,21 @@ describe('round 10 pins: 412 refresh gate, volatile grace, stream cap, JSON path
 		tb.seed(path, { content: 'grace' });
 		const token = await lock(path);
 		resetDavVolatileState();
+		// Prove the record really is gone first — otherwise a genuine,
+		// record-backed refresh would also answer 200 and this pin could not
+		// distinguish the volatile grace from a no-op reset.
+		const discovery = async (): Promise<string> => {
+			const res = await request(path, {
+				method: 'PROPFIND',
+				headers: { Depth: '0', 'Content-Type': 'application/xml' },
+				body: '<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>',
+			});
+			return res.text();
+		};
+		expect(await discovery()).not.toContain('opaquelocktoken');
 		const refresh = await request(path, { method: 'LOCK', headers: { If: `(${token})` } });
 		expect(refresh.status).toBe(200);
+		expect(await discovery()).toContain('opaquelocktoken');
 	});
 
 	it('a streamed XML body without content-length still trips the 413 cap', async () => {
@@ -3295,5 +3327,211 @@ describe('round 10 pins: 412 refresh gate, volatile grace, stream cap, JSON path
 			body: LOCK_BODY,
 		});
 		expect(res.status).toBe(200);
+	});
+});
+
+describe('round 11 pins: LOCK If semantics, body caps, upload session cap, finalize', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>r11</D:href></D:owner></D:lockinfo>';
+
+	async function lock(path: string): Promise<string> {
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		const token = res.headers.get('Lock-Token');
+		expect(token).toBeTruthy();
+		return token!;
+	}
+
+	it('body-less LOCK whose If yields no token (tag or etag terms) answers 412', async () => {
+		const path = '/r11notoken.txt';
+		tb.seed(path, { content: 'seeded' });
+		const tagged = await request(path, {
+			method: 'LOCK',
+			headers: { If: `(<${ORIGIN}/r11notoken.txt>)` },
+		});
+		expect(tagged.status).toBe(412);
+		const etagged = await request(path, { method: 'LOCK', headers: { If: '(["deadbeef"])' } });
+		expect(etagged.status).toBe(412);
+	});
+
+	it('a negated live token is not a refresh credential (Not polarity → 412)', async () => {
+		const path = '/r11negated.txt';
+		tb.seed(path, { content: 'seeded' });
+		const token = await lock(path);
+		const res = await request(path, { method: 'LOCK', headers: { If: `(Not ${token})` } });
+		expect(res.status).toBe(412);
+		// The lock itself is untouched.
+		expect((await request(path, { method: 'PUT', body: 'x' })).status).toBe(423);
+	});
+
+	it('a create-LOCK whose If condition is false answers 412 instead of minting', async () => {
+		const path = '/r11false.txt';
+		tb.seed(path, { content: 'seeded' });
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: '(["stale-etag"])' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(412);
+		// Nothing was minted: a plain LOCK still succeeds afterwards.
+		const fresh = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(fresh.status).toBe(200);
+	});
+
+	it('a body-carrying LOCK without lockscope is 400 even when an If is present', async () => {
+		const path = '/r11noscope.txt';
+		tb.seed(path, { content: 'seeded' });
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: {
+				'Content-Type': 'application/xml',
+				If: '(<opaquelocktoken:00000000-0000-0000-0000-000000000000:0>)',
+			},
+			body: '<D:lockinfo xmlns:D="DAV:"><D:owner>x</D:owner></D:lockinfo>',
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('a content-length-less oversized chunk stream stops at expected+1 (400)', async () => {
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/r11chunk.bin', size: 1000 }),
+		});
+		expect(begin.status).toBe(200);
+		const begun = (await begin.json()) as { uploadId: string; chunkCount: number };
+		expect(begun.chunkCount).toBe(1);
+		// 1005 bytes with NO content-length: the declared fast-path cannot
+		// fire, so only the streaming cap may stop the body.
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array(1005).fill(0x61));
+				controller.close();
+			},
+		});
+		const res = await request(`/.resumable/${begun.uploadId}/0`, {
+			method: 'PUT',
+			body: stream,
+		});
+		expect(res.status).toBe(400);
+		expect(await res.text()).toContain('exceeds');
+		await request(`/.resumable/${begun.uploadId}`, { method: 'DELETE' });
+	});
+
+	it('resumable begin refuses a JSON body over 64 KiB (413)', async () => {
+		const res = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/r11big.json', size: 10, pad: 'x'.repeat(70 * 1024) }),
+		});
+		expect(res.status).toBe(413);
+	});
+
+	it(
+		'caps OPEN upload sessions: finalized ones do not count, 65th open begin → 507',
+		async () => {
+			// Phase 1: fill the map with 64 FINALIZED sessions — bounded by
+			// their 10 min grace, so they must NOT count toward the cap.
+			for (let i = 0; i < 64; i += 1) {
+				const begin = await request('/.resumable', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ path: `/r11done-${i}.bin`, size: 10 }),
+				});
+				expect(begin.status).toBe(200);
+				const begun = (await begin.json()) as { uploadId: string };
+				const put = await request(`/.resumable/${begun.uploadId}/0`, {
+					method: 'PUT',
+					body: new Uint8Array(10).fill(1),
+				});
+				expect(put.status).toBe(200);
+				const fin = await request(`/.resumable/${begun.uploadId}/finalize`, {
+					method: 'POST',
+				});
+				expect(fin.status).toBe(201);
+			}
+			// Phase 2: map size is 64 but zero sessions are open → still 200.
+			// (A size-based cap would 507 here and brick batch uploads.)
+			const next = await request('/.resumable', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ path: '/r11open-first.bin', size: 10 }),
+			});
+			expect(next.status).toBe(200);
+			let openAccepted = 1;
+			// Phase 3: NOW the open cap applies: 63 more open, the 65th refuses.
+			let refused = false;
+			for (let i = 0; i < 70 && !refused; i += 1) {
+				const res = await request('/.resumable', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ path: `/r11open-${i}.bin`, size: 10 }),
+				});
+				if (res.status === 507) {
+					refused = true;
+					break;
+				}
+				expect(res.status).toBe(200);
+				openAccepted += 1;
+			}
+			expect(refused).toBe(true);
+			expect(openAccepted).toBe(64);
+		},
+		// ~256 serialized round-trips (64 begin+chunk+finalize + 64 begins);
+		// parallel test-file CPU contention can stretch this 10-20x past its
+		// isolated ~4.5 s.
+		180_000,
+	);
+
+	it('finalize answers 201 when the target vanished after begin (fresh existence)', async () => {
+		// /dest.txt is seeded: existed at begin (overwriteMode 3), so the
+		// begin-time snapshot would answer 204 after the mid-flight delete.
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/dest.txt', size: 3 }),
+		});
+		expect(begin.status).toBe(200);
+		const begun = (await begin.json()) as { uploadId: string; chunkCount: number };
+		const put = await request(`/.resumable/${begun.uploadId}/0`, {
+			method: 'PUT',
+			body: new Uint8Array([1, 2, 3]),
+		});
+		expect(put.status).toBe(200);
+		expect((await request('/dest.txt', { method: 'DELETE' })).status).toBe(204);
+		const fin = await request(`/.resumable/${begun.uploadId}/finalize`, { method: 'POST' });
+		expect(fin.status).toBe(201);
+	});
+
+	it('finalize evaluates a false If condition (412) and releases the claim', async () => {
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/r11fin.txt', size: 3 }),
+		});
+		expect(begin.status).toBe(200);
+		const begun = (await begin.json()) as { uploadId: string; chunkCount: number };
+		const put = await request(`/.resumable/${begun.uploadId}/0`, {
+			method: 'PUT',
+			body: new Uint8Array([1, 2, 3]),
+		});
+		expect(put.status).toBe(200);
+		const fin = await request(`/.resumable/${begun.uploadId}/finalize`, {
+			method: 'POST',
+			headers: { If: '(["stale-etag"])' },
+		});
+		expect(fin.status).toBe(412);
+		// The claim was released by the failure: a clean retry succeeds.
+		const retry = await request(`/.resumable/${begun.uploadId}/finalize`, { method: 'POST' });
+		expect(retry.status).toBe(201);
 	});
 });

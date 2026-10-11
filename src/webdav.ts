@@ -247,29 +247,42 @@ export function mountBasePath(base: string): string {
 
 /** XML request bodies are read from the wire at most this much (see below). */
 const MAX_XML_BODY = 4 * 1024 * 1024;
+/** Hard cap for the JSON `POST /.resumable` begin body (path + size). */
+const RESUMABLE_BEGIN_MAX = 64 * 1024;
 
 /**
- * Buffer an XML request body up to MAX_XML_BODY bytes; `null` = over the
- * cap (the caller answers 413). The body is read as a stream so a ~100 MB
- * authenticated PROPFIND/PROPPATCH/LOCK/MKCOL can never land whole in the
- * 128 MB isolate before `validateXml` even runs.
+ * Buffer a request body up to `max` bytes; `null` = over the cap (the
+ * caller answers 413/400). The body is read as a stream so a ~100 MB
+ * authenticated body can never land whole in the 128 MB isolate before the
+ * size check runs — including when the client sends NO Content-Length
+ * (chunked/H2): the declared fast-path below is skipped then, and only this
+ * loop enforces the cap. Stream errors (client hung up mid-body) report the
+ * same as an over-cap body rather than surfacing a 500.
  */
-async function readTextCapped(request: Request): Promise<string | null> {
+async function readBytesCapped(request: Request, max: number): Promise<Uint8Array | null> {
   const declared = Number(request.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > MAX_XML_BODY) return null;
-  if (request.body === null) return '';
+  if (Number.isFinite(declared) && declared > max) return null;
+  if (request.body === null) return new Uint8Array(0);
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_XML_BODY) {
-      await reader.cancel();
-      return null;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The client may already be gone; the 413/400 still stands.
+        }
+        return null;
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } catch {
+    return null;
   }
   const all = new Uint8Array(total);
   let at = 0;
@@ -277,7 +290,13 @@ async function readTextCapped(request: Request): Promise<string | null> {
     all.set(chunk, at);
     at += chunk.byteLength;
   }
-  return new TextDecoder().decode(all);
+  return all;
+}
+
+async function readTextCapped(request: Request, max = MAX_XML_BODY): Promise<string | null> {
+  const bytes = await readBytesCapped(request, max);
+  if (bytes === null) return null;
+  return new TextDecoder().decode(bytes);
 }
 
 /** Normalise ROOT_ID: "" / "/" → whole account; "/backup/" → "/backup". */
@@ -673,7 +692,7 @@ async function checkMutationPreconditions(
   store: DavStore,
   path: string,
   mount: Mount,
-  opts?: { enforce?: boolean },
+  opts?: { enforce?: boolean; lockSemantics?: boolean },
 ): Promise<Response | null> {
   // HTTP conditionals first (§6 evaluation order): a failing If-Match is a
   // definitive 412 regardless of how the WebDAV If header below evaluates.
@@ -806,7 +825,11 @@ async function checkMutationPreconditions(
     // never identifies a lock, so it fails as a plain condition (412);
     // a real lock-token-shaped value on a locked resource is a lock
     // problem and answers 423. (Untagged terms only — see above.)
-    if (invalidTokens.size > 0) {
+    // `lockSemantics` (LOCK): §9.10.6 makes a foreign-token mismatch on a
+    // LOCK a 412 (`lock-token-matches-request-uri`) whatever mod_dav does
+    // for writes — skip the 423 upgrade and let lockAcquire's own §9.10.6
+    // rule answer 412 after this evaluation passes the header as true.
+    if (invalidTokens.size > 0 && !opts?.lockSemantics) {
       const lockShaped = [...invalidTokens].some(
         (t) => t.startsWith('opaquelocktoken:') || t.startsWith('urn:uuid:'),
       );
@@ -1201,8 +1224,13 @@ async function handleResumable(
   // POST /.resumable — begin a session.
   if (rest === '' && method === 'POST') {
     let body: { path?: string; size?: number; mtimeMs?: number; overwriteMode?: number };
+    // A begin body is a tiny JSON object; cap it hard (64 KiB) so a
+    // Content-Length-less stream cannot buffer unbounded in the isolate
+    // before JSON.parse runs — the same premise as the XML body cap.
+    const rawBody = await readTextCapped(request, RESUMABLE_BEGIN_MAX);
+    if (rawBody === null) return errorResponse('Payload Too Large', 413);
     try {
-      body = (await request.json()) as typeof body;
+      body = JSON.parse(rawBody) as typeof body;
     } catch {
       return errorResponse('Invalid JSON', 400);
     }
@@ -1254,19 +1282,25 @@ async function handleResumable(
     const overwriteMode = existed ? 3 : 0;
 
     const begun = await client.beginResumable(absPath, size, mtimeMs);
-    await store.init({
-      path: absPath,
-      size,
-      mtimeMs,
-      uploadId: begun.uploadId,
-      uploadSign: begun.uploadSign,
-      chunkSize: begun.chunkSize,
-      chunkCount: begun.chunkCount,
-      chunkMd5s: new Array(begun.chunkCount).fill(null),
-      hosts: begun.hosts,
-      overwriteMode,
-      createdAt: Date.now(),
-    });
+    try {
+      await store.init({
+        path: absPath,
+        size,
+        mtimeMs,
+        uploadId: begun.uploadId,
+        uploadSign: begun.uploadSign,
+        chunkSize: begun.chunkSize,
+        chunkCount: begun.chunkCount,
+        chunkMd5s: new Array(begun.chunkCount).fill(null),
+        hosts: begun.hosts,
+        overwriteMode,
+        createdAt: Date.now(),
+      });
+    } catch (err) {
+      // Advisory-state safety cap (see MAX_UPLOAD_SESSIONS): 507, RFC 4918 §7.1.
+      if (err instanceof DavLimitError) return errorResponse('Insufficient Storage', 507);
+      throw err;
+    }
     return Response.json({
       uploadId: begun.uploadId,
       chunkSize: begun.chunkSize,
@@ -1297,7 +1331,13 @@ async function handleResumable(
     if (Number.isFinite(declared) && declared !== expected) {
       return errorResponse(`Chunk size mismatch: got ${declared}, expected ${expected}`, 400);
     }
-    const bytes = new Uint8Array(await request.arrayBuffer());
+    const bytes = await readBytesCapped(request, expected + 1);
+    if (bytes === null || bytes.byteLength > expected) {
+      // Reached when the client streams MORE than expected with no
+      // Content-Length (the declared fast-path above never fired) — stop at
+      // expected+1 instead of buffering up to the runtime request cap.
+      return errorResponse(`Chunk size mismatch: body exceeds ${expected} bytes`, 400);
+    }
     // Last chunk may be short; all others must be exactly chunkSize.
     if (bytes.byteLength !== expected) {
       return errorResponse(
@@ -1384,14 +1424,22 @@ async function handleResumable(
     // sit out the stale-claim TTL on a session nobody is working on.
     let marked = false;
     try {
-      // This branch is what actually creates the resource, so it is the write
-      // that must respect a lock taken after `begin` (and any If header the
-      // client sent with the finalize POST).
-      const locked = await enforceWrite(request, store, session.path);
-      if (locked) return locked;
+      // This branch is what actually creates the resource, so it is the
+      // write that must respect a lock taken after `begin` AND any If /
+      // If-Match conditionals the client sent with the finalize POST —
+      // evaluated with the shared precondition gate (begin already checked
+      // once, but the resource may have changed since; the comment above
+      // promised full If handling and enforceWrite alone never delivered it).
+      const pre = await checkMutationPreconditions(request, client, store, session.path, mount);
+      if (pre) return pre;
       const missing = session.chunkMd5s.findIndex((m) => m === null);
       if (missing !== -1) return errorResponse(`Chunk ${missing} not uploaded`, 409);
       const chunkMd5s = session.chunkMd5s as string[];
+      // The begin-time existence verdict can go stale (target deleted or
+      // created between begin and finalize). RFC 4918 §9.6.1: 201 = created,
+      // 204 = replaced — decided by a fresh stat taken right before THIS
+      // create, not by a snapshot from minutes ago.
+      const existedNow = (await statResource(client, session.path)) !== null;
       try {
         await client.finalizeResumable(
           session.path,
@@ -1427,7 +1475,7 @@ async function handleResumable(
       // Best-effort: the file already exists on Terabox at this point, so a
       // failure in advisory state (a DO still running pre-deploy code, a
       // transient storage error) must not turn a completed upload into a 500.
-      const status = session.overwriteMode > 0 ? 204 : 201;
+      const status = existedNow ? 204 : 201;
       try {
         await store.markFinalized(session.uploadId, status);
         marked = true;
@@ -2065,7 +2113,13 @@ async function handleLock(
   if (parsedIf === null) return errorResponse('Bad Request', 400);
   const presentedLocks = parsedIf.flatMap((list) =>
     list.terms
-      .filter((t) => t.kind === 'token')
+      // A negated term is never a refresh credential: `If: (Not <T>)`
+      // asserts T does NOT lock this resource, so feeding T (when it
+      // DOES lock) into the gate below would let `Not` polarity invert
+      // into a successful refresh (RFC 4918 §10.4.1). Etag terms are
+      // conditions, not credentials, and are likewise dropped here —
+      // the create path below evaluates the whole header properly.
+      .filter((t) => t.kind === 'token' && !t.negated)
       .map((t) => t.value)
       // A scheme://-shaped value is a Resource-Tag / URL name (§10.4.1),
       // never a lock token — same exclusion the old text filter applied,
@@ -2079,17 +2133,38 @@ async function handleLock(
   if (body.trim()) {
     const xmlError = validateXml(body);
     if (xmlError) return errorResponse(`Invalid XML: ${xmlError}`, 400);
-    // RFC 4918 §9.10.1: a LOCK that creates a lock carries a lockinfo body.
-    // Defaulting a missing scope to "exclusive" grants a lock the client
-    // never asked for; a refresh (signalled by If) may omit it.
+    // RFC 4918 §9.10.1: a body-carrying LOCK creates a lock, so lockscope
+    // is REQUIRED — even when an If header is present (a refresh carries
+    // no body). Previously an If presence skipped this check and minted a
+    // default exclusive lock the client never asked for (the same
+    // grant-it-anyway flaw the missing-scope 400 exists to prevent).
     const scopeBlock = body.match(
       /<(?:[A-Za-z_][\w.-]*:)?lockscope(?:\s[^>]*)?>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?lockscope\s*>/,
     );
-    if (!scopeBlock && presentedLocks.length === 0) {
-      return errorResponse('lockscope missing', 400);
-    }
-  } else if (presentedLocks.length === 0) {
+    if (!scopeBlock) return errorResponse('lockscope missing', 400);
+    // §10.4 / §6: a create-LOCK is subject to If (and If-Match/If-None-
+    // Match) exactly like every other mutating method — evaluate with the
+    // shared evaluator, enforcement off (locking itself is handled below
+    // by lockAcquire). Without this a false condition (`If: (["stale"])`,
+    // `(<DAV:no-lock>)`) minted the lock anyway while PUT answered 412.
+    const pre = await checkMutationPreconditions(
+      request,
+      client,
+      store,
+      absPath,
+      mount,
+      { enforce: false, lockSemantics: true },
+    );
+    if (pre) return pre;
+  } else if (!ifHeader) {
     return errorResponse('lockinfo body required', 400);
+  } else if (presentedLocks.length === 0) {
+    // The client sent an If condition but it yielded no usable refresh
+    // credential (etag terms only, Resource-Tags, negated-only lists):
+    // the precondition for a body-less refresh is unmet → §9.10.6 412.
+    // A 400 here claimed "malformed request" for a well-formed header —
+    // PUT answers 412 for exactly these shapes.
+    return errorResponse('Precondition Failed', 412);
   } else {
     // §9.10.1: a body-less LOCK is a refresh, never a create. A presented
     // token that applies to no live lock covering this URI is not a valid
@@ -2099,6 +2174,13 @@ async function handleLock(
     // fallback it carries the never-brick volatile grace, exactly what PUT
     // enforcement honors, so the same token that may write a locked file
     // may also refresh it after its record was lost to an isolate rotation.
+    // KNOWN RESIDUAL (memory fallback only): the grace verifies by pattern
+    // (uuid + expiry, isOurUnexpiredToken), so on the record-less memory
+    // store a CLIENT-FORGED pattern-token is indistinguishable from a real
+    // one whose record was lost — both re-establish via lockAcquire. That
+    // is inherent to pattern-grace; production always binds DAV_STATE
+    // (volatile=false → applies ⊆ recordTokens → forged → 412, pinned in
+    // test/davstate.test.ts "well-formed never-issued token on the DO path").
     // RFC 4918 §9.10.6: this mismatch is the `lock-token-matches-request-uri`
     // precondition — the status is 412, not 409 (409 is UNLOCK's
     // `lock-token-matches-lock-discovery` and the missing-intermediate case).

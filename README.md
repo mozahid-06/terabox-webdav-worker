@@ -62,7 +62,7 @@ rclone config create terabox webdav \
   pass <your-webdav-password>
 rclone lsd terabox:
 # Linux: mount it as a real directory (details in "rclone mount" below):
-mkdir -p /mnt/terabox && rclone mount terabox: /mnt/terabox --vfs-cache-mode full --daemon
+sudo mkdir -p /mnt/terabox && rclone mount terabox: /mnt/terabox --vfs-cache-mode full --daemon
 ```
 
 ## Features
@@ -250,7 +250,7 @@ buffered in memory and sent as TeraBox chunks.
 directory on Linux, mount it with FUSE:
 
 ```sh
-mkdir -p /mnt/terabox
+sudo mkdir -p /mnt/terabox   # /mnt is root-owned; your user only needs it to exist
 rclone mount terabox: /mnt/terabox \
   --vfs-cache-mode full \
   --daemon            # run in the background
@@ -270,7 +270,12 @@ fusermount -u /mnt/terabox    # unmount (fusermount3 -u on newer distros)
 
 Autostart at login with a systemd **user** unit
 (`~/.config/systemd/user/terabox-rclone.service`; adjust the rclone path to
-`command -v rclone`):
+`command -v rclone`). Pre-create the mountpoint first — a user unit cannot
+mkdir in root-owned `/mnt`:
+
+```sh
+sudo mkdir -p /mnt/terabox
+```
 
 ```ini
 [Unit]
@@ -418,7 +423,7 @@ per-request, but not shared across isolates. The Worker keeps serving.
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 307 cases over a mocked TeraBox API
+npm test                         # Vitest: 321 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)

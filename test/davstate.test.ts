@@ -327,21 +327,31 @@ describe('metadata generation (cross-isolate cache invalidation)', () => {
 		expect(put.status).toBe(412);
 	});
 
-	it('mints its own token instead of adopting a presented one', async () => {
+	it('refuses a create whose If condition is false instead of adopting a forged token', async () => {
 		const target = `/do-adopt-${crypto.randomUUID().slice(0, 8)}.txt`;
 		tb.seed(target, { content: 'adoption path\n' });
 		const forged = `opaquelocktoken:${crypto.randomUUID()}:${Date.now() + 3600000}`;
-		// Pre-fix the strict route still ADOPTED a presented well-formed
-		// token — the client would receive a response 'granting' the very
-		// token it just forged (§6.5: lock tokens are capabilities, not
-		// client-chosen names). The minted token must be the server's own.
+		// §6.5: lock tokens are capabilities, not client-chosen names. The
+		// body-carrying LOCK's If (`(<forged>)`) is a FALSE condition — the
+		// forged token locks nothing — so round 11 evaluates create-LOCK If
+		// truth like every other mutating method: 412, no lock minted,
+		// nothing adopted. (Rounds 9-10 ignored the condition and answered
+		// 200 with a server-minted token.)
 		const lock = await request(target, {
 			method: 'LOCK',
 			headers: { 'Content-Type': 'application/xml', If: `(<${forged}>)` },
 			body: LOCK_BODY,
 		});
-		expect(lock.status).toBe(200);
-		const minted = lock.headers.get('Lock-Token')!;
+		expect(lock.status).toBe(412);
+		// Nothing was created from the false condition: a clean LOCK still
+		// succeeds and the token it grants is the server's own.
+		const fresh = await request(target, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(fresh.status).toBe(200);
+		const minted = fresh.headers.get('Lock-Token')!;
 		expect(minted.slice(1, -1)).not.toBe(forged);
 	});
 

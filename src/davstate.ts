@@ -136,6 +136,8 @@ export interface UploadSession {
   hosts: string[];
   overwriteMode: number;
   createdAt: number;
+  /** Last chunk/finalize activity — drives the idle-abandonment reap. */
+  lastActivity?: number;
   /** Host that accepted the last chunk; tried first on the next one. */
   activeHost?: string;
   /**
@@ -186,6 +188,33 @@ function isExpired(session: UploadSession): boolean {
 }
 
 /**
+ * An OPEN session whose client went away (crash, killed rclone, dropped
+ * network) keeps no useful state: its chunks cannot finalize without the
+ * client, yet it would hold one of the MAX_UPLOAD_SESSIONS slots until the
+ * 24 h TTL — 64 abandons would brick new uploads for a day. Reap open
+ * sessions with no chunk/finalize activity for UPLOAD_SESSION_IDLE_MS.
+ * Industry resumable stores use similar idle aborts (S3 MPU lifecycle,
+ * Drive abandon windows); 2 h is far beyond any real gap between 4 MiB
+ * chunks, and a client resuming after longer restarts cleanly instead of
+ * wedging everyone else.
+ */
+const UPLOAD_SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+
+function reapUploadSessions(uploads: Map<string, UploadSession>): void {
+  const now = Date.now();
+  const idleCutoff = now - UPLOAD_SESSION_IDLE_MS;
+  for (const [id, s] of uploads) {
+    if (isExpired(s)) {
+      uploads.delete(id);
+      continue;
+    }
+    if (s.finalized === undefined && (s.lastActivity ?? s.createdAt) < idleCutoff) {
+      uploads.delete(id);
+    }
+  }
+}
+
+/**
  * Result of the atomic finalize claim. `owned` — this request now runs the
  * create; `replay` — a finished finalize answers with its recorded status;
  * `busy` — another request holds the claim; `unknown` — session gone.
@@ -228,6 +257,18 @@ export const MAX_PROP_PATHS = 8192;
  *  shared locks may stack on a single path. */
 export const MAX_LOCK_PATHS = 4096;
 export const MAX_LOCK_RECORDS_PER_PATH = 32;
+/**
+ * Cap on concurrently OPEN (non-finalized) upload sessions (see
+ * DavLimitError → 507). Open sessions expire via the 24 h TTL, but an
+ * authenticated client opening them without bound would grow the uploads
+ * map — and every chunk PUT re-persists that whole map (see
+ * persist('uploads')), so cost per chunk is O(map). FINALIZED records do
+ * NOT count: they are already bounded by their 10 min grace
+ * (UPLOAD_FINALIZED_GRACE_MS), and counting them would 507 a batch upload
+ * mid-sync as soon as 64 files finished within the grace window.
+ * Mirrors the lock/prop advisory caps.
+ */
+export const MAX_UPLOAD_SESSIONS = 64;
 
 /** Advisory state exceeded a safety cap above; both stores surface it as
  *  HTTP 507 (RFC 4918 §7.1) rather than letting the DO storage cliff turn
@@ -617,8 +658,13 @@ export class MemoryDavStore implements DavStore, UploadStore {
   async init(session: UploadSession): Promise<void> {
     // Same lazy sweep the Durable Object runs: without it, a deployment with
     // no DAV_STATE binding accumulates abandoned sessions until recycle.
-    for (const [id, existing] of this.uploads) {
-      if (isExpired(existing)) this.uploads.delete(id);
+    reapUploadSessions(this.uploads);
+    let openSessions = 0;
+    for (const existing of this.uploads.values()) {
+      if (existing.finalized === undefined) openSessions += 1;
+    }
+    if (openSessions >= MAX_UPLOAD_SESSIONS) {
+      throw new DavLimitError('upload session cap reached');
     }
     this.uploads.set(session.uploadId, session);
   }
@@ -637,6 +683,7 @@ export class MemoryDavStore implements DavStore, UploadStore {
     const session = this.uploads.get(uploadId);
     if (session) {
       session.chunkMd5s[index] = md5;
+      session.lastActivity = Date.now();
       if (activeHost) session.activeHost = activeHost;
     }
   }
@@ -1004,10 +1051,18 @@ export class DavState extends DurableObject {
         }
         case '/upload-init': {
           const session = body['session'] as UploadSession;
-          // Lazy sweep: drop any expired sessions whenever a new one lands, so
-          // the map stays bounded even if clients abandon uploads.
-          for (const [id, existing] of this.uploads) {
-            if (isExpired(existing)) this.uploads.delete(id);
+          // Lazy sweep: drop expired AND idle-abandoned sessions whenever a
+          // new one lands, so the map stays bounded even if clients vanish.
+          reapUploadSessions(this.uploads);
+          // Safety cap (see MAX_UPLOAD_SESSIONS): refuse growth the DO could
+          // not persist cheaply — every later chunk re-serializes the map.
+          // Open sessions only; finalized records ride their 10 min grace.
+          let openSessions = 0;
+          for (const existing of this.uploads.values()) {
+            if (existing.finalized === undefined) openSessions += 1;
+          }
+          if (openSessions >= MAX_UPLOAD_SESSIONS) {
+            throw new DavLimitError('upload session cap reached');
           }
           this.uploads.set(session.uploadId, session);
           await this.persist('uploads');
@@ -1028,6 +1083,7 @@ export class DavState extends DurableObject {
           const session = this.uploads.get(body['uploadId'] as string);
           if (session) {
             session.chunkMd5s[body['index'] as number] = body['md5'] as string;
+            session.lastActivity = Date.now();
             const activeHost = body['activeHost'] as string | undefined;
             if (activeHost) session.activeHost = activeHost;
             // Only the uploads key changes here; every other key (locks,
