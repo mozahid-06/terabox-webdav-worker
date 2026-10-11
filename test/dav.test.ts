@@ -3188,12 +3188,14 @@ describe('round 9 pins: If fail-closed, target cap, refresh-only LOCK, 413, %5c'
 		const path = '/r9refresh.txt';
 		tb.seed(path, { content: 'seeded' });
 		const relTag = await request(path, { method: 'LOCK', headers: { If: `</r9refresh.txt>` } });
-		expect(relTag.status).toBe(409);
+		// §9.10.6 lock-token-matches-request-uri: 412 (was briefly 409 in
+		// round 9; see round-10 pins below for the foreign-token shape).
+		expect(relTag.status).toBe(412);
 		const bogus = await request(path, {
 			method: 'LOCK',
 			headers: { If: '(<opaquelocktoken:00000000-0000-0000-0000-000000000000:0>)' },
 		});
-		expect(bogus.status).toBe(409);
+		expect(bogus.status).toBe(412);
 		// Neither attempt may have left a lock behind: a real LOCK still succeeds.
 		const fresh = await request(path, {
 			method: 'LOCK',
@@ -3220,5 +3222,78 @@ describe('round 9 pins: If fail-closed, target cap, refresh-only LOCK, 413, %5c'
 		expect(evil.status).toBe(400);
 		const plain = await request('/r9a%5cb.txt', { method: 'PUT', body: 'x' });
 		expect(plain.status).toBe(201);
+	});
+});
+
+describe('round 10 pins: 412 refresh gate, volatile grace, stream cap, JSON path, empty If', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>r10</D:href></D:owner></D:lockinfo>';
+
+	async function lock(path: string): Promise<string> {
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		const token = res.headers.get('Lock-Token');
+		expect(token).toBeTruthy();
+		return token!;
+	}
+
+	it('body-less LOCK with only another resource\'s live token answers 412 (§9.10.6)', async () => {
+		const other = `/r10foreign-${crypto.randomUUID().slice(0, 8)}.txt`;
+		tb.seed(other, { content: 'locked elsewhere' });
+		tb.seed('/r10target.txt', { content: 'fresh target' });
+		const foreign = await lock(other);
+		const res = await request('/r10target.txt', { method: 'LOCK', headers: { If: `(${foreign})` } });
+		expect(res.status).toBe(412);
+	});
+
+	it('body-less refresh re-establishes a lock whose memory record was lost (volatile grace)', async () => {
+		const path = `/r10grace-${crypto.randomUUID().slice(0, 8)}.txt`;
+		tb.seed(path, { content: 'grace' });
+		const token = await lock(path);
+		resetDavVolatileState();
+		const refresh = await request(path, { method: 'LOCK', headers: { If: `(${token})` } });
+		expect(refresh.status).toBe(200);
+	});
+
+	it('a streamed XML body without content-length still trips the 413 cap', async () => {
+		const chunk = new TextEncoder().encode('x'.repeat(1024 * 1024));
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (let i = 0; i < 5; i += 1) controller.enqueue(chunk);
+				controller.close();
+			},
+		});
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body,
+		});
+		expect(res.status).toBe(413);
+	});
+
+	it('resumable begin refuses a JSON path with backslash-hidden traversal', async () => {
+		tb.seed('/r10dir', { isdir: 1 });
+		const res = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/r10dir/..\\..\\evil.txt', size: 10 }),
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('an empty If header is treated as absent on LOCK (parity with PUT)', async () => {
+		const path = `/r10emptyif-${crypto.randomUUID().slice(0, 8)}.txt`;
+		tb.seed(path, { content: 'seeded' });
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { If: '', 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
 	});
 });

@@ -185,6 +185,14 @@ function sanitizeDavPath(davPath: string): string {
       parts.pop();
       continue;
     }
+    // Same traversal premise as decodePathname's guard: a segment that only
+    // hides ".." behind backslashes must not reach the upstream path. The
+    // resumable-upload JSON body is already percent-decoded, so it skips
+    // decodePathname and lands here raw (§6.5-style capability bypass via
+    // `..\..\evil` would otherwise reach Terabox's storage un-normalized).
+    if (segment.includes('\\') && segment.split(/[\\/]/).includes('..')) {
+      throw new TeraboxError(-9, 'Invalid path encoding');
+    }
     parts.push(segment);
   }
   return '/' + parts.join('/');
@@ -710,7 +718,13 @@ async function checkMutationPreconditions(
         return null;
       }
       if (davPath.length > 1 && davPath.endsWith('/')) davPath = davPath.slice(0, -1);
-      return mount.toTera(sanitizeDavPath(davPath));
+      try {
+        return mount.toTera(sanitizeDavPath(davPath));
+      } catch {
+        // sanitizeDavPath throws TeraboxError(-9) for backslash-hidden
+        // traversal; a tag naming such a URI resolves to nothing (412).
+        return null;
+      }
     };
     const resolved: Array<string | null> = lists.map((list) =>
       list.tag === null ? path : resolveTag(list.tag),
@@ -1201,7 +1215,12 @@ async function handleResumable(
     if (!davPath.startsWith('/') || size < 0) return errorResponse('path and size required', 400);
     // The JSON path is already percent-decoded, but still needs `.`/`..`
     // collapsing — otherwise a crafted `..` walks above a ROOT_ID mount.
-    const absPath = mount.toTera(sanitizeDavPath(davPath));
+    let absPath: string;
+    try {
+      absPath = mount.toTera(sanitizeDavPath(davPath));
+    } catch {
+      return errorResponse('Invalid path encoding', 400);
+    }
     if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
 
     // Resumable upload is a write: it must respect locks and HTTP
@@ -2039,7 +2058,10 @@ async function handleLock(
   // presented tokens; the old `scheme://` text filter missed relative tags
   // like `</a>`. A malformed If answers 400 here, like every other method.
   const ifHeader = request.headers.get('If');
-  const parsedIf = ifHeader === null ? [] : parseIfHeader(ifHeader);
+  // An absent AND an empty `If:` header are both "no If header" — PUT has
+  // always ignored `If:` with an empty value (`if (ifHeader)` truthiness);
+  // LOCK must not 400 where PUT skips, so parse only non-empty values.
+  const parsedIf = ifHeader ? parseIfHeader(ifHeader) : [];
   if (parsedIf === null) return errorResponse('Bad Request', 400);
   const presentedLocks = parsedIf.flatMap((list) =>
     list.terms
@@ -2070,12 +2092,19 @@ async function handleLock(
     return errorResponse('lockinfo body required', 400);
   } else {
     // §9.10.1: a body-less LOCK is a refresh, never a create. A presented
-    // token that identifies no live lock covering this URI is not a valid
+    // token that applies to no live lock covering this URI is not a valid
     // refresh credential — without this check the acquire path below would
     // mint a brand-new lock from a bare `If: </relative>` or a bogus token.
+    // `applies` (not `recordTokens`) is the right membership: on the memory
+    // fallback it carries the never-brick volatile grace, exactly what PUT
+    // enforcement honors, so the same token that may write a locked file
+    // may also refresh it after its record was lost to an isolate rotation.
+    // RFC 4918 §9.10.6: this mismatch is the `lock-token-matches-request-uri`
+    // precondition — the status is 412, not 409 (409 is UNLOCK's
+    // `lock-token-matches-lock-discovery` and the missing-intermediate case).
     const refresh = await store.checkTokens(absPath, presentedLocks);
-    if (!refresh.recordTokens.some((t) => presentedLocks.includes(t))) {
-      return errorResponse('Lock Token Does Not Match Any Lock on this Resource', 409);
+    if (refresh.applies.length === 0) {
+      return errorResponse('Precondition Failed', 412);
     }
   }
   const resource = await statResource(client, absPath);

@@ -40,7 +40,9 @@ T=$(curl -s -D - -o /dev/null -X LOCK -u "$A" -H 'Content-Type: application/xml'
 ok "LOCK -> token" "$([ -n "$T" ] && echo yes || echo no)" yes
 ok "locked PUT w/o token -> 423" "$(code -X PUT -u "$A" --data x "$B$COL/f.txt")" 423
 ok "locked PUT with token -> 204" "$(code -X PUT -u "$A" -H "If: ($T)" --data 'with-token' "$B$COL/f.txt")" 204
+ok "body-less LOCK refresh -> 200" "$(code -X LOCK -u "$A" -H "If: ($T)" "$B$COL/f.txt")" 200
 ok "UNLOCK -> 204" "$(code -X UNLOCK -u "$A" -H "Lock-Token: $T" "$B$COL/f.txt")" 204
+ok "body-less LOCK dead token -> 412" "$(code -X LOCK -u "$A" -H "If: ($T)" "$B$COL/f.txt")" 412
 
 echo "== If header semantics =="
 ok "negated forged token PUT -> 201/204" "$(code -X PUT -u "$A" -H 'If: (not <opaquelocktoken:00000000-0000-0000-0000-000000000000:0>)' --data neg "$B$COL/not.txt")" 201

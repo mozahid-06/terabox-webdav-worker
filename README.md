@@ -280,7 +280,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/mkdir -p /mnt/terabox
 ExecStart=/usr/bin/rclone mount terabox: /mnt/terabox --vfs-cache-mode full
+# fusermount3 -u on distros that only ship fusermount3
 ExecStop=/bin/fusermount -u /mnt/terabox
 Restart=on-failure
 RestartSec=5
