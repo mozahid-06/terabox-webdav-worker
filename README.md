@@ -41,9 +41,8 @@ What you can do once deployed:
 ## Quick start
 
 ```sh
-# 1. In your browser, log in to terabox.com and copy your session cookie:
-#    DevTools → Application → Storage → Cookies → https://www.terabox.com
-#    (name=value; name2=value2 — see "Getting your TeraBox COOKIE" below)
+# 1. Log in to terabox.com and copy your session cookie from the Network
+#    tab (see "Getting your TeraBox COOKIE" below for exact steps)
 
 # 2. Deploy the worker with your credentials as Secrets (repo carries none):
 git clone git@github.com:taxin-404/terabox-webdav-worker.git
@@ -117,10 +116,23 @@ configuration survives every push.
 
 1. Log in to **[terabox.com](https://www.terabox.com)** (or your regional
    mirror) in a desktop browser.
-2. Open DevTools → **Application → Storage → Cookies** and find
-   `https://www.terabox.com`.
-3. Copy the cookies as a single `name=value; name2=value2` string and paste
-   it into the `COOKIE` Secret.
+2. Open DevTools → **Network** and reload the page (`Ctrl`+`Shift`+`R`).
+3. Click the first request in the list (the `document` entry, usually on
+   top) and open its **Headers** tab.
+4. Under **Request Headers**, right-click the `Cookie:` line and choose
+   **Copy value**. That gives you exactly the one-line string the Secret
+   needs:
+
+   ```
+   ndus=...; browserid=...; lang=...; ...
+   ```
+
+   > **Don't use the Console.** `document.cookie` omits `httpOnly` cookies —
+   > and `ndus` is `httpOnly` — so you'd copy a string without the one cookie
+   > that matters. The Network `Cookie:` header includes everything.
+5. Paste that string into the `COOKIE` Secret: Worker → **Settings →
+   Variables and secrets → Add variable** → Key `COOKIE`, tick **Secret**,
+   paste the value, save (the "Add variable and deploy" button deploys it).
 
 What matters:
 
