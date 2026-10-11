@@ -88,6 +88,12 @@ service from Cloudflare.
   `stoken` are really the **wrong cluster/origin** — `d.terabox.com`-flavoured
   hosts reject the session; same-origin `dm*` clusters accept it — see
   `docs/live-testing.md` "Root cause found".)
+  Historical "paste the full cookie incl. `stoken`" advice is Baidu web
+  boilerplate, and the `stoken` name was likely **mistaken for `browserid`**
+  (the latter is the `devuid` query param on app-protocol calls like
+  `tcc/query` — a device id, not a session credential). The takeaway: verify
+  the real upload path empirically instead of assuming the pan.baidu.com
+  recipe applies to TeraBox.
 - `JSTOKEN` is optional: only the cookie the WebDAV client sends is ever
   echoed back; the page-minted jsToken stays server-side.
 - `bdstoken` is embedded in the account page HTML (used for `filemanager` +
