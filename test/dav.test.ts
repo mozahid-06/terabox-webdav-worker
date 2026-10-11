@@ -3085,3 +3085,68 @@ describe('round 7 pins: lock conflicts, forged tokens, caps', () => {
 		expect((await request('/a.txt', { method: 'PUT', body: 'blocked' })).status).toBe(423);
 	});
 });
+
+describe('round 8 pins: If Resource-Tags and negation (memory fallback)', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>r8</D:href></D:owner></D:lockinfo>';
+
+	const lock = async (path: string): Promise<string> => {
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		return res.headers.get('Lock-Token')!;
+	};
+
+	it('COPY accepts a dest-tagged token over a locked destination (§7.5.1)', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const destPath = `/r8mem-dest-${tag}.txt`;
+		tb.seed(destPath, { content: 'locked dest\n' });
+		const token = await lock(destPath);
+		const copy = await request('/a.txt', {
+			method: 'COPY',
+			headers: {
+				Destination: ORIGIN + destPath,
+				If: `<${ORIGIN}${destPath}> (${token})`,
+			},
+		});
+		expect(copy.status).toBe(204);
+	});
+
+	it('MOVE accepts source and destination tokens in tagged lists (§7.5)', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const destPath = `/r8mem-mvdest-${tag}.txt`;
+		tb.seed(destPath, { content: 'locked dest\n' });
+		const srcToken = await lock('/a.txt');
+		const destToken = await lock(destPath);
+		const move = await request('/a.txt', {
+			method: 'MOVE',
+			headers: {
+				Destination: ORIGIN + destPath,
+				If:
+					`<${ORIGIN}/a.txt> (${srcToken}) ` +
+					`<${ORIGIN}${destPath}> (${destToken})`,
+			},
+		});
+		expect(move.status).toBe(204);
+	});
+
+	it('(not <live-token>) on the locked resource itself fails the condition', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const target = `/r8mem-not-${tag}.txt`;
+		tb.seed(target, { content: 'locked\n' });
+		const token = await lock(target);
+		// Pre-fix `not` was case-sensitively MISSED, the term parsed
+		// positive, the real token satisfied it and the write proceeded
+		// (204). The negation makes it false → header false → 412.
+		const put = await request(target, {
+			method: 'PUT',
+			headers: { If: `(not ${token})` },
+			body: 'negated',
+		});
+		expect(put.status).toBe(412);
+	});
+});

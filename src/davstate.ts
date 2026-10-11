@@ -281,6 +281,17 @@ function purgeAt(locks: Map<string, LockRecord[]>, path: string): LockRecord[] {
   return live;
 }
 
+/** Drop expired records on every path (cap headroom — the DO's alarm does
+ *  the same job on a timer; the memory fallback has no alarm at all). */
+function sweepExpiredLocks(locks: Map<string, LockRecord[]>): void {
+  const now = Date.now();
+  for (const [key, records] of locks) {
+    const live = records.filter((r) => r.expiresAt > now);
+    if (live.length > 0) locks.set(key, live);
+    else locks.delete(key);
+  }
+}
+
 /** Locks on the path itself, plus Infinity-depth locks on its ancestors. */
 /**
  * Does the lock stored at `key` govern `path`? Exact hit, or an
@@ -392,7 +403,12 @@ function coreLockAcquire(
   // Safety caps (see DavLimitError): refuse growth the DO could not persist.
   const atPath = locks.get(path);
   if (!atPath && locks.size >= MAX_LOCK_PATHS) {
-    throw new DavLimitError('lock path cap reached');
+    // Expired records on paths nobody re-locks still occupy the cap — and
+    // the memory fallback never sweeps them. Without this, an isolate that
+    // has ever held 4096 distinct (now-expired) locks answers 507 to every
+    // new LOCK until one of those old paths is touched again.
+    sweepExpiredLocks(locks);
+    if (locks.size >= MAX_LOCK_PATHS) throw new DavLimitError('lock path cap reached');
   }
   if (atPath && atPath.length >= MAX_LOCK_RECORDS_PER_PATH) {
     throw new DavLimitError('lock record cap reached');
@@ -679,7 +695,7 @@ export function createDavStore(env: Env): DavStore & UploadStore {
 /* Durable Object client                                               */
 /* ------------------------------------------------------------------ */
 
-const DO_NAME = 'terabox-dav-state';
+export const DO_NAME = 'terabox-dav-state';
 
 export class RemoteDavStore implements DavStore, UploadStore {
   constructor(private readonly ns: DurableObjectNamespace) {}
@@ -1037,6 +1053,10 @@ export class DavState extends DurableObject {
               Object.assign(session, prev);
               throw err;
             }
+            // The session's expiry just moved from the 24h upload TTL to
+            // finalizedAt+grace: re-arm, or the sweep still waits at the
+            // old, much later time and the record outlives its window.
+            await this.armSweep();
           }
           return Response.json({});
         }

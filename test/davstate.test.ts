@@ -1,7 +1,9 @@
-import { env, SELF } from 'cloudflare:test';
+import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	createDavStore,
+	DO_NAME,
+	MAX_LOCK_PATHS,
 	MemoryDavStore,
 	UPLOAD_FINALIZED_GRACE_MS,
 	UPLOAD_SESSION_TTL_MS,
@@ -54,6 +56,35 @@ afterEach(() => {
 });
 
 describe('DAV_STATE Durable Object', () => {
+	it('re-arms the sweep when finalize moves the expiry to +grace', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const target = `/r8-fin-${tag}.txt`;
+		const data = new Uint8Array(5).fill(9);
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: target, size: data.byteLength }),
+		});
+		expect(begin.status).toBe(200);
+		const { uploadId, chunkCount } = (await begin.json()) as { uploadId: string; chunkCount: number };
+		expect(chunkCount).toBe(1);
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: data });
+		expect(put.status).toBe(200);
+		const fin = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(fin.status).toBe(201);
+		const t0 = Date.now();
+		// Pre-fix the alarm still pointed at the session's original 24h TTL
+		// (or whatever an earlier state change armed): the finalized record
+		// lingered in DO storage for up to a day past its 10-minute grace.
+		// cloudflare:test's `env` type omits the DO binding (the src Env
+		// declares it optional); this project's config binds it.
+		const ns = (env as unknown as { DAV_STATE: DurableObjectNamespace }).DAV_STATE;
+		const stub = ns.get(ns.idFromName(DO_NAME));
+		const alarm = await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm());
+		expect(alarm).not.toBeNull();
+		expect(alarm!).toBeLessThanOrEqual(t0 + UPLOAD_FINALIZED_GRACE_MS + 10_000);
+	});
+
 	it('enforces a lock across the DO round-trip: 423, then 204 with the token', async () => {
 		const lock = await request(srcPath, {
 			method: 'LOCK',
@@ -327,5 +358,113 @@ describe('metadata generation (cross-isolate cache invalidation)', () => {
 				'</D:prop></D:set></D:propertyupdate>',
 		});
 		expect(res.status).toBe(507);
+	});
+});
+
+describe('round 8 pins: If Resource-Tags, negation, sweep, caps', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>r8</D:href></D:owner></D:lockinfo>';
+
+	const lock = async (path: string): Promise<string> => {
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		return res.headers.get('Lock-Token')!;
+	};
+
+	it('COPY accepts a dest-tagged token over a locked destination (§7.5.1)', async () => {
+		// Pre-fix every list was judged against the Request-URI, so Td
+		// "failed" on the (unlocked) source and the header answered 412 —
+		// the only RFC- sanctioned way to overwrite a locked destination
+		// was unreachable.
+		const tag = crypto.randomUUID().slice(0, 8);
+		const srcPath = `/r8-cp-src-${tag}.txt`;
+		const destPath = `/r8-cp-dest-${tag}.txt`;
+		tb.seed(srcPath, { content: 'copy me\n' });
+		tb.seed(destPath, { content: 'locked dest\n' });
+		const token = await lock(destPath);
+		const copy = await request(srcPath, {
+			method: 'COPY',
+			headers: {
+				Destination: ORIGIN + destPath,
+				If: `<${ORIGIN}${destPath}> (${token})`,
+			},
+		});
+		expect(copy.status).toBe(204);
+	});
+
+	it('MOVE accepts source and destination tokens in tagged lists (§7.5)', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const srcPath = `/r8-mv-src-${tag}.txt`;
+		const destPath = `/r8-mv-dest-${tag}.txt`;
+		tb.seed(srcPath, { content: 'move me\n' });
+		tb.seed(destPath, { content: 'locked dest\n' });
+		const srcToken = await lock(srcPath);
+		const destToken = await lock(destPath);
+		const move = await request(srcPath, {
+			method: 'MOVE',
+			headers: {
+				Destination: ORIGIN + destPath,
+				If:
+					`<${ORIGIN}${srcPath}> (${srcToken}) ` +
+					`<${ORIGIN}${destPath}> (${destToken})`,
+			},
+		});
+		expect(move.status).toBe(204);
+	});
+
+	it('rejects a tagged token that belongs to a different resource (§10.4.10)', async () => {
+		// The tag says "evaluate this token against /somewhere-else", where
+		// it applies to nothing → the list is false and the header has no
+		// other list → 412. Pre-fix the token was judged against the
+		// Request-URI, matched its own lock, and the DELETE sailed through.
+		const tag = crypto.randomUUID().slice(0, 8);
+		const srcPath = `/r8-foreign-${tag}.txt`;
+		tb.seed(srcPath, { content: 'delete me\n' });
+		const token = await lock(srcPath);
+		const res = await request(srcPath, {
+			method: 'DELETE',
+			headers: { If: `<${ORIGIN}/r8-elsewhere-${tag}.txt> (${token})` },
+		});
+		expect(res.status).toBe(412);
+	});
+
+	it('treats `not` case-insensitively: (not <forged>) negates (ABNF §2.3)', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const target = `/r8-not-${tag}.txt`;
+		tb.seed(target, { content: 'unlocked\n' });
+		const forged = `opaquelocktoken:${crypto.randomUUID()}:${Date.now() + 3600000}`;
+		// Pre-fix `not` parsed as a positive term, the forgery was
+		// "invalid", and the request died412 despite the negation making
+		// the condition true.
+		const put = await request(target, {
+			method: 'PUT',
+			headers: { If: `(not <${forged}>)` },
+			body: 'negated',
+		});
+		expect(put.status).toBe(204);
+	});
+
+	it('lock path cap sweeps expired records before refusing (memory fallback)', async () => {
+		const store = new MemoryDavStore();
+		const req = { shared: false, depth: '0', owner: '', presented: [] };
+		for (let i = 0; i < MAX_LOCK_PATHS; i += 1) {
+			// seconds: 0 → expiresAt = now → already expired for the next
+			// check, so the map fills with dead entries (the fallback has
+			// no alarm to reap them).
+			await store.lockAcquire(`/r8sweep-${i}.txt`, { ...req, seconds: 0 });
+		}
+		// Pre-fix this40th path hit `locks.size >= MAX_LOCK_PATHS` against
+		// 4096 expired corpses and answered 507 forever. Post-fix the sweep
+		// clears the dead entries — the one live lock below must survive.
+		await store.lockAcquire('/r8sweep-live.txt', { ...req, seconds: 3600 });
+		const after = await store.lockAcquire('/r8sweep-new.txt', { ...req, seconds: 3600 });
+		expect(after.ok).toBe(true);
+		const state = await store.describe(['/r8sweep-live.txt']);
+		expect(state['/r8sweep-live.txt']!.locks).toHaveLength(1);
 	});
 });

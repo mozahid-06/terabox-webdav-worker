@@ -467,14 +467,40 @@ interface IfTerm {
   value: string;
 }
 
-/** Parse `If: (<token> [etag]) (Not <token2> [etag2])` into OR-ed lists. */
-function parseIfHeader(header: string): IfTerm[][] | null {
-  const lists: IfTerm[][] = [];
+/**
+ * One paren list plus the Resource-Tag naming the resource its terms
+ * belong to (RFC 4918 §10.4.1 tagged-list production); null = untagged,
+ * i.e. the Request-URI per §10.4.4.
+ */
+interface IfList {
+  tag: string | null;
+  terms: IfTerm[];
+}
+
+/**
+ * Parse `If: [<tag>] (<token> [etag]) (Not <token2> …)` into OR-ed lists,
+ * keeping each list's Resource-Tag. A `<…>` outside the parens counts as a
+ * tag only when a list follows it (tagged-list = Resource-tag 1*List); the
+ * paren-free forms of §10.4.1 (`If: <token>`, `If: ["etag"]`) are bare
+ * terms on the Request-URI. `Not` is matched case-insensitively — the ABNF
+ * literals are case-insensitive (RFC 5234 §2.3), so `(not <t>)` and
+ * `(NOT <t>)` are negations too.
+ */
+function parseIfHeader(header: string): IfList[] | null {
+  const lists: IfList[] = [];
   const listRe = /\(([^()]*)\)/g;
+  let tag: string | null = null;
+  let gapFrom = 0;
   let lm: RegExpExecArray | null;
   while ((lm = listRe.exec(header)) !== null) {
+    // Text between the previous list and this one: a trailing `<…>` there
+    // is this list's Resource-Tag. The tag stays in force for the list's
+    // siblings until another tag replaces it (§10.4.1: 1*List per tag).
+    const tagMatch = /<([^<>]*)>\s*$/.exec(header.slice(gapFrom, lm.index));
+    if (tagMatch) tag = tagMatch[1] ?? null;
+    gapFrom = listRe.lastIndex;
     const terms: IfTerm[] = [];
-    const termRe = /(Not\s+)?<([^>]*)>|\[([^\]]*)\]/g;
+    const termRe = /(Not\s+)?<([^>]*)>|\[([^\]]*)\]/gi;
     let tm: RegExpExecArray | null;
     while ((tm = termRe.exec(lm[1] ?? '')) !== null) {
       if (tm[2] !== undefined) {
@@ -483,14 +509,14 @@ function parseIfHeader(header: string): IfTerm[][] | null {
         terms.push({ negated: Boolean(tm[1]), kind: 'etag', value: tm[3] ?? '' });
       }
     }
-    lists.push(terms);
+    lists.push({ tag, terms });
   }
   if (lists.length > 0) return lists;
   // RFC 4918 §10.2.1 also legalizes the paren-free forms: a bare
   // `If: <opaquelocktoken:…>` (Tag-list) and `If: ["etag"]` (No-tag-list)
   // are each a single one-term list. Rejecting them with 400 broke clients
   // that send exactly those shapes.
-  const bareRe = /(Not\s+)?<([^>]*)>|\[([^\]]*)\]/g;
+  const bareRe = /(Not\s+)?<([^>]*)>|\[([^\]]*)\]/gi;
   const terms: IfTerm[] = [];
   let tm: RegExpExecArray | null;
   while ((tm = bareRe.exec(header)) !== null) {
@@ -500,7 +526,7 @@ function parseIfHeader(header: string): IfTerm[][] | null {
       terms.push({ negated: Boolean(tm[1]), kind: 'etag', value: tm[3] ?? '' });
     }
   }
-  return terms.length > 0 ? [terms] : null;
+  return terms.length > 0 ? [{ tag: null, terms }] : null;
 }
 
 /**
@@ -560,11 +586,21 @@ async function checkHttpPreconditions(
   return null;
 }
 
+/**
+ * Precondition gate for every mutating method: unmet `If` (and the
+ * mod_dav-style invalid-token upgrade) answers 412/423, then lock
+ * enforcement applies. Each list is evaluated against the resource it
+ * identifies — the Resource-Tag when present, the Request-URI when not
+ * (RFC 4918 §10.4.4) — and the header as a whole is true when any list is
+ * true (§10.4.3), so a dest-tagged token (§7.5.1) can satisfy a COPY whose
+ * Request-URI holds no lock token at all.
+ */
 async function checkMutationPreconditions(
   request: Request,
   client: TeraboxClient,
   store: DavStore,
   path: string,
+  mount: Mount,
   opts?: { enforce?: boolean },
 ): Promise<Response | null> {
   // HTTP conditionals first (§6 evaluation order): a failing If-Match is a
@@ -580,22 +616,89 @@ async function checkMutationPreconditions(
     if (!lists) return errorResponse('Bad Request', 400);
     check = await store.checkTokens(path, presented);
     const applies = new Set(check.applies);
+    // Resolve each Resource-Tag exactly like a Destination URI. A tag that
+    // names another origin or leaves the mount makes its lists false — a
+    // failed condition (§10.4.10), never a 400: the header is well-formed,
+    // the resource it names is simply not one whose locks we track.
+    const requestOrigin = new URL(request.url);
+    const resolveTag = (tag: string): string | null => {
+      let url: URL;
+      try {
+        url = new URL(tag, request.url);
+      } catch {
+        return null;
+      }
+      if (url.host !== requestOrigin.host) return null;
+      let davPath: string;
+      try {
+        davPath = decodePathname(url.pathname.split(/[?#]/, 1)[0]!);
+      } catch {
+        return null;
+      }
+      if (davPath.length > 1 && davPath.endsWith('/')) davPath = davPath.slice(0, -1);
+      if (mount.base) {
+        if (davPath === mount.base) davPath = '/';
+        else if (davPath.startsWith(mount.base + '/')) davPath = davPath.slice(mount.base.length);
+        else return null;
+      }
+      return mount.toTera(sanitizeDavPath(davPath));
+    };
+    const resolved: Array<string | null> = lists.map((list) =>
+      list.tag === null ? path : resolveTag(list.tag),
+    );
+    // One store lookup per tagged resource: which of the submitted tokens
+    // actually apply there (untagged terms reuse the Request-URI result
+    // above, byte-for-byte the pre-tag behavior).
+    const taggedTokens = new Map<string, Set<string>>();
+    lists.forEach((list, index) => {
+      const target = resolved[index]!;
+      if (list.tag === null || target === null || target === path) return;
+      for (const term of list.terms) {
+        if (term.kind !== 'token') continue;
+        let set = taggedTokens.get(target);
+        if (!set) taggedTokens.set(target, (set = new Set()));
+        set.add(term.value);
+      }
+    });
+    const taggedApplies = new Map<string, Set<string>>();
+    for (const [target, set] of taggedTokens) {
+      const checked = await store.checkTokens(target, [...set]);
+      taggedApplies.set(target, new Set(checked.applies));
+    }
     let anyTrue = false;
     const invalidTokens = new Set<string>();
-    let etag: string | null | undefined;
-    for (const terms of lists) {
-      let listTrue = terms.length > 0;
-      for (const term of terms) {
+    const etags = new Map<string, string | null>();
+    for (let i = 0; i < lists.length; i += 1) {
+      const list = lists[i]!;
+      const target = resolved[i]!;
+      let listTrue = list.terms.length > 0;
+      for (const term of list.terms) {
         let value: boolean;
         if (term.kind === 'token') {
-          value = applies.has(term.value);
-          if (!term.negated && !value) invalidTokens.add(term.value);
-        } else {
-          if (etag === undefined) {
-            const dentry = await statResourceFresh(client, path);
-            etag = dentry ? dentry.etag : null;
+          if (target === null) {
+            value = false;
+          } else if (list.tag === null || target === path) {
+            value = applies.has(term.value);
+            // Only Request-URI terms feed the mod_dav-style invalid-token
+            // upgrade (412/423); a tagged token is judged against the
+            // resource its tag names (§10.4.10) and must not poison an
+            // otherwise-satisfiable header (§10.4.3 OR-of-lists).
+            if (!term.negated && !value) invalidTokens.add(term.value);
+          } else {
+            value = taggedApplies.get(target)?.has(term.value) ?? false;
           }
-          value = etag !== null && etag === term.value.trim();
+        } else {
+          if (target === null) {
+            value = false;
+          } else {
+            let etag = etags.get(target);
+            if (etag === undefined) {
+              const dentry = await statResourceFresh(client, target);
+              etag = dentry ? dentry.etag : null;
+              etags.set(target, etag);
+            }
+            value = etag !== null && etag === term.value.trim();
+          }
         }
         if (term.negated) value = !value;
         listTrue = listTrue && value;
@@ -607,7 +710,7 @@ async function checkMutationPreconditions(
     // `<DAV:no-lock>` is the pseudo-token of the RFCs' own examples: it
     // never identifies a lock, so it fails as a plain condition (412);
     // a real lock-token-shaped value on a locked resource is a lock
-    // problem and answers 423.
+    // problem and answers 423. (Untagged terms only — see above.)
     if (invalidTokens.size > 0) {
       const lockShaped = [...invalidTokens].some(
         (t) => t.startsWith('opaquelocktoken:') || t.startsWith('urn:uuid:'),
@@ -1018,7 +1121,7 @@ async function handleResumable(
 
     // Resumable upload is a write: it must respect locks and HTTP
     // preconditions exactly like PUT (the resource is created at finalize).
-    const pre = await checkMutationPreconditions(request, client, store, absPath);
+    const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
     if (pre) return pre;
 
     const parentCheck = await requireParent(client, absPath);
@@ -1326,7 +1429,7 @@ async function handleMkcol(
   // RFC 4918 §9.3.1: an intermediate collection must already exist (409).
   const parentCheck = await requireParent(client, absPath);
   if (parentCheck) return parentCheck;
-  const pre = await checkMutationPreconditions(request, client, store, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
   if (pre) return pre;
   try {
     await client.mkdir(absPath);
@@ -1606,7 +1709,7 @@ async function handlePut(
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
 
-  const pre = await checkMutationPreconditions(request, client, store, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
   if (pre) return pre;
 
   // RFC 4918 §9.7.1: creation needs existing intermediate collections (409).
@@ -1664,7 +1767,7 @@ async function handleDelete(
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   const resource = await statResourceFresh(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
-  const pre = await checkMutationPreconditions(request, client, store, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
   if (pre) return pre;
   await client.fileOperation('delete', [{ path: absPath }]);
   await safeRelocate(store, [{ src: absPath, mode: 'forget', recursive: resource.isDir }]);
@@ -1764,7 +1867,7 @@ async function handleMoveCopy(
   // source blocks MOVE but never COPY — copying a locked resource without
   // its token is fine (litmus locks/copy), overwriting a locked target is
   // not, so the destination is enforced separately for both methods.
-  const pre = await checkMutationPreconditions(request, client, store, srcPath, {
+  const pre = await checkMutationPreconditions(request, client, store, srcPath, mount, {
     enforce: method === 'MOVE',
   });
   if (pre) return pre;
@@ -1985,7 +2088,7 @@ async function handleProppatch(
   }
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
-  const pre = await checkMutationPreconditions(request, client, store, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
   if (pre) return pre;
 
   const scope = collectXmlScope(body);
