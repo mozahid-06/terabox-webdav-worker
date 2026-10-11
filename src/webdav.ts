@@ -177,6 +177,12 @@ export function decodePathname(pathname: string): string {
  * `decodePathname`, so without this a crafted `..` could walk above a
  * ROOT_ID mount before `toTera` concatenates it.
  */
+/** True if any path segment is the reserved `.DAV` metadata directory
+ *  name (case-insensitive). */
+function isReservedDavSegment(davPath: string): boolean {
+  return davPath.split('/').some((segment) => segment.toUpperCase() === '.DAV');
+}
+
 function sanitizeDavPath(davPath: string): string {
   const parts: string[] = [];
   for (const segment of davPath.split('/')) {
@@ -249,6 +255,13 @@ export function mountBasePath(base: string): string {
 const MAX_XML_BODY = 4 * 1024 * 1024;
 /** Hard cap for the JSON `POST /.resumable` begin body (path + size). */
 const RESUMABLE_BEGIN_MAX = 64 * 1024;
+/** PUT bodies above this (Content-Length known) stream through the multipart
+ *  pipeline instead of buffering; they stay within one 4 MiB chunk below. */
+const STREAM_PUT_MIN = 4 * 1024 * 1024;
+/** PUT bodies without a usable Content-Length must buffer (precreate needs
+ *  the size upfront) — capped here so a chunked stream cannot exhaust the
+ *  128 MB isolate. Above this: send Content-Length and the body streams. */
+const PUT_BUFFER_MAX = 32 * 1024 * 1024;
 
 /**
  * Buffer a request body up to `max` bytes; `null` = over the cap (the
@@ -1153,6 +1166,18 @@ export async function handleWebDav(
 
   const absPath = mount.toTera(davPath);
 
+  // Reserved metadata segment (litmus 0.18 `protected` suite; the
+  // CVE-2026-42535 class in mod_dav_fs): a path whose segment is `.DAV`
+  // — case-insensitively, so `.dav`/`.Dav` cannot shadow it — is never
+  // reachable by ANY method (OPTIONS excepted, being harmless discovery).
+  // This worker keeps no server-internal store under `.DAV` today, but
+  // reserving the name keeps clients from planting a decoy directory that
+  // a future metadata implementation — or a downstream server — would then
+  // trust; every litmus protected status set admits 403 as the rejection.
+  if (method !== 'OPTIONS' && isReservedDavSegment(davPath)) {
+    return errorResponse('Forbidden', 403);
+  }
+
   switch (method) {
     case 'OPTIONS':
       return new Response(null, {
@@ -1870,9 +1895,6 @@ async function handlePut(
   const parentCheck = await requireParent(client, absPath);
   if (parentCheck) return parentCheck;
 
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  const size = bytes.byteLength;
-
   let existing: { isDir: boolean } | null = null;
   try {
     existing = await statResourceFresh(client, absPath);
@@ -1887,9 +1909,33 @@ async function handlePut(
   if (existing && existing.isDir) return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
   const existed = Boolean(existing);
 
+  // A KNOWN size above the threshold streams through Terabox's multipart
+  // pipeline (precreate → superfile2 chunks → create) so a body the edge
+  // happily delivers (~100 MB on this plan) never has to coexist with the
+  // isolate's other 128 MB. An unknown size cannot precreate, so it still
+  // buffers — under a hard cap. The stat above runs first in both paths so
+  // 405/409 answer before a single body byte is pulled.
+  const declared = Number(request.headers.get('content-length'));
+  const streaming = Number.isFinite(declared) && declared > STREAM_PUT_MIN;
+  let bytes: Uint8Array | null = null;
+  if (!streaming) {
+    bytes = await readBytesCapped(request, PUT_BUFFER_MAX);
+    if (bytes === null) return errorResponse('Payload Too Large', 413);
+  }
+
   try {
-    await client.upload(absPath, size, Date.now(), bytes, existed ? 3 : 0);
+    if (streaming) {
+      const body = request.body;
+      if (!body) throw new TeraboxError(2, 'Missing request body');
+      await client.uploadStream(absPath, declared, Date.now(), body, existed ? 3 : 0);
+    } else {
+      await client.upload(absPath, bytes!.byteLength, Date.now(), bytes!, existed ? 3 : 0);
+    }
   } catch (error) {
+    // Only observable while streaming: the body stopped short of its
+    // Content-Length. Finalizing would publish a truncated file, so this is
+    // a client-side fault (400) — NOT -9's usual 404 "target missing".
+    if (streaming && errIsNum(error, -9)) return errorResponse('Bad Request', 400);
     if (errIsNum(error, -8)) {
       // A path conflict already counts as the resource existing; report a CONFLICT.
       return errorResponse('Conflict', 409);
@@ -1982,6 +2028,7 @@ async function handleMoveCopy(
     else return errorResponse('Not Found', 404);
   }
   if (destDav.length > 1 && destDav.endsWith('/')) destDav = destDav.slice(0, -1);
+  if (isReservedDavSegment(destDav)) return errorResponse('Forbidden', 403);
   const destPath = mount.toTera(destDav);
   if (mount.isRoot(destPath) || destPath === '') return errorResponse('Forbidden', 403);
 

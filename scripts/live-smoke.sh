@@ -2,9 +2,9 @@
 # Full live WebDAV smoke against the deployed worker.
 # STANDING RULE: run this after every `git push` (and after every deploy)
 # and do not consider the change done until it passes.
-#   BASE=https://terabox.taxin-404.workers.dev/dav USER=taxin:404 ./scripts/live-smoke.sh
+#   BASE=https://davbox.crazy-gooner-mf.workers.dev/dav USER=taxin:404 ./scripts/live-smoke.sh
 set -u
-B="${BASE:-https://terabox.taxin-404.workers.dev/dav}"
+B="${BASE:-https://davbox.crazy-gooner-mf.workers.dev/dav}"
 A="${USER_CRED:-taxin:404}"
 PASS=0; FAIL=0
 ok() { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf "  ok  %-58s %s\n" "$1" "$2"; else FAIL=$((FAIL+1)); printf "  XX  %-58s %s (want %s)\n" "$1" "$2" "$3"; fi; }

@@ -9,7 +9,7 @@ import {
 } from '../src/webdav';
 import type { DavStore, RelocateItem } from '../src/davstate';
 import { validateXml } from '../src/davxml';
-import { resetTeraboxCaches } from '../src/terabox';
+import { resetTeraboxCaches, TeraboxClient } from '../src/terabox';
 import { getChunkSize } from '../src/sign';
 import { AUTH, MockTerabox, ORIGIN, UPLOAD_BASE, installMock } from './helpers';
 
@@ -3533,5 +3533,207 @@ describe('round 11 pins: LOCK If semantics, body caps, upload session cap, final
 		// The claim was released by the failure: a clean retry succeeds.
 		const retry = await request(`/.resumable/${begun.uploadId}/finalize`, { method: 'POST' });
 		expect(retry.status).toBe(201);
+	});
+});
+
+describe('litmus protected: .DAV is a reserved segment (403 on every method)', () => {
+	it('rejects every read/write/admin method on .DAV paths with 403', async () => {
+		// Seed the exact shapes litmus's protected suite uses: a collection
+		// `.DAV` under a test collection, plus a file inside it.
+		expect((await request('/.DAV/test.txt', { method: 'PUT', body: 'x' })).status).toBe(403);
+		const methods: Array<[string, RequestInit]> = [
+			['GET', {}],
+			['HEAD', {}],
+			['PUT', { body: 'x' }],
+			['DELETE', {}],
+			['PROPFIND', {}],
+			['PROPPATCH', { headers: { 'Content-Type': 'application/xml' }, body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>' }],
+			['LOCK', { headers: { 'Content-Type': 'application/xml' }, body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>x</D:owner></D:lockinfo>' }],
+			['UNLOCK', {}],
+			['MKCOL', {}],
+		];
+		for (const [method, init] of methods) {
+			const res = await request('/.DAV/test.txt', { method, ...init });
+			expect(res.status, `${method} /dav/.DAV/test.txt`).toBe(403);
+		}
+		// The collection itself and deeper paths are equally reserved.
+		expect((await request('/.DAV', { method: 'PROPFIND' })).status).toBe(403);
+		expect((await request('/.DAV', { method: 'GET' })).status).toBe(403);
+		expect((await request('/.DAV', { method: 'DELETE' })).status).toBe(403);
+		expect((await request('/.DAV', { method: 'MKCOL' })).status).toBe(403);
+		expect((await request('/docs/.DAV/deeper', { method: 'GET' })).status).toBe(403);
+		expect((await request('/sub/.DAV/x', { method: 'PUT', body: 'x' })).status).toBe(403);
+	}, 30_000);
+
+	it('is case-insensitive: .dav and .Dav are reserved too', async () => {
+		expect((await request('/.dav/test.txt', { method: 'GET' })).status).toBe(403);
+		expect((await request('/.Dav/test.txt', { method: 'PUT', body: 'x' })).status).toBe(403);
+	});
+
+	it('blocks COPY/MOVE on both source and reserved destinations', async () => {
+		// Destination into the reserved directory.
+		let res = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/.DAV/copied.txt', Overwrite: 'T' },
+		});
+		expect(res.status).toBe(403);
+		res = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/.DAV/moved.txt', Overwrite: 'T' },
+		});
+		expect(res.status).toBe(403);
+		// Source out of / under the reserved directory.
+		res = await request('/.DAV/test.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/extracted.txt' },
+		});
+		expect(res.status).toBe(403);
+		res = await request('/docs/.DAV/x', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/extracted2.txt' },
+		});
+		expect(res.status).toBe(403);
+		// The reserved tree was never created.
+		const listing = await request('/', { method: 'PROPFIND', headers: { Depth: '1' } });
+		expect(listing.status).toBe(207);
+		expect(await listing.text()).not.toContain('.DAV');
+	});
+
+	it('leaves OPTIONS on .DAV allowed (harmless discovery)', async () => {
+		expect((await request('/.DAV/test.txt', { method: 'OPTIONS' })).status).toBe(204);
+	});
+
+	it('does not over-block: a name merely containing .DAV stays usable', async () => {
+		expect((await request('/.DAVx', { method: 'PUT', body: 'keeper' })).status).toBe(201);
+		expect((await request('/.DAVx', { method: 'GET' })).status).toBe(200);
+		expect((await request('/a.DAV', { method: 'MKCOL' })).status).toBe(201);
+		expect((await request('/a.DAV', { method: 'DELETE' })).status).toBe(204);
+		expect((await request('/.DAVx', { method: 'DELETE' })).status).toBe(204);
+	});
+
+	it('normal traffic is untouched by the reservation', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect((await request('/docs', { method: 'PROPFIND', headers: { Depth: '1' } })).status).toBe(207);
+		expect((await request('/new-col', { method: 'MKCOL' })).status).toBe(201);
+	});
+});
+
+describe('PUT body paths: streaming above the threshold, capped buffer without Content-Length', () => {
+	// A failed expectation above must not leak a live prototype spy into the
+	// next case (vi.spyOn re-wraps an existing spy, carrying call counts).
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const payloadOfSize = (size: number): Uint8Array => {
+		const payload = new Uint8Array(size);
+		const tile = new Uint8Array(65536);
+		for (let i = 0; i < tile.length; i += 1) tile[i] = (i * 7 + 13) % 251;
+		for (let off = 0; off < size; off += tile.length) {
+			payload.set(tile.subarray(0, Math.min(tile.length, size - off)), off);
+		}
+		return payload;
+	};
+
+	it('streams a Content-Length body above 4 MiB and stores it byte-for-byte', async () => {
+		const streamSpy = vi.spyOn(TeraboxClient.prototype, 'uploadStream');
+		const bufferSpy = vi.spyOn(TeraboxClient.prototype, 'upload');
+		const payload = payloadOfSize(5 * 1024 * 1024 + 7);
+
+		const res = await request('/big-stream.bin', { method: 'PUT', body: payload });
+		expect(res.status).toBe(201);
+		expect(streamSpy).toHaveBeenCalledTimes(1);
+		expect(bufferSpy).not.toHaveBeenCalled();
+		// 5 MiB + 7 at a 4 MiB chunk size is exactly two superfile2 parts.
+		expect(tb.superfile2Calls).toBe(2);
+
+		const got = await request('/big-stream.bin');
+		expect(got.status).toBe(200);
+		expect(new Uint8Array(await got.arrayBuffer())).toEqual(payload);
+
+		streamSpy.mockRestore();
+		bufferSpy.mockRestore();
+	}, 60_000);
+
+	it('streams an overwrite too (204, new content)', async () => {
+		const streamSpy = vi.spyOn(TeraboxClient.prototype, 'uploadStream');
+		const payload = payloadOfSize(4 * 1024 * 1024 + 1);
+		expect((await request('/a.txt', { method: 'PUT', body: payload })).status).toBe(204);
+		expect(streamSpy).toHaveBeenCalledTimes(1);
+		const got = await request('/a.txt');
+		expect(new Uint8Array(await got.arrayBuffer())).toEqual(payload);
+		streamSpy.mockRestore();
+	}, 60_000);
+
+	it('without Content-Length a body over the buffer cap is refused with 413 and never created', async () => {
+		const bufferSpy = vi.spyOn(TeraboxClient.prototype, 'upload');
+		const streamSpy = vi.spyOn(TeraboxClient.prototype, 'uploadStream');
+		// 33 MiB in 1 MiB slices: the test process never holds the body, and
+		// neither does the worker — the cap fires while reading.
+		let sent = 0;
+		const bounded = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				sent += 1;
+				if (sent > 33) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(new Uint8Array(1024 * 1024));
+			},
+		});
+		const res = await request('/too-big-nocl.bin', { method: 'PUT', body: bounded });
+		expect(res.status).toBe(413);
+		expect(bufferSpy).not.toHaveBeenCalled();
+		expect(streamSpy).not.toHaveBeenCalled();
+		expect((await request('/too-big-nocl.bin')).status).toBe(404);
+		bufferSpy.mockRestore();
+		streamSpy.mockRestore();
+	}, 60_000);
+
+	it('without Content-Length a small body still buffers through upload()', async () => {
+		const streamSpy = vi.spyOn(TeraboxClient.prototype, 'uploadStream');
+		const bufferSpy = vi.spyOn(TeraboxClient.prototype, 'upload');
+		let sent = 0;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				sent += 1;
+				if (sent > 2) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(new Uint8Array(512 * 1024));
+			},
+		});
+		const res = await request('/small-nocl.bin', { method: 'PUT', body });
+		expect(res.status).toBe(201);
+		expect(bufferSpy).toHaveBeenCalledTimes(1);
+		expect(streamSpy).not.toHaveBeenCalled();
+		expect((await request('/small-nocl.bin', { method: 'DELETE' })).status).toBe(204);
+		bufferSpy.mockRestore();
+		streamSpy.mockRestore();
+	});
+
+	it('a body shorter than its Content-Length is a 400 and publishes nothing', async () => {
+		const streamSpy = vi.spyOn(TeraboxClient.prototype, 'uploadStream');
+		let sent = 0;
+		const short = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				sent += 1;
+				if (sent > 1) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(new Uint8Array(1024 * 1024));
+			},
+		});
+		const res = await request('/truncated.bin', {
+			method: 'PUT',
+			headers: { 'Content-Length': String(5 * 1024 * 1024 + 7) },
+			body: short,
+		});
+		expect(res.status).toBe(400);
+		expect(streamSpy).toHaveBeenCalled();
+		expect((await request('/truncated.bin')).status).toBe(404);
+		streamSpy.mockRestore();
 	});
 });

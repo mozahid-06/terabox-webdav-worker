@@ -191,7 +191,11 @@ const worker: ExportedHandler<Env> = {
     });
 
     const started = Date.now();
-    log('info', `${request.method} ${url.pathname}`);
+    // No unconditional per-request log line: with observability enabled each
+    // console call is a billable event (one per request adds up to the
+    // 200k/day Free limit before any real debugging starts). The `slow`
+    // line below and every error path still log with method + path, which
+    // is what post-mortems actually need.
     try {
       const response = await handleWebDav(
         request,

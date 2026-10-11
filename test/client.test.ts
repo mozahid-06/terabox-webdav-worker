@@ -116,3 +116,63 @@ describe('jsToken cache precedence and mint dedup (review M2)', () => {
 		expect((b as never as { jsToken: string }).jsToken).toBe('shared-token');
 	});
 });
+
+describe('upstream network failures stay TeraboxErrors (lockbomb 500 fix)', () => {
+	// Root cause of the litmus lockbomb "500 Internal Server Error": under
+	// load a JS-token errno triggers a force-mint, and fetchMintPage's raw
+	// fetch()/text() threw a plain TypeError that escaped every wrapper —
+	// index.ts's non-TeraboxError branch answered a generic 500. Every
+	// other fetch site already wraps as TeraboxError(-5) → 502.
+	it('wraps a mint-page network failure as TeraboxError -5, never a raw throw', async () => {
+		vi.stubGlobal('fetch', async () => {
+			throw new TypeError('fetch failed');
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await expect(
+			(client as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken(true),
+		).rejects.toMatchObject({ errno: -5 });
+	});
+
+	// The 60 s handlers behind litmus's "connection timed out": no fetch
+	// carried an AbortSignal, so a hung upstream held the request until the
+	// edge cut the client's connection. Bodiless calls are bounded; a
+	// multipart upload body must NOT get the signal (a slow 16 MB chunk
+	// would abort mid-transfer).
+	it('passes an abort signal on bodiless API fetches', async () => {
+		const signals: Array<AbortSignal | undefined> = [];
+		vi.stubGlobal('fetch', async (_input: unknown, init?: { signal?: AbortSignal }) => {
+			signals.push(init?.signal);
+			return new Response(JSON.stringify({ errno: 0 }), { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await client.quota();
+		expect(signals.length).toBeGreaterThan(0);
+		expect(signals[0]).toBeInstanceOf(AbortSignal);
+	});
+
+	it('omits the abort signal when a request carries an upload body', async () => {
+		const signals: Array<{ signal?: AbortSignal } | undefined> = [];
+		vi.stubGlobal('fetch', async (_input: unknown, init?: { signal?: AbortSignal }) => {
+			signals.push(init);
+			return new Response(JSON.stringify({ errno: 0 }), { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await (client as never as {
+			request<T>(path: string, opts?: Record<string, unknown>): Promise<T>;
+		}).request('/api/create', { method: 'POST', body: 'x=1' });
+		expect(signals.length).toBeGreaterThan(0);
+		expect(signals[0]?.signal).toBeUndefined();
+	});
+
+	it('passes an abort signal on the mint page fetch', async () => {
+		const signals: Array<AbortSignal | undefined> = [];
+		vi.stubGlobal('fetch', async (_input: unknown, init?: { signal?: AbortSignal }) => {
+			signals.push(init?.signal);
+			return new Response(tokenHtml('timeout-token'), { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await (client as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken(true);
+		expect(signals.length).toBeGreaterThan(0);
+		expect(signals[0]).toBeInstanceOf(AbortSignal);
+	});
+});

@@ -5,7 +5,7 @@ after every campaign so future sessions (human or AI) start with context.
 
 ## Target
 
-- Worker: `https://terabox.taxin-404.workers.dev/` (auto-deploys from `main`)
+- Worker: `https://davbox.crazy-gooner-mf.workers.dev/` (auto-deploys from `main`)
 - Credentials: **not stored in this repo** — pass via `WEBDAV_USER` / `WEBDAV_PASS`
 - Test account content: folders `BackupFolder/ mern/ hacking/ omacom/ tools/ …`,
   sample file `BackupFolder/screenshot-2026-07-21_12-58-20.png`
@@ -329,7 +329,7 @@ clients are never harmed by the hopping: an empty store *allows* writes
 - litmus built from source (credentials via env, never committed):
   `TESTS="basic copymove props locks http"
   WEBDAV_USER=… WEBDAV_PASS=…; /tmp/opencode/litmus/install/bin/litmus -k -n
-  https://terabox.taxin-404.workers.dev/litmus/ "$WEBDAV_USER" "$WEBDAV_PASS"`
+  https://davbox.crazy-gooner-mf.workers.dev/litmus/ "$WEBDAV_USER" "$WEBDAV_PASS"`
 - probe habit: to check which build is live, PUT to a path whose parent does
   **not** exist — `409` = new build, `201`/`204` = old build still serving.
 

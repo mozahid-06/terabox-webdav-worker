@@ -25,6 +25,15 @@ const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 509]);
 const JS_TOKEN_ERRORS = new Set([4000023, 400141, 450016]);
 /** Minimum gap between outbound Terabox calls (bclone minSleep 400 ms parity). */
 const DEFAULT_MIN_GAP_MS = 400;
+/** Upstream fetch bounds: a hung mint or bodiless API fetch held the handler
+ *  open until the edge cut the client's connection (litmus lockbomb's
+ *  "connection timed out" and the 60 s `slow` handlers), and a mint-page
+ *  network failure escaped as a plain Error → generic 500. Timeout here
+ *  surfaces both as TeraboxError(-5) → 502. Deliberately NOT applied to
+ *  fetches that carry upload bodies or stream downloads: their transfers are
+ *  only bounded by the transfer itself. */
+const API_TIMEOUT_MS = 30_000;
+const MINT_TIMEOUT_MS = 15_000;
 /** Next free upstream slot, shared by every request handled by THIS isolate.
  *  Cloudflare runs one module registry per isolate, so N isolates can each
  *  schedule one call per MIN_GAP_MS: the aggregate upstream rate is
@@ -254,6 +263,55 @@ interface ApiResult<T> {
   status: number;
 }
 
+/**
+ * Pull exactly `size` bytes from `body` as fixed `chunkSize` windows (the
+ * last one short, one empty window for a zero-byte size), carrying bytes the
+ * transport delivered past a window boundary over to the next one. Returns
+ * null once — as soon as — the body ends short of `size`, so callers can
+ * refuse to finalize instead of publishing a truncated file.
+ */
+function streamWindows(
+  body: ReadableStream<Uint8Array>,
+  size: number,
+  chunkSize: number,
+): { next(): Promise<Uint8Array | null>; cancel(): Promise<void> } {
+  const reader = body.getReader();
+  const maxWindows = size === 0 ? 1 : Math.ceil(size / chunkSize);
+  let emitted = 0;
+  let delivered = 0;
+  let carry: Uint8Array | null = null;
+  return {
+    async next() {
+      if (emitted >= maxWindows) return null;
+      emitted += 1;
+      if (size === 0) return new Uint8Array(0);
+      const want = Math.min(chunkSize, size - delivered);
+      const window = new Uint8Array(want);
+      let filled = 0;
+      if (carry && carry.byteLength > 0) {
+        const take = Math.min(carry.byteLength, want);
+        window.set(carry.subarray(0, take), 0);
+        filled = take;
+        carry = carry.byteLength > take ? carry.subarray(take) : null;
+      }
+      while (filled < want) {
+        const { done, value } = await reader.read();
+        if (done) return null; // short body: caller throws before create()
+        if (!value || value.byteLength === 0) continue;
+        const take = Math.min(value.byteLength, want - filled);
+        window.set(value.subarray(0, take), filled);
+        filled += take;
+        if (value.byteLength > take) carry = value.subarray(take);
+      }
+      delivered += want;
+      return window;
+    },
+    async cancel() {
+      await reader.cancel().catch(() => undefined);
+    },
+  };
+}
+
 export class TeraboxClient {
   private cookie: string;
   private baseUrl: string;
@@ -354,7 +412,16 @@ export class TeraboxClient {
     let response: Response;
     try {
       await this.pace(); // rate-limit guard: no bursts toward Terabox
-      response = await fetch(url.toString(), { method: opts.method || 'GET', headers, body });
+      // Bodiless calls (stats, lists, quotas, task polls) get a hard time
+      // bound so a hung upstream answers 502 instead of holding the request
+      // until the edge drops the client. Calls carrying an upload body are
+      // exempt: their transfer is only bounded by the transfer itself.
+      response = await fetch(url.toString(), {
+        method: opts.method || 'GET',
+        headers,
+        body,
+        ...(body === undefined ? { signal: AbortSignal.timeout(API_TIMEOUT_MS) } : {}),
+      });
     } catch (error) {
       throw new TeraboxError(-5, `Terabox network error: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -518,14 +585,25 @@ export class TeraboxClient {
   /** Paced page fetch used for jsToken minting (with or without the session). */
   private async fetchMintPage(url: string, withCookie = true): Promise<{ response: Response; html: string }> {
     await this.pace();
-    const response = await fetch(url, {
-      headers: {
-        ...(withCookie ? { Cookie: this.cookie, Referer: this.baseUrl } : {}),
-        'User-Agent': DESKTOP_APP_USER_AGENT,
-      },
-      redirect: 'follow',
-    });
-    return { response, html: await response.text() };
+    try {
+      const response = await fetch(url, {
+        headers: {
+          ...(withCookie ? { Cookie: this.cookie, Referer: this.baseUrl } : {}),
+          'User-Agent': DESKTOP_APP_USER_AGENT,
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(MINT_TIMEOUT_MS),
+      });
+      return { response, html: await response.text() };
+    } catch (error) {
+      // Raw network/abort failures here previously escaped every wrapper as
+      // a plain Error and the fetch handler answered a generic 500; every
+      // other upstream site already maps this to TeraboxError(-5) → 502.
+      throw new TeraboxError(
+        -5,
+        `Terabox mint network error: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async checkLogin(): Promise<void> {
@@ -1183,6 +1261,81 @@ export class TeraboxClient {
     // Single-chunk control md5 IS the chunk md5 the server returned; the
     // multi-chunk form hashes only the tiny JSON array of digests (a few
     // hundred bytes) — negligible CPU either way.
+    const controlMd5 =
+      chunkMd5s.length === 1 ? chunkMd5s[0]! : await md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
+    if (decodeMD5(createdMd5) !== controlMd5) {
+      const integrity = new TeraboxError(-5, 'Server file md5 does not match uploaded chunks');
+      integrity.integrity = true;
+      throw integrity;
+    }
+  }
+
+  /**
+   * Streaming variant of {@link upload} for bodies whose total size is known
+   * but which must never be buffered whole (Cloudflare's edge delivers up to
+   * ~100 MB — larger than half the isolate). Runs the identical precreate →
+   * superfile2 → create pipeline, the same host failover (the current window
+   * is held until its md5 returns, so a switch retries the same bytes), and
+   * the same control-md5 integrity check. A body that ends before `size`
+   * throws -9 and never runs create, so a truncated client cannot publish a
+   * partial file.
+   */
+  async uploadStream(
+    absPath: string,
+    size: number,
+    mtimeMs: number,
+    body: ReadableStream<Uint8Array>,
+    overwriteMode = 0,
+  ): Promise<void> {
+    await this.checkPremium();
+    const limit = this.isPremium ? MAX_PREMIUM_FILE_BYTES : MAX_FREE_FILE_BYTES;
+    if (size > limit) throw es(58);
+    await atStep('jsToken', () => this.ensureJsToken());
+    const hosts = await atStep('locateupload', () => this.ensureUploadHosts());
+
+    const { uploadId, returnType, uploadSign } = await atStep('precreate', () =>
+      this.precreate(absPath, size, mtimeMs),
+    );
+    if (returnType === 2) throw es(-8);
+
+    const chunkSize = getChunkSize(size, this.isPremium);
+    const chunkCount = size === 0 ? 1 : Math.ceil(size / chunkSize);
+    const chunkMd5s: string[] = [];
+    let hostIndex = 0;
+    let host = hosts[0]!;
+    const windows = streamWindows(body, size, chunkSize);
+    try {
+      for (let index = 0; index < chunkCount; index += 1) {
+        const window = await windows.next();
+        if (window === null) throw new TeraboxError(-9, 'Request body ended before Content-Length');
+        for (;;) {
+          try {
+            const uploadedMd5 = await atStep(`chunk${index}@${host}`, () =>
+              this.uploadChunk(host, absPath, uploadId, uploadSign, index, window),
+            );
+            if (!uploadedMd5) throw new TeraboxError(-5, `Uploaded chunk ${index} returned no md5`);
+            chunkMd5s.push(uploadedMd5);
+            break;
+          } catch (error) {
+            // Anything thrown inside this try is the host's answer, whether
+            // or not it carries an HTTP status — same rule as upload()'s
+            // ladder; the window above is still in hand for the retry.
+            if (error instanceof TeraboxError && hostIndex < hosts.length - 1) {
+              hostIndex += 1;
+              host = hosts[hostIndex]!;
+              continue;
+            }
+            throw error;
+          }
+        }
+      }
+    } finally {
+      await windows.cancel();
+    }
+
+    const createdMd5 = await atStep('create', () =>
+      this.createFile(absPath, uploadId, uploadSign, size, mtimeMs, chunkMd5s, overwriteMode),
+    );
     const controlMd5 =
       chunkMd5s.length === 1 ? chunkMd5s[0]! : await md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
     if (decodeMD5(createdMd5) !== controlMd5) {
