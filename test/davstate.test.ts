@@ -491,7 +491,11 @@ describe('account-wide API pacing (pace → DavState /api-slot)', () => {
 		const ns = (env as unknown as { DAV_STATE: DurableObjectNamespace }).DAV_STATE;
 		const stub = ns.get(ns.idFromName(DO_NAME));
 		await runInDurableObject(stub, async (instance) => {
-			(instance as unknown as { nextApiSlot: number }).nextApiSlot = 0;
+			const timeline = instance as unknown as { nextApiSlot: number };
+			// Read-back first: if the field is ever renamed, this fails loudly
+			// instead of writing a dead own-property that no-ops the reset.
+			expect(typeof timeline.nextApiSlot).toBe('number');
+			timeline.nextApiSlot = 0;
 		});
 		const first = await store.apiSlot!(200);
 		const second = await store.apiSlot!(200);

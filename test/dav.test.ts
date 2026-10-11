@@ -44,6 +44,10 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.unstubAllGlobals();
+	// Belt-and-braces for the Date.now spy in the sliding-TTL test: if that
+	// test ever dies past its timeout, the finally never runs — restoring
+	// here keeps a frozen clock from leaking into later cases.
+	vi.restoreAllMocks();
 });
 
 describe('auth', () => {
@@ -641,6 +645,10 @@ describe('GET download-URL cache (repeat-open TTFB)', () => {
 		expect((await request('/a.txt')).status).toBe(200); // phase-0 replay #1
 		expect((await request('/a.txt')).status).toBe(200); // phase-0 replay #2 (after any rewrite)
 		expect(tb.pcsCalls).toBe(1);
+		// Positive half: the session IS attached on the API-origin mint
+		// (the /dl/ handler ignores cookies, so without this the nulls
+		// above could pass vacuously if nothing attached the cookie at all).
+		expect(tb.pcsCookies[0]).toContain('ndus=');
 		const capabilityFetches = tb.dlCookies.filter((e) => e.flavour === 'pcs');
 		expect(capabilityFetches.length).toBeGreaterThanOrEqual(3);
 		for (const seen of capabilityFetches) expect(seen.cookie).toBeNull();
@@ -652,10 +660,14 @@ describe('GET download-URL cache (repeat-open TTFB)', () => {
 		const t0 = Date.now();
 		const at = vi.spyOn(Date, 'now');
 		try {
-			// t0+20min: inside the original TTL — still a hit.
+			// t0+20min: inside the original TTL — still a hit. The metaCache
+			// (60 s) must have expired, so this GET re-stats: proof the WORKER
+			// (not just this test's realm) observed the mocked clock — without
+			// that the whole slide assertion below would be vacuous.
 			at.mockReturnValue(t0 + 20 * 60_000);
 			expect((await request('/a.txt')).status).toBe(200);
 			expect(tb.pcsCalls).toBe(1);
+			expect(tb.filemetasCalls).toBe(2);
 			// t0+40min: past the ORIGINAL TTL. The hit above must have slid
 			// expires forward; with an absolute TTL this re-ladders (RED).
 			at.mockReturnValue(t0 + 40 * 60_000);

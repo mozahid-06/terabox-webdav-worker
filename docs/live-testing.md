@@ -591,7 +591,7 @@ account-wide; the isolate floor is the backstop).
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-11, post review rounds 4–14 + perf work): `main` =
+Branch state (2026-10-11, post review rounds 4–15 + perf work): `main` =
 production; deploys are **manual** `wrangler deploy` after `npm run review`
 (the optional dashboard Git integration is documented in README — do not
 assume a push deploys). Current verification: **litmus 138/138** (basic,
@@ -614,12 +614,12 @@ free tier daily quota (`Exceeded allowed rows written in Durable Objects
 free tier`) 500s EVERY request until the 00:00 UTC reset — this is
 environmental, not a code regression; wait for the reset rather than
 debugging. Post-verification of these deploys runs from
-`/tmp/opencode/postreset-verify.sh` (auto-probes for 207, then smoke +
-138-test litmus, results in `/tmp/opencode/postreset/`). It includes the RFC 7233 GET/ETag
-conformance hardening (merged `d065d53`, deployed) and the full-repo audit
-hardening (merged `4d87f47`: traversal containment, metaCache cap, errno→status
-maps, DO-backed lock/prop tests, docs/config fixes — see the Phase 2–4 commit
-messages). All feature branches (`fix/davfs2-etag-hang`, `fix/audit-hardening`,
+`/tmp/opencode/postreset-verify.sh` (auto-probes for 207, then smoke + the
+138-test litmus; results land in `/tmp/opencode/postreset/`). The branch also
+includes the RFC 7233 GET/ETag conformance hardening (merged `d065d53`,
+deployed) and the full-repo audit hardening (merged `4d87f47`: traversal
+containment, metaCache cap, errno→status maps, DO-backed lock/prop tests,
+docs/config fixes — see the Phase 2–4 commit messages). All feature branches (`fix/davfs2-etag-hang`, `fix/audit-hardening`,
 `docs/ndus-cookie-lifetime`, `docs/openapi-full-extraction`) are merged and
 deleted; only `main` remains. Git history was rewritten (filter-repo) to purge
 leaked credentials — pre-rewrite SHAs in old sessions map via the subjects.

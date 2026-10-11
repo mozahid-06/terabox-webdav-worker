@@ -525,8 +525,11 @@ function dlUrlCacheGet(absPath: string, item: TeraboxItem): { url: string; cooki
 }
 
 /** Slide the TTL of an entry that just served a hit — a hot file keeps its
- *  warm URL for as long as it keeps being opened. Touches only `expires`:
- *  the URL and the mint-time cookieless boundary stay exactly as written. */
+ *  warm URL across repeated opens instead of re-laddering every 30 min.
+ *  Touches only `expires` (mutate-only: it can never resurrect an entry an
+ *  invalidation/gate-drop/FIFO eviction removed): the URL and the mint-time
+ *  cookieless boundary stay exactly as written. At DLURL_MAX_ENTRIES the
+ *  hot entry is still the first FIFO victim — unchanged, pre-existing. */
 function dlUrlCacheTouch(absPath: string): void {
   const entry = dlUrlCache.get(absPath);
   if (entry) entry.expires = Date.now() + DLURL_TTL_MS;

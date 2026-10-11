@@ -65,6 +65,10 @@ export class MockTerabox {
 	 *  pins the round-14 cookieless boundary end-to-end: the cached `via=pcs`
 	 *  capability URL must never be replayed with the session attached. */
 	dlCookies: Array<{ flavour: string; cookie: string | null }> = [];
+	/** Session Cookie observed on the API-origin PCS route itself — the
+	 *  positive half: the boundary test proves the session IS attached
+	 *  where it belongs, not merely absent everywhere. */
+	pcsCookies: Array<string | null> = [];
 
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
@@ -483,6 +487,7 @@ export class MockTerabox {
 		// cookie in, 302 straight to the CDN — no /file/<hash> dlink hop.
 		if (pathname === '/rest/2.0/pcs/file' && url.searchParams.get('method') === 'download') {
 			this.pcsCalls++;
+			this.pcsCookies.push(req.headers.get('Cookie'));
 			if (this.gatePcs) {
 				return json({ request_id: 'mock-pcs-gate', error_code: 400141, error_msg: 'need verify' });
 			}

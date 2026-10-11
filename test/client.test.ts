@@ -240,7 +240,7 @@ describe('account-wide slot reserver (pace hook)', () => {
 	});
 });
 
-describe('resolved fetches honour the session cookie boundary (review R14 #1)', () => {
+describe('resolved fetches: credential boundary + header bound (reviews R14/R15)', () => {
 	it('omits Cookie/Referer on a post-hop capability replay, keeps them on every credentialed path', async () => {
 		// The session cookie only ever crosses to API origins: the hop loop's
 		// UA-only headers are the documented shape. A cached post-302 URL
