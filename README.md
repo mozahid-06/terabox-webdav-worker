@@ -181,4 +181,4 @@ The test-suite mocks the Terabox API behind a stubbed global fetch, so the
 whole stack (auth, routing, WebDAV, uploads) is exercised without a real
 account. You still need a real Terabox session cookie to try a live account —
 the **full** browser cookie string (a bare `ndus` value is gated by Terabox
-now; `stoken` matters for uploads).
+now; `stoken` in it is **not** required — verified 2026-10-11).

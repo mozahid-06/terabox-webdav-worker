@@ -78,7 +78,10 @@ service from Cloudflare.
 
 ## 5. Sessions & cookies
 
-- Cookie = `ndus` (+ `browserid`, `lang` optional). It is a **secret** (never
+- Cookie = `ndus` (the session) plus rotating device/locale fields
+  (`browserid`, `lang`, … — observed jar recorded in
+  `docs/ndus-cookie-lifetime.md`; none of the extras is proven necessary).
+  It is a **secret** (never
   committed; dashboard Secret only). Sessions expire — when they do, every
   call fails with `2/check/login` errno and the cookie must be refreshed.
 - **`stoken` is not required.** Live-verified 2026-10-11: a cookie with no
@@ -88,12 +91,12 @@ service from Cloudflare.
   `stoken` are really the **wrong cluster/origin** — `d.terabox.com`-flavoured
   hosts reject the session; same-origin `dm*` clusters accept it — see
   `docs/live-testing.md` "Root cause found".)
-  Historical "paste the full cookie incl. `stoken`" advice is Baidu web
-  boilerplate, and the `stoken` name was likely **mistaken for `browserid`**
-  (the latter is the `devuid` query param on app-protocol calls like
-  `tcc/query` — a device id, not a session credential). The takeaway: verify
-  the real upload path empirically instead of assuming the pan.baidu.com
-  recipe applies to TeraBox.
+  `stoken` doesn't appear in TeraBox's observed cookie jar at all
+  (`docs/ndus-cookie-lifetime.md`) — it's pan.baidu.com's field, which is
+  also why the old "paste the full cookie incl. `stoken`" advice is
+  boilerplate that doesn't reflect what this API path actually checks.
+  Verify the upload path empirically instead of trusting field-name
+  folklore.
 - `JSTOKEN` is optional: only the cookie the WebDAV client sends is ever
   echoed back; the page-minted jsToken stays server-side.
 - `bdstoken` is embedded in the account page HTML (used for `filemanager` +
