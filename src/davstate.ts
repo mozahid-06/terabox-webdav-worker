@@ -111,6 +111,13 @@ export interface DavStore {
    * returns the new value; otherwise the current value is returned.
    */
   metaGeneration(bump: boolean): Promise<number>;
+  /**
+   * Account-wide upstream slot reservation (TeraboxClient.pace): returns the
+   * ms the caller must wait before firing, having queued its slot in the
+   * shared timeline. Only remote (DO-backed) stores offer it — the memory
+   * fallback omits it and pacing stays isolate-local.
+   */
+  apiSlot?(minGapMs: number): Promise<number>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -801,6 +808,10 @@ export class RemoteDavStore implements DavStore, UploadStore {
     return this.call<number>('/meta-gen', { bump });
   }
 
+  apiSlot(minGapMs: number): Promise<number> {
+    return this.call<number>('/api-slot', { minGapMs });
+  }
+
   async markFinalized(uploadId: string, status: number): Promise<void> {
     await this.call('/upload-finalized', { uploadId, status });
   }
@@ -844,6 +855,11 @@ export class DavState extends DurableObject {
   /** Bumped by every metadata-changing write; isolates diff it against the
    *  value their local read cache was filled under. */
   private metaGen = 0;
+  /** Next account-wide upstream slot. Computed synchronously (the DO is
+   *  single-threaded, so read+write has no await between them — the same
+   *  race-free reservation the isolate-local floor uses) and kept in memory:
+   *  a rate floor needs no durability, and eviction just re-opens the gap. */
+  private nextApiSlot = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1048,6 +1064,13 @@ export class DavState extends DurableObject {
             await this.ctx.storage.put('metaGen', this.metaGen);
           }
           return Response.json(this.metaGen);
+        }
+        case '/api-slot': {
+          const minGapMs = Math.max(0, Number(body['minGapMs']) || 0);
+          const now = Date.now();
+          const slot = Math.max(now, this.nextApiSlot + minGapMs);
+          this.nextApiSlot = slot;
+          return Response.json(slot - now);
         }
         case '/upload-init': {
           const session = body['session'] as UploadSession;

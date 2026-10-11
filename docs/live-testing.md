@@ -585,7 +585,9 @@ requests + the DO already cover any size, and S3 staging would not help gvfs.
 
 Deferred (user decisions): taskid `async=1` confirmation (deliberate bclone
 parity), uploadId nonce (would break the `tbbig` client), account password
-rotation (`taxin:404` still live), DO-backed cross-isolate pacing.
+rotation (`taxin:404` still live). ~~DO-backed cross-isolate pacing~~ shipped
+2026-10-11 (the DAV_STATE DO `/api-slot` route serializes the reservation
+account-wide; the isolate floor is the backstop).
 
 ## Repo map (context for AI sessions)
 

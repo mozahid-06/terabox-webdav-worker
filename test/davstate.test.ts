@@ -478,3 +478,25 @@ describe('round 8 pins: If Resource-Tags, negation, sweep, caps', () => {
 		expect(state['/r8sweep-live.txt']!.locks).toHaveLength(1);
 	});
 });
+
+describe('account-wide API pacing (pace → DavState /api-slot)', () => {
+	it('offers an account-wide slot reservation on the remote store', async () => {
+		const store = createDavStore(env);
+		expect(typeof store.apiSlot).toBe('function');
+		// First reservation is immediate; the second queues behind the gap —
+		// the DO's single-threaded route makes the pair race-free.
+		const first = await store.apiSlot!(200);
+		const second = await store.apiSlot!(200);
+		expect(first).toBeLessThan(50);
+		expect(second).toBeGreaterThanOrEqual(50);
+	});
+
+	it('wires the reservation into every paced upstream call of a request', async () => {
+		const stats = (await import('../src/terabox')).paceAccountReservations;
+		expect(stats).toBeDefined();
+		expect(stats!.count).toBe(0);
+		const res = await request(srcPath);
+		expect(res.status).toBe(200);
+		expect(stats!.count).toBeGreaterThan(0);
+	});
+});

@@ -74,7 +74,7 @@ sudo mkdir -p /mnt/terabox && rclone mount terabox: /mnt/terabox --vfs-cache-mod
 | Locks & properties | Real `LOCK`/`UNLOCK` with 423 enforcement and dead properties, backed by a `DavState` Durable Object (one serialized instance for the whole account) |
 | Downloads | Terabox CDN links with `Range` support; `HEAD` streams nothing (the upstream body is cancelled after headers) |
 | Uploads | Chunked Terabox upload (up to 4 GiB per file free, 128 GiB premium) |
-| Rate safety | Every outbound call paced by `MIN_GAP_MS`; `Retry-After` honored (capped 5 s); jsToken re-minted at most once per 5 minutes |
+| Rate safety | Every outbound call paced by `MIN_GAP_MS`, account-wide via the `DAV_STATE` DO (`/api-slot`; per-isolate floor as backstop); `Retry-After` honored (capped 5 s); jsToken re-minted at most once per 5 minutes |
 | State | No persistent server state of your own: everything lives in the TeraBox account |
 
 ## How it works
@@ -423,7 +423,7 @@ per-request, but not shared across isolates. The Worker keeps serving.
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 343 cases over a mocked TeraBox API
+npm test                         # Vitest: 347 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)

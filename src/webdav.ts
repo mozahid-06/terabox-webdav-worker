@@ -1180,6 +1180,11 @@ export async function handleWebDav(
   const mount = makeMount(opts);
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
+  // Account-wide pacing: every isolate queues upstream slots through the
+  // DAV_STATE DO, so the aggregate rate is 1 / MIN_GAP_MS no matter how many
+  // isolates Cloudflare runs. Advisory: the memory fallback has no apiSlot,
+  // and pace() keeps its isolate-local floor either way.
+  client.apiSlotReserver = store.apiSlot ? (minGapMs) => store.apiSlot!(minGapMs) : undefined;
   // Cross-isolate freshness: drop anything another isolate invalidated.
   await syncMetaGeneration(store);
 

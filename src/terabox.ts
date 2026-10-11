@@ -35,14 +35,24 @@ const DEFAULT_MIN_GAP_MS = 400;
 const API_TIMEOUT_MS = 30_000;
 const MINT_TIMEOUT_MS = 15_000;
 /** Next free upstream slot, shared by every request handled by THIS isolate.
- *  Cloudflare runs one module registry per isolate, so N isolates can each
- *  schedule one call per MIN_GAP_MS: the aggregate upstream rate is
- *  (isolate count) / MIN_GAP_MS, not 1 / MIN_GAP_MS. Within one isolate the
- *  reservation in pace() is race-free (no await between read and write), so
- *  concurrent requests in this isolate cannot burst. If account-wide pacing
- *  is ever required, move this slot into the DAV_STATE DO (see the
- *  cross-isolate generation pattern the meta cache already uses). */
+ *  Within one isolate the reservation in pace() is race-free (no await
+ *  between read and write), so concurrent requests here cannot burst — but
+ *  Cloudflare runs one module registry per isolate, so N isolates could each
+ *  schedule one call per MIN_GAP_MS. Account-wide pacing therefore goes
+ *  through the DAV_STATE DO (store.apiSlot, wired per request in
+ *  handleWebDav); the isolate floor below stays as the backstop whenever the
+ *  DO is unbound, unreachable or cooling down. */
 let nextUpstreamSlot = 0;
+/** Account-wide reservation cooldown after a DO failure or timeout: the
+ *  local floor keeps pacing meanwhile, so a sick DO costs one bounded wait
+ *  per window instead of one per request. */
+let apiSlotFailUntil = 0;
+/** Test hook: how many reservations pace() completed through the DO. */
+export const paceAccountReservations = { count: 0 };
+/** Budget for one DO reservation round-trip (normally ~1-5 ms). */
+const API_SLOT_TIMEOUT_MS = 300;
+/** Cooldown after a failed account-wide reservation. */
+const API_SLOT_COOLDOWN_MS = 30_000;
 /** Reused jsToken across WebDAV requests — the root fetch is the call most
  *  exposed to Terabox's verification gate, so mint at most once per TTL. */
 const JS_TOKEN_CACHE = { token: '', at: 0 };
@@ -69,6 +79,9 @@ export function resetTeraboxCaches(): void {
   PREMIUM_CACHE.isPremium = false;
   UPLOAD_HOSTS_CACHE.hosts = null;
   UPLOAD_HOSTS_CACHE.at = 0;
+  paceAccountReservations.count = 0;
+  apiSlotFailUntil = 0;
+  nextUpstreamSlot = 0;
 }
 /** Desktop-app UA used when minting the jsToken from the root page. */
 const DESKTOP_APP_USER_AGENT = 'terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox';
@@ -327,6 +340,10 @@ export class TeraboxClient {
   /** Pre-minted token from env JSTOKEN (Alist/CLI users paste window.jsToken). */
   private readonly configuredJsToken: string;
   private readonly minGapMs: number;
+  /** Account-wide slot reserver — wired per request by handleWebDav to the
+   *  DAV_STATE DO (advisory: left unset for the memory fallback, and any
+   *  failure falls back to the isolate-local floor). */
+  apiSlotReserver: ((minGapMs: number) => Promise<number>) | undefined;
 
   constructor(cookie: string, domain = DEFAULT_BASE_URL, opts: { jsToken?: string; minGapMs?: number } = {}) {
     this.cookie = valuedCookie(cookie);
@@ -338,16 +355,47 @@ export class TeraboxClient {
   /**
    * Reserve the next upstream slot and sleep until it (rate-limit guard).
    * Every outbound Terabox call — API, jsToken mint, download stream — passes
-   * through here, which serializes calls WITHIN THIS ISOLATE at one per
-   * MIN_GAP_MS. It does not coordinate across isolates (see nextUpstreamSlot
-   * above): treat MIN_GAP_MS as a per-isolate floor, not an account-wide
-   * guarantee.
+   * through here. The isolate-local floor always applies; when
+   * apiSlotReserver is wired (handleWebDav → DAV_STATE DO) an account-wide
+   * reservation is taken too and the longer of the two waits is slept, so
+   * the aggregate upstream rate is 1 / MIN_GAP_MS across ALL isolates.
    */
   async pace(): Promise<void> {
     const slot = Math.max(Date.now(), nextUpstreamSlot + this.minGapMs);
     nextUpstreamSlot = slot;
-    const wait = slot - Date.now();
+    let wait = slot - Date.now();
+    const reserver = this.apiSlotReserver;
+    if (reserver && Date.now() >= apiSlotFailUntil) {
+      try {
+        const global = await this.reserveAccountSlot(reserver);
+        paceAccountReservations.count += 1;
+        wait = Math.max(wait, global);
+      } catch {
+        // Advisory: the local floor above already stands; back off so the
+        // outage costs one bounded wait, not one per request.
+        apiSlotFailUntil = Date.now() + API_SLOT_COOLDOWN_MS;
+      }
+    }
     if (wait > 0) await this.sleep(wait);
+  }
+
+  /** One account-wide reservation under a hard budget: this call sits on the
+   *  hot path of every upstream request, so a sick DO may delay a request by
+   *  at most API_SLOT_TIMEOUT_MS before the cooldown skips it entirely. */
+  private reserveAccountSlot(reserver: (minGapMs: number) => Promise<number>): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('api slot reservation timed out')), API_SLOT_TIMEOUT_MS);
+      reserver(this.minGapMs).then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 
   private sleep(ms: number): Promise<void> {

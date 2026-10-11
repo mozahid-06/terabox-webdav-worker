@@ -198,3 +198,43 @@ describe('fetchDownload resolved URLs (download-URL cache path)', () => {
 		expect(response.status).toBe(200);
 	});
 });
+
+describe('account-wide slot reserver (pace hook)', () => {
+	it('takes the reserver before the download fetch', async () => {
+		const order: string[] = [];
+		vi.stubGlobal('fetch', async () => {
+			order.push('fetch');
+			return new Response('bytes', { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		client.apiSlotReserver = async () => {
+			order.push('reserver');
+			return 0;
+		};
+		const { response } = await client.fetchDownload('https://cdn.example/file/x');
+		expect(response.status).toBe(200);
+		expect(order).toEqual(['reserver', 'fetch']);
+	});
+
+	it('falls back to isolate-local pacing when the reserver fails, without retry-storming', async () => {
+		const order: string[] = [];
+		let calls = 0;
+		vi.stubGlobal('fetch', async () => {
+			order.push('fetch');
+			return new Response('bytes', { status: 200 });
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		client.apiSlotReserver = async () => {
+			calls++;
+			order.push('reserver');
+			throw new Error('dav-state down');
+		};
+		const { response } = await client.fetchDownload('https://cdn.example/file/x');
+		expect(response.status).toBe(200);
+		expect(order[0]).toBe('reserver');
+		expect(calls).toBe(1);
+		// Cooldown: a sick DO costs one failure per window, not one per call.
+		await client.pace();
+		expect(calls).toBe(1);
+	});
+});

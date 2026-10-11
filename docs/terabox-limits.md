@@ -26,7 +26,7 @@ service from Cloudflare.
 
 | Behavior | Detail | Status |
 |---|---|---|
-| Call pacing | bclone sleeps **400 ms minimum** between upstream API calls; faster bursts earn `429` / `400141` / silent throttling | worker paces every outbound call with `MIN_GAP_MS` (400 default, `wrangler.toml` var) — a **per-isolate** floor; N isolates can each fire one call per gap |
+| Call pacing | bclone sleeps **400 ms minimum** between upstream API calls; faster bursts earn `429` / `400141` / silent throttling | worker paces every outbound call with `MIN_GAP_MS` (400 default, `wrangler.toml` var) — **account-wide**: the reservation is serialized through the DAV_STATE DO (`/api-slot`), with the per-isolate floor as backstop when the DO is unbound, unreachable or cooling down |
 | jsToken | mintable from any root page (`/main?category=all`, `about`, `privacy`) with desktop `sec-ch-ua` headers; 128 hex chars | worker mints + caches (`JS_TOKEN_CACHE`, 5 min TTL), refreshes on `4000023` / `450016` |
 | Missing token | `filemanager` without jsToken → `450016 need verify` (HTTP 200 body) | worker always attaches token |
 | **IP-reputation gate (400141)** | **web dlink path (`/file/<hash>`) answers `400141 need verify` from datacenter IPs on every origin and flavour — plain `filemetas` dlink, `origin=dlna`, official `/api/download` token dlink, even host-rewritten browser URLs. A fresh jsToken does not clear it.** | **solved**: download uses the app-protocol **PCS route** `/rest/2.0/pcs/file?method=download` which 302s to CDN with no jsToken/sign (see §3) |
