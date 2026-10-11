@@ -15,9 +15,13 @@ import type { Env } from './types';
  *    the state for the whole account. Every WebDAV isolate talks to the same
  *    object, so locks/dead props are consistent no matter how Cloudflare
  *    schedules requests; litmus's sequential suite becomes deterministic.
+ *    The DO path is STRICT: a token counts only when a live record names it
+ *    (no self-issued-token grace, no adoption of presented tokens), so lock
+ *    capabilities cannot be forged where records durably exist.
  *
  * Both implementations delegate to the same pure core functions below, so
- * the semantics cannot drift.
+ * the semantics cannot drift — except for the documented `volatile` grace,
+ * which only the record-losing memory store enables.
  */
 
 export interface LockRecord {
@@ -206,6 +210,36 @@ export interface UploadStore {
 }
 
 /* ------------------------------------------------------------------ */
+/* Advisory-state safety caps (see corePatch / coreLockAcquire)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Dead-property caps, counted in string chars (≈ bytes; a safety limit, not
+ * an accounting one). Dead props never expire, so without limits one client
+ * PROPPATCHing megabytes would grow the DO's whole-state persist toward the
+ * storage value limit — after which EVERY lock/prop mutation deployment-wide
+ * would fail until the object reset.
+ */
+export const MAX_PROP_BYTES_PER_PATH = 32 * 1024;
+export const MAX_PROP_BYTES_TOTAL = 512 * 1024;
+export const MAX_PROP_PATHS = 8192;
+/** Lock records do expire (TTL), but a client could still LOCK thousands of
+ *  paths inside one timeout window; cap both the path count and how many
+ *  shared locks may stack on a single path. */
+export const MAX_LOCK_PATHS = 4096;
+export const MAX_LOCK_RECORDS_PER_PATH = 32;
+
+/** Advisory state exceeded a safety cap above; both stores surface it as
+ *  HTTP 507 (RFC 4918 §7.1) rather than letting the DO storage cliff turn
+ *  it into a deployment-wide 500. */
+export class DavLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DavLimitError';
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Token helpers (shared by the WebDAV layer, both stores, and the DO) */
 /* ------------------------------------------------------------------ */
 
@@ -272,17 +306,25 @@ function applyingLocksOf(locks: Map<string, LockRecord[]>, path: string): LockRe
   return out;
 }
 
+/**
+ * `volatile` enables the memory store's never-brick grace: a self-issued
+ * token keeps satisfying checks after its record was lost to an isolate
+ * rotation. The Durable Object passes `false` — records there survive, so
+ * the grace would only ever be exercised by FORGED tokens (§6.5 makes lock
+ * tokens capabilities; accepting invented ones voids the capability).
+ */
 function coreCheckTokens(
   locks: Map<string, LockRecord[]>,
   path: string,
   tokens: string[],
+  volatile: boolean,
 ): TokenCheck {
   purgeAt(locks, path);
   const applying = applyingLocksOf(locks, path);
   const recordTokens = applying.map((r) => r.token);
   const applies: string[] = [];
   for (const token of new Set(tokens)) {
-    if (recordTokens.includes(token) || isOurUnexpiredToken(token)) applies.push(token);
+    if (recordTokens.includes(token) || (volatile && isOurUnexpiredToken(token))) applies.push(token);
   }
   return { applies, recordTokens, applying: applying.length };
 }
@@ -291,6 +333,7 @@ function coreLockAcquire(
   locks: Map<string, LockRecord[]>,
   path: string,
   req: LockRequest,
+  volatile: boolean,
 ): LockOutcome {
   const now = Date.now();
   // A presented token that names a LIVE lock not covering this URI means
@@ -313,23 +356,53 @@ function coreLockAcquire(
     refreshable.expiresAt = now + req.seconds * 1000;
     return { ok: true, refreshed: true, record: refreshable };
   }
-  const existing = purgeAt(locks, path);
-  if (existing.length > 0) {
-    // Already locked and not the owner: an exclusive lock admits nothing
-    // else, and a shared lock admits only further shared requests
-    // (RFC 4918 §9.10.6).
-    if (!req.shared || existing.some((r) => r.scope === 'exclusive')) {
-      return {
-        ok: false,
-        refreshed: false,
-        record: existing.find((r) => r.scope === 'exclusive') ?? existing[0]!,
-      };
+  purgeAt(locks, path);
+  // RFC 4918 §6.1.3: a server MUST NOT create conflicting locks. Whether
+  // this resource is ALREADY locked includes indirect locks — an Infinity-
+  // depth lock on an ancestor (§9.11) — not just records stored at this
+  // exact path. The old direct-only check let B lock /coll/f beneath A's
+  // depth-infinity lock on /coll and then write through A's exclusivity.
+  const covering = applyingLocksOf(locks, path);
+  if (covering.length > 0 && (!req.shared || covering.some((r) => r.scope === 'exclusive'))) {
+    // Exclusive admits nothing; shared admits only further shared requests
+    // (RFC 4918 §9.10.6) — same table as before, now over ALL covering locks.
+    return {
+      ok: false,
+      refreshed: false,
+      record: covering.find((r) => r.scope === 'exclusive') ?? covering[0]!,
+    };
+  }
+  // §9.10.3 whole-hierarchy rule: granting depth-infinity must not conflict
+  // with a lock DEEPER in the subtree (the covering check above only sees
+  // ancestors and the path itself). Exclusive conflicts with any live
+  // descendant lock; shared conflicts with an exclusive descendant.
+  if (req.depth === 'Infinity') {
+    const cover = { depth: 'Infinity' } as LockRecord;
+    for (const [key, records] of locks) {
+      if (key === path) continue;
+      for (const r of records) {
+        if (r.expiresAt <= now) continue;
+        if (!lockCovers(path, cover, key)) continue;
+        if (r.scope === 'exclusive' || !req.shared) {
+          return { ok: false, refreshed: false, record: r };
+        }
+      }
     }
   }
-  // Re-acquire the client's own still-valid token when its record was lost
-  // (isolate rotation); any other presented token is ignored and a fresh
-  // one minted.
-  const token = req.presented.find(isOurUnexpiredToken) ?? makeLockToken(req.seconds);
+  // Safety caps (see DavLimitError): refuse growth the DO could not persist.
+  const atPath = locks.get(path);
+  if (!atPath && locks.size >= MAX_LOCK_PATHS) {
+    throw new DavLimitError('lock path cap reached');
+  }
+  if (atPath && atPath.length >= MAX_LOCK_RECORDS_PER_PATH) {
+    throw new DavLimitError('lock record cap reached');
+  }
+  // Re-acquire a presented still-valid token ONLY in volatile mode (memory
+  // store, whose records can be lost to isolate rotation). The DO persists
+  // records — "lost" never legitimately happens there — and adopting what a
+  // client presents would let it CHOOSE its own capability (§6.5).
+  const token =
+    (volatile ? req.presented.find(isOurUnexpiredToken) : undefined) ?? makeLockToken(req.seconds);
   const record: LockRecord = {
     token,
     scope: req.shared ? 'shared' : 'exclusive',
@@ -348,6 +421,7 @@ function coreUnlock(
   locks: Map<string, LockRecord[]>,
   path: string,
   token: string,
+  volatile: boolean,
 ): UnlockOutcome {
   const now = Date.now();
   let liveTokenElsewhere = false;
@@ -377,9 +451,14 @@ function coreUnlock(
     return 'removed';
   }
   if (liveTokenElsewhere) return 'nomatch';
-  // A self-issued token whose record is gone means the lock has already
-  // lapsed: succeeding is the graceful answer. Foreign/forged tokens 409.
-  return isOurUnexpiredToken(token) ? 'lapsed' : 'nomatch';
+  // A well-formed token that matches no live record anywhere. If something
+  // on this path is STILL locked by others, answering the graceful 'lapsed'
+  // (204) would mask their state — the client would sail on believing it
+  // unlocked and trip 423 on its next write (RFC 4918 §9.11 wants 409 for a
+  // non-matching token). 'lapsed' stays for the genuine case: nothing here
+  // is locked at all, so the record simply aged out (memory-store rotation).
+  if (applyingLocksOf(locks, path).length > 0) return 'nomatch';
+  return volatile && isOurUnexpiredToken(token) ? 'lapsed' : 'nomatch';
 }
 
 function coreDescribe(
@@ -411,8 +490,25 @@ function corePatch(
     if (op.op === 'set') store[op.key] = op.markup;
     else delete store[op.key];
   }
-  if (Object.keys(store).length > 0) props.set(path, store);
-  else props.delete(path);
+  if (Object.keys(store).length > 0) {
+    // Size caps BEFORE mutating the map: dead props never expire, and the DO
+    // persists the whole map — unbounded growth would eventually exceed the
+    // storage value limit and turn every mutation deployment-wide into a 500.
+    // 507 (RFC 4918 §7.1) is the honest answer to "cannot store".
+    const bytes = Object.values(store).reduce((n, v) => n + v.length, 0);
+    if (bytes > MAX_PROP_BYTES_PER_PATH) throw new DavLimitError('dead-property size cap per path');
+    if (bytes > MAX_PROP_BYTES_TOTAL) throw new DavLimitError('dead-property total size cap');
+    if (!props.has(path) && props.size >= MAX_PROP_PATHS) {
+      throw new DavLimitError('dead-property path cap');
+    }
+    let total = bytes;
+    for (const [key, rec] of props) {
+      if (key === path) continue;
+      total += Object.values(rec).reduce((n, v) => n + v.length, 0);
+      if (total > MAX_PROP_BYTES_TOTAL) throw new DavLimitError('dead-property total size cap');
+    }
+    props.set(path, store);
+  } else props.delete(path);
   return store;
 }
 
@@ -476,15 +572,18 @@ export class MemoryDavStore implements DavStore, UploadStore {
   }
 
   async checkTokens(path: string, tokens: string[]): Promise<TokenCheck> {
-    return coreCheckTokens(this.locks, path, tokens);
+    // volatile=true: this store's records die with the isolate, so the
+    // self-issued-token grace below keeps warm clients working (documented
+    // relaxed semantics for the zero-dependency fallback).
+    return coreCheckTokens(this.locks, path, tokens, true);
   }
 
   async lockAcquire(path: string, req: LockRequest): Promise<LockOutcome> {
-    return coreLockAcquire(this.locks, path, req);
+    return coreLockAcquire(this.locks, path, req, true);
   }
 
   async unlock(path: string, token: string): Promise<UnlockOutcome> {
-    return coreUnlock(this.locks, path, token);
+    return coreUnlock(this.locks, path, token, true);
   }
 
   async describe(paths: string[]): Promise<Record<string, PathState>> {
@@ -594,6 +693,7 @@ export class RemoteDavStore implements DavStore, UploadStore {
       method: 'POST',
       body: JSON.stringify(body),
     });
+    if (res.status === 507) throw new DavLimitError(`dav-state ${route}: ${await res.text()}`);
     if (!res.ok) throw new Error(`dav-state ${route}: HTTP ${res.status}`);
     return (await res.json()) as T;
   }
@@ -681,11 +781,18 @@ export class DavState extends DurableObject {
   /** Bumped by every metadata-changing write; isolates diff it against the
    *  value their local read cache was filled under. */
   private metaGen = 0;
-  private readonly ready: Promise<void>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ready = this.load();
+    // Load (and re-arm any expiry sweep) inside blockConcurrencyWhile:
+    // requests are held until state is ready, and a transient storage error
+    // restarts the object with backoff instead of rejecting a stored `ready`
+    // promise forever (which would 500 every fetch for the rest of the
+    // instance's lifetime).
+    this.ctx.blockConcurrencyWhile(async () => {
+      await this.load();
+      await this.armSweep();
+    });
   }
 
   private async load(): Promise<void> {
@@ -701,7 +808,21 @@ export class DavState extends DurableObject {
     this.metaGen = metaGen ?? 0;
   }
 
-  private async persist(): Promise<void> {
+  /**
+   * Write-through persist, scoped to what actually changed: chunk PUTs
+   * re-persist ONLY the upload sessions (the old full-state write re-serialized
+   * every lock and dead prop on every 4 MiB chunk), lock/prop routes only the
+   * advisory maps. Partial object puts leave the other keys untouched.
+   */
+  private async persist(what: 'all' | 'advisory' | 'uploads' = 'all'): Promise<void> {
+    if (what === 'advisory') {
+      await this.ctx.storage.put({ locks: [...this.locks], props: [...this.props] });
+      return;
+    }
+    if (what === 'uploads') {
+      await this.ctx.storage.put({ uploads: [...this.uploads] });
+      return;
+    }
     await this.ctx.storage.put({
       locks: [...this.locks],
       props: [...this.props],
@@ -710,125 +831,292 @@ export class DavState extends DurableObject {
     });
   }
 
+  /** Deep-ish copy of the advisory maps for rollback (records are mutated
+   *  in place — refresh, UNLOCK splice — so a shallow map copy would not
+   *  undo anything). */
+  private advisorySnapshot(): {
+    locks: Map<string, LockRecord[]>;
+    props: Map<string, Record<string, string>>;
+  } {
+    return {
+      locks: new Map(
+        [...this.locks].map(([k, v]) => [k, v.map((r) => ({ ...r }))] as [string, LockRecord[]]),
+      ),
+      props: new Map(
+        [...this.props].map(([k, v]) => [k, { ...v }] as [string, Record<string, string>]),
+      ),
+    };
+  }
+
+  private restoreAdvisory(snap: {
+    locks: Map<string, LockRecord[]>;
+    props: Map<string, Record<string, string>>;
+  }): void {
+    this.locks = snap.locks;
+    this.props = snap.props;
+  }
+
+  /** Earliest future expiry among locks and unfinished uploads — when an
+   *  alarm sweep would first change something (null = nothing expires). */
+  private nextSweepAt(): number | null {
+    const now = Date.now();
+    let next: number | null = null;
+    const consider = (t: number): void => {
+      if (t > now && (next === null || t < next)) next = t;
+    };
+    for (const records of this.locks.values()) for (const r of records) consider(r.expiresAt);
+    for (const s of this.uploads.values()) {
+      if (s.finalized) consider((s.finalizedAt ?? s.createdAt) + UPLOAD_FINALIZED_GRACE_MS);
+      else consider(s.createdAt + UPLOAD_SESSION_TTL_MS);
+    }
+    return next;
+  }
+
+  /**
+   * Arm a one-shot alarm at the next real expiry. The lazy per-path purges
+   * only run when a path is re-touched; without this backstop, a lock (or
+   * abandoned upload) on a path nobody visits again would sit in memory and
+   * get re-serialized into every subsequent persist forever.
+   */
+  private async armSweep(): Promise<void> {
+    const next = this.nextSweepAt();
+    if (next === null) return;
+    try {
+      const current = await this.ctx.storage.getAlarm();
+      if (current === null || current > next) await this.ctx.storage.setAlarm(next);
+    } catch {
+      // Arming is a backstop; the lazy sweeps still bound growth.
+    }
+  }
+
   override async fetch(request: Request): Promise<Response> {
-    await this.ready;
     if (request.method !== 'POST') {
       return new Response('POST only', { status: 405 });
     }
     const url = new URL(request.url);
     const body = (await request.json()) as Record<string, unknown>;
-    switch (url.pathname) {
-      case '/tokens': {
-        const out = coreCheckTokens(this.locks, body['path'] as string, body['tokens'] as string[]);
-        return Response.json(out);
-      }
-      case '/lock': {
-        const out = coreLockAcquire(this.locks, body['path'] as string, body['req'] as LockRequest);
-        if (out.ok) await this.persist();
-        return Response.json(out);
-      }
-      case '/unlock': {
-        const out = coreUnlock(this.locks, body['path'] as string, body['token'] as string);
-        if (out === 'removed') await this.persist();
-        return Response.json(out);
-      }
-      case '/describe': {
-        const out = coreDescribe(this.locks, this.props, body['paths'] as string[]);
-        return Response.json(out);
-      }
-      case '/patch': {
-        const out = corePatch(this.props, body['path'] as string, body['ops'] as PropPatchOp[]);
-        await this.persist();
-        return Response.json(out);
-      }
-      case '/relocate': {
-        for (const item of body['items'] as RelocateItem[]) {
-          coreRelocate(this.locks, this.props, item);
+    try {
+      switch (url.pathname) {
+        case '/tokens': {
+          const out = coreCheckTokens(
+            this.locks,
+            body['path'] as string,
+            body['tokens'] as string[],
+            false,
+          );
+          return Response.json(out);
         }
-        await this.persist();
-        return Response.json({});
-      }
-      case '/meta-gen': {
-        if (body['bump']) {
-          this.metaGen += 1;
-          // Only the counter changed. persist() would serialize every lock,
-          // dead prop and upload session (each with its full chunk-md5 list)
-          // to storage on EVERY metadata write — O(sessions) per PUT.
-          await this.ctx.storage.put('metaGen', this.metaGen);
+        case '/lock': {
+          const snap = this.advisorySnapshot();
+          const out = coreLockAcquire(
+            this.locks,
+            body['path'] as string,
+            body['req'] as LockRequest,
+            false,
+          );
+          if (out.ok) {
+            try {
+              await this.persist('advisory');
+            } catch (err) {
+              // Mutate-before-persist needs a rollback: a failed write must
+              // not leave the lock live in memory — the client gets a 500
+              // and never learns the token, yet the phantom record would
+              // 423 every later writer, and the NEXT successful persist
+              // would durabilize it.
+              this.restoreAdvisory(snap);
+              throw err;
+            }
+            await this.armSweep();
+          }
+          return Response.json(out);
         }
-        return Response.json(this.metaGen);
-      }
-      case '/upload-init': {
-        const session = body['session'] as UploadSession;
-        // Lazy sweep: drop any expired sessions whenever a new one lands, so
-        // the map stays bounded even if clients abandon uploads.
-        for (const [id, existing] of this.uploads) {
-          if (isExpired(existing)) this.uploads.delete(id);
+        case '/unlock': {
+          const snap = this.advisorySnapshot();
+          const out = coreUnlock(
+            this.locks,
+            body['path'] as string,
+            body['token'] as string,
+            false,
+          );
+          if (out === 'removed') {
+            try {
+              await this.persist('advisory');
+            } catch (err) {
+              this.restoreAdvisory(snap);
+              throw err;
+            }
+          }
+          return Response.json(out);
         }
-        this.uploads.set(session.uploadId, session);
-        await this.persist();
-        return Response.json({});
-      }
-      case '/upload-get': {
-        const uploadId = body['uploadId'] as string;
-        const session = this.uploads.get(uploadId);
-        if (session && isExpired(session)) {
-          this.uploads.delete(uploadId);
-          await this.persist();
-          return Response.json(null);
+        case '/describe': {
+          const out = coreDescribe(this.locks, this.props, body['paths'] as string[]);
+          return Response.json(out);
         }
-        return Response.json(session ?? null);
-      }
-      case '/upload-chunk': {
-        const session = this.uploads.get(body['uploadId'] as string);
-        if (session) {
-          session.chunkMd5s[body['index'] as number] = body['md5'] as string;
-          const activeHost = body['activeHost'] as string | undefined;
-          if (activeHost) session.activeHost = activeHost;
-          await this.persist();
+        case '/patch': {
+          const snap = this.advisorySnapshot();
+          const out = corePatch(this.props, body['path'] as string, body['ops'] as PropPatchOp[]);
+          try {
+            await this.persist('advisory');
+          } catch (err) {
+            this.restoreAdvisory(snap);
+            throw err;
+          }
+          return Response.json(out);
         }
-        return Response.json({});
-      }
-      case '/upload-finalized': {
-        const session = this.uploads.get(body['uploadId'] as string);
-        if (session) {
-          session.finalized = body['status'] as number;
-          session.finalizedAt = Date.now();
-          session.finalizing = undefined;
-          await this.persist();
+        case '/relocate': {
+          const snap = this.advisorySnapshot();
+          for (const item of body['items'] as RelocateItem[]) {
+            coreRelocate(this.locks, this.props, item);
+          }
+          try {
+            await this.persist('advisory');
+          } catch (err) {
+            this.restoreAdvisory(snap);
+            throw err;
+          }
+          return Response.json({});
         }
-        return Response.json({});
-      }
-      case '/upload-claim': {
-        const session = this.uploads.get(body['uploadId'] as string);
-        if (!session) return Response.json({ kind: 'unknown' });
-        if (session.finalized !== undefined) return Response.json({ kind: 'replay', status: session.finalized });
-        const now = Date.now();
-        if (session.finalizing !== undefined && now - session.finalizing < FINALIZE_CLAIM_TTL_MS) {
-          return Response.json({ kind: 'busy' });
+        case '/meta-gen': {
+          if (body['bump']) {
+            this.metaGen += 1;
+            // Only the counter changed. A full persist() would serialize every
+            // lock, dead prop and upload session (each with its full chunk-md5
+            // list) to storage on EVERY metadata write — O(state) per PUT.
+            await this.ctx.storage.put('metaGen', this.metaGen);
+          }
+          return Response.json(this.metaGen);
         }
-        // Fresh claim, or taking over a stale one (owner died mid-finalize).
-        // Mutate before persist: the check and the set happen with no await
-        // in between, so a second request can never interleave here.
-        session.finalizing = now;
-        await this.persist();
-        return Response.json({ kind: 'owned' });
-      }
-      case '/upload-claim-release': {
-        const session = this.uploads.get(body['uploadId'] as string);
-        if (session && session.finalized === undefined) {
-          session.finalizing = undefined;
-          await this.persist();
+        case '/upload-init': {
+          const session = body['session'] as UploadSession;
+          // Lazy sweep: drop any expired sessions whenever a new one lands, so
+          // the map stays bounded even if clients abandon uploads.
+          for (const [id, existing] of this.uploads) {
+            if (isExpired(existing)) this.uploads.delete(id);
+          }
+          this.uploads.set(session.uploadId, session);
+          await this.persist('uploads');
+          await this.armSweep();
+          return Response.json({});
         }
-        return Response.json({});
+        case '/upload-get': {
+          const uploadId = body['uploadId'] as string;
+          const session = this.uploads.get(uploadId);
+          if (session && isExpired(session)) {
+            this.uploads.delete(uploadId);
+            await this.persist('uploads');
+            return Response.json(null);
+          }
+          return Response.json(session ?? null);
+        }
+        case '/upload-chunk': {
+          const session = this.uploads.get(body['uploadId'] as string);
+          if (session) {
+            session.chunkMd5s[body['index'] as number] = body['md5'] as string;
+            const activeHost = body['activeHost'] as string | undefined;
+            if (activeHost) session.activeHost = activeHost;
+            // Only the uploads key changes here; every other key (locks,
+            // props) stays untouched in storage.
+            await this.persist('uploads');
+          }
+          return Response.json({});
+        }
+        case '/upload-finalized': {
+          const session = this.uploads.get(body['uploadId'] as string);
+          if (session) {
+            const prev = {
+              finalized: session.finalized,
+              finalizedAt: session.finalizedAt,
+              finalizing: session.finalizing,
+            };
+            session.finalized = body['status'] as number;
+            session.finalizedAt = Date.now();
+            session.finalizing = undefined;
+            try {
+              await this.persist('uploads');
+            } catch (err) {
+              Object.assign(session, prev);
+              throw err;
+            }
+          }
+          return Response.json({});
+        }
+        case '/upload-claim': {
+          const session = this.uploads.get(body['uploadId'] as string);
+          if (!session) return Response.json({ kind: 'unknown' });
+          if (session.finalized !== undefined) return Response.json({ kind: 'replay', status: session.finalized });
+          const now = Date.now();
+          if (session.finalizing !== undefined && now - session.finalizing < FINALIZE_CLAIM_TTL_MS) {
+            return Response.json({ kind: 'busy' });
+          }
+          // Fresh claim, or taking over a stale one (owner died mid-finalize).
+          // Mutate before persist: the check and the set happen with no await
+          // in between, so a second request can never interleave here. A failed
+          // persist must release the claim again — otherwise this 500 wedges
+          // concurrent retries into `busy` until the claim TTL.
+          const prev = session.finalizing;
+          session.finalizing = now;
+          try {
+            await this.persist('uploads');
+          } catch (err) {
+            session.finalizing = prev;
+            throw err;
+          }
+          return Response.json({ kind: 'owned' });
+        }
+        case '/upload-claim-release': {
+          const session = this.uploads.get(body['uploadId'] as string);
+          if (session && session.finalized === undefined) {
+            session.finalizing = undefined;
+            await this.persist('uploads');
+          }
+          return Response.json({});
+        }
+        case '/upload-delete': {
+          this.uploads.delete(body['uploadId'] as string);
+          await this.persist('uploads');
+          return Response.json({});
+        }
+        default:
+          return new Response('unknown route', { status: 404 });
       }
-      case '/upload-delete': {
-        this.uploads.delete(body['uploadId'] as string);
-        await this.persist();
-        return Response.json({});
-      }
-      default:
-        return new Response('unknown route', { status: 404 });
+    } catch (err) {
+      // Safety-cap refusals from the cores become 507 (RFC 4918 §7.1) both
+      // for the in-process caller and for RemoteDavStore over the wire.
+      if (err instanceof DavLimitError) return new Response(err.message, { status: 507 });
+      throw err;
     }
+  }
+
+  /**
+   * One-shot expiry sweep: the lazy purges only run when a path is touched
+   * again, so the alarm fires at the earliest real expiry and drops whatever
+   * the lazy passes would never revisit (never-re-touched locked paths,
+   * abandoned uploads), then re-arms for the next one.
+   */
+  override async alarm(): Promise<void> {
+    const now = Date.now();
+    let changed = false;
+    for (const [key, records] of this.locks) {
+      const live = records.filter((r) => r.expiresAt > now);
+      if (live.length !== records.length) {
+        changed = true;
+        if (live.length > 0) this.locks.set(key, live);
+        else this.locks.delete(key);
+      }
+    }
+    for (const [id, session] of this.uploads) {
+      if (isExpired(session)) {
+        this.uploads.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) {
+      try {
+        await this.persist();
+      } catch {
+        // A failed sweep write is bounded by the next alarm/lazy purge.
+      }
+    }
+    await this.armSweep();
   }
 }

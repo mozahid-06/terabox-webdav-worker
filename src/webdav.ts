@@ -10,8 +10,10 @@ import {
 import {
   collectTokens,
   createDavStore,
+  DavLimitError,
   resetDavVolatileState as resetDavStoreState,
   type DavStore,
+  type LockOutcome,
   type LockRecord,
   type PathState,
   type PropPatchOp,
@@ -1887,16 +1889,37 @@ async function handleLock(
   // lockdiscovery — hoist any prefix the client declared higher up in the
   // request body into the fragment itself so it stays self-contained.
   if (owner.includes('<')) owner = selfContain(owner, collectXmlScope(body));
-  const depth = (request.headers.get('Depth') || '').toLowerCase() === '0' ? '0' : 'Infinity';
+  // RFC 4918 §9.10.3: Depth on LOCK must be "0" or "infinity" — any other
+  // value MUST NOT be used, and silently widening it to Infinity would hand
+  // out a hierarchy-wide lock the client never asked for. Absent = infinity
+  // (the RFC default for LOCK).
+  const rawDepth = request.headers.get('Depth');
+  let depth: '0' | 'Infinity';
+  if (rawDepth === null) {
+    depth = 'Infinity';
+  } else {
+    const d = rawDepth.trim().toLowerCase();
+    if (d !== '0' && d !== 'infinity') {
+      return errorResponse('Depth on LOCK must be 0 or infinity', 400);
+    }
+    depth = d === '0' ? '0' : 'Infinity';
+  }
 
-  const outcome = await store.lockAcquire(absPath, {
-    shared,
-    depth,
-    owner,
-    presented: collectTokens(request.headers.get('If')),
-    seconds,
-    rootHref: encodeHref(mount.href(absPath), resource?.isDir ?? false),
-  });
+  let outcome: LockOutcome;
+  try {
+    outcome = await store.lockAcquire(absPath, {
+      shared,
+      depth,
+      owner,
+      presented: collectTokens(request.headers.get('If')),
+      seconds,
+      rootHref: encodeHref(mount.href(absPath), resource?.isDir ?? false),
+    });
+  } catch (err) {
+    // Advisory-state safety cap (see DavLimitError): 507, RFC 4918 §7.1.
+    if (err instanceof DavLimitError) return errorResponse('Insufficient Storage', 507);
+    throw err;
+  }
   if (!outcome.ok) {
     // §9.10.6: an If naming a lock that does not cover this URI is a failed
     // precondition (412); an actual lock conflict is 423. Preconditions are
@@ -2019,7 +2042,15 @@ async function handleProppatch(
       );
     }
   }
-  if (ops.length > 0) await store.propPatch(absPath, ops);
+  if (ops.length > 0) {
+    try {
+      await store.propPatch(absPath, ops);
+    } catch (err) {
+      // Advisory-state safety cap (see DavLimitError): 507, RFC 4918 §7.1.
+      if (err instanceof DavLimitError) return errorResponse('Insufficient Storage', 507);
+      throw err;
+    }
+  }
   if (propstats.length === 0) {
     propstats.push(`<D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat>`);
   }

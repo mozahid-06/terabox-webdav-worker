@@ -700,8 +700,22 @@ describe('resumable upload', () => {
 
 		const fin = await request(`/.resumable/${begun.uploadId}/finalize`, { method: 'POST' });
 		expect(fin.status).toBe(201);
-		expect(tb.find('/big.bin')!.size).toBe(total);
-		expect(tb.find('/big.bin')!.content).toEqual(data);
+		const landed = tb.find('/big.bin')!;
+		expect(landed.size).toBe(total);
+		// Byte-for-byte compare: vitest's toEqual walks a 4.19 MB typed array
+		// structurally and takes 24-33 s on a loaded machine — against the
+		// test's own 30 s budget that made this pin flaky for timing reasons
+		// alone. A linear scan is the same assertion in milliseconds.
+		const got = landed.content!;
+		expect(got.length).toBe(data.length);
+		let diff = -1;
+		for (let i = 0; i < data.length; i += 1) {
+			if (got[i] !== data[i]) {
+				diff = i;
+				break;
+			}
+		}
+		expect(diff).toBe(-1);
 	}, 30000);
 
 	it('replays the same status when finalize is retried', async () => {
@@ -2936,5 +2950,138 @@ describe('review round 6: preflight, Allow, control-plane shapes, Destination, h
 		const unauth = await SELF.fetch(ORIGIN + '/no-such-file.txt');
 		expect(unauth.status).toBe(401);
 		expect(unauth.headers.get('X-Content-Type-Options')).toBe('nosniff');
+	});
+});
+
+describe('round 7 pins: lock conflicts, forged tokens, caps', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>r7</D:href></D:owner></D:lockinfo>';
+
+	// A token in our own minted shape (uuid + 13-digit epoch-ms expiry)
+	// that no server instance ever issued.
+	const forged = `opaquelocktoken:${crypto.randomUUID()}:${Date.now() + 3600000}`;
+
+	const lock = async (path: string, init: RequestInit = {}): Promise<string> => {
+		const res = await request(path, {
+			...init,
+			method: 'LOCK',
+			headers: {
+				'Content-Type': 'application/xml',
+				...((init.headers as Record<string, string>) ?? {}),
+			},
+			body: init.body ?? LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		return res.headers.get('Lock-Token')!;
+	};
+
+	const LOCKDISCOVERY_PROPFIND =
+		'<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>';
+
+	it('rejects LOCK on a member of an exclusively Infinity-locked collection', async () => {
+		await request('/r7col', { method: 'MKCOL' });
+		await request('/r7col/child.txt', { method: 'PUT', body: 'child' });
+		await lock('/r7col');
+		// RFC 4918 §9.10.3: the collection's exclusive Infinity lock already
+		// covers every member — a LOCK on the child is a conflict (423),
+		// not a second independent lock stacked underneath.
+		const res = await request('/r7col/child.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(423);
+	});
+
+	it('rejects an Infinity LOCK over a subtree that already holds a member lock', async () => {
+		await request('/r7tree', { method: 'MKCOL' });
+		await request('/r7tree/mem.txt', { method: 'PUT', body: 'member' });
+		await lock('/r7tree/mem.txt');
+		// The requested lock would cover a member that is already locked;
+		// granting it would overlap two exclusive locks on the same bytes.
+		const res = await request('/r7tree', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(423);
+	});
+
+	it('UNLOCK with a well-formed never-issued token is 409 while the real lock lives', async () => {
+		await request('/r7un.txt', { method: 'PUT', body: 'locked file' });
+		await lock('/r7un.txt');
+		// Pre-fix this answered 204 ('lapsed'): our token shape with no live
+		// record was treated as an already-lapsed lock — forging an unlock
+		// acknowledged for a lock the caller never held (RFC 4918 §9.11).
+		// §9.11's Lock-Token production is "<" URI ">", hence the brackets.
+		const res = await request('/r7un.txt', {
+			method: 'UNLOCK',
+			headers: { 'Lock-Token': `<${forged}>` },
+		});
+		expect(res.status).toBe(409);
+	});
+
+	it('LOCK with a Depth header other than 0 or infinity is 400', async () => {
+		const res = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', Depth: '1' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('PROPPATCH beyond the dead-property size cap answers 507', async () => {
+		const big = 'x'.repeat(40000);
+		const res = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				`<X:big xmlns:X="urn:x">${big}</X:big>` +
+				'</D:prop></D:set></D:propertyupdate>',
+		});
+		expect(res.status).toBe(507);
+	});
+
+	it('expired locks stop enforcing and vanish from lockdiscovery', async () => {
+		await request('/r7exp.txt', { method: 'PUT', body: 'temporary' });
+		await lock('/r7exp.txt', { headers: { Timeout: 'Second-1' } });
+		expect((await request('/r7exp.txt', { method: 'PUT', body: 'nope' })).status).toBe(423);
+		await new Promise((resolve) => setTimeout(resolve, 1400));
+		expect((await request('/r7exp.txt', { method: 'PUT', body: 'freed' })).status).toBe(204);
+		const res = await request('/r7exp.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: LOCKDISCOVERY_PROPFIND,
+		});
+		expect(await res.text()).toContain('<D:lockdiscovery/>');
+	});
+
+	it('COPY carries dead properties but never locks', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:r7k xmlns:X="urn:r7">round7</X:r7k></D:prop></D:set></D:propertyupdate>',
+		});
+		await lock('/a.txt');
+		const copy = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/r7copy-dest.txt' },
+		});
+		expect(copy.status).toBe(201);
+		// RFC 4918 §9.3.1: COPY copies all dead properties…
+		const props = await request('/r7copy-dest.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><X:r7k xmlns:X="urn:r7"/></D:prop></D:propfind>',
+		});
+		expect(await props.text()).toContain('round7');
+		// …but never the locks (§9.10.1 scope): the copy is writable with
+		// no token while the source stays locked.
+		expect((await request('/r7copy-dest.txt', { method: 'PUT', body: 'free' })).status).toBe(204);
+		expect((await request('/a.txt', { method: 'PUT', body: 'blocked' })).status).toBe(423);
 	});
 });

@@ -277,4 +277,55 @@ describe('metadata generation (cross-isolate cache invalidation)', () => {
 		expect(await store.metaGeneration(true)).toBe(1);
 		expect(await store.metaGeneration(false)).toBe(1);
 	});
+
+	it('rejects a well-formed never-issued token on the DO path (no volatile grace)', async () => {
+		const target = `/do-strict-${crypto.randomUUID().slice(0, 8)}.txt`;
+		tb.seed(target, { content: 'strict path\n' });
+		// The memory fallback documents a self-issued-token grace for its
+		// per-isolate records; the DO is the durable source of truth and must
+		// not extend that grace to a shape-correct forgery. With the token
+		// properly submitted (`<…>`, RFC 4918 §10.4.1) the condition fails
+		// as an invalid lock-token: 412. Pre-fix the strict route admitted
+		// it via the volatile grace and the write simply proceeded (2xx).
+		const forged = `opaquelocktoken:${crypto.randomUUID()}:${Date.now() + 3600000}`;
+		const put = await request(target, {
+			method: 'PUT',
+			headers: { If: `(<${forged}>)` },
+			body: 'forged grant',
+		});
+		expect(put.status).toBe(412);
+	});
+
+	it('mints its own token instead of adopting a presented one', async () => {
+		const target = `/do-adopt-${crypto.randomUUID().slice(0, 8)}.txt`;
+		tb.seed(target, { content: 'adoption path\n' });
+		const forged = `opaquelocktoken:${crypto.randomUUID()}:${Date.now() + 3600000}`;
+		// Pre-fix the strict route still ADOPTED a presented well-formed
+		// token — the client would receive a response 'granting' the very
+		// token it just forged (§6.5: lock tokens are capabilities, not
+		// client-chosen names). The minted token must be the server's own.
+		const lock = await request(target, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: `(<${forged}>)` },
+			body: LOCK_BODY,
+		});
+		expect(lock.status).toBe(200);
+		const minted = lock.headers.get('Lock-Token')!;
+		expect(minted.slice(1, -1)).not.toBe(forged);
+	});
+
+	it('answers 507 for a dead-property write past the caps over the DO route', async () => {
+		const target = `/do-cap-${crypto.randomUUID().slice(0, 8)}.txt`;
+		tb.seed(target, { content: 'cap path\n' });
+		const big = 'y'.repeat(40000);
+		const res = await request(target, {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				`<X:big xmlns:X="urn:x">${big}</X:big>` +
+				'</D:prop></D:set></D:propertyupdate>',
+		});
+		expect(res.status).toBe(507);
+	});
 });
