@@ -43,6 +43,21 @@ export default defineConfig({
 				test: { name: 'mount', include: ['test/mount.test.ts'] },
 			},
 			{
+				// Non-ASCII PATH: routing must percent-encode the base exactly
+				// like the URL parser encodes request pathnames, or every
+				// request on such a mount 404s (round-9 F8).
+				plugins: [
+					cloudflareTest({
+						main: 'src/index.ts',
+						miniflare: {
+							...compat,
+							bindings: { ...davBindings, PATH: '/döc' },
+						},
+					}),
+				],
+				test: { name: 'mount-utf8', include: ['test/mount-utf8.test.ts'] },
+			},
+			{
 				plugins: [
 					cloudflareTest({
 						main: 'src/index.ts',

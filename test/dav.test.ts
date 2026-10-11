@@ -3150,3 +3150,75 @@ describe('round 8 pins: If Resource-Tags and negation (memory fallback)', () => 
 		expect(put.status).toBe(412);
 	});
 });
+
+describe('round 9 pins: If fail-closed, target cap, refresh-only LOCK, 413, %5c', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>r9</D:href></D:owner></D:lockinfo>';
+
+	it('fails an unresolvable Resource-Tag list even when its terms are negated (§10.4.10)', async () => {
+		const foreign = 'https://foreign-origin.invalid/elsewhere.txt';
+		const token = await request('/a.txt', {
+			method: 'PUT',
+			headers: {
+				If: `<${foreign}> (Not <opaquelocktoken:00000000-0000-0000-0000-000000000000:0>)`,
+			},
+			body: 'x',
+		});
+		expect(token.status).toBe(412);
+		const etag = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: `<${foreign}> (Not ["deadbeef"])` },
+			body: 'x',
+		});
+		expect(etag.status).toBe(412);
+	});
+
+	it('caps distinct tagged If targets: the 9th answers 400', async () => {
+		const lists = Array.from(
+			{ length: 9 },
+			(_, i) =>
+				`<${ORIGIN}/r9cap-${i}.txt> (Not <opaquelocktoken:00000000-0000-0000-0000-000000000000:0>)`,
+		).join(' ');
+		const res = await request('/a.txt', { method: 'PUT', headers: { If: lists }, body: 'x' });
+		expect(res.status).toBe(400);
+	});
+
+	it('body-less LOCK is refresh-only: tag-like or bogus If never mints (§9.10.1)', async () => {
+		const path = '/r9refresh.txt';
+		tb.seed(path, { content: 'seeded' });
+		const relTag = await request(path, { method: 'LOCK', headers: { If: `</r9refresh.txt>` } });
+		expect(relTag.status).toBe(409);
+		const bogus = await request(path, {
+			method: 'LOCK',
+			headers: { If: '(<opaquelocktoken:00000000-0000-0000-0000-000000000000:0>)' },
+		});
+		expect(bogus.status).toBe(409);
+		// Neither attempt may have left a lock behind: a real LOCK still succeeds.
+		const fresh = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(fresh.status).toBe(200);
+	});
+
+	it('refuses an XML body over 4 MiB with 413 before buffering', async () => {
+		const body =
+			'<?xml version="1.0" encoding="utf-8"?>' +
+			`<D:propfind xmlns:D="DAV:"><D:allprop/><D:pad>${'x'.repeat(4 * 1024 * 1024)}</D:pad></D:propfind>`;
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body,
+		});
+		expect(res.status).toBe(413);
+	});
+
+	it('rejects percent-encoded backslash traversal, keeps plain backslash names', async () => {
+		const evil = await request('/r9%5c..%5cx.txt', { method: 'PUT', body: 'x' });
+		expect(evil.status).toBe(400);
+		const plain = await request('/r9a%5cb.txt', { method: 'PUT', body: 'x' });
+		expect(plain.status).toBe(201);
+	});
+});

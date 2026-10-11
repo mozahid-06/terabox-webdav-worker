@@ -158,6 +158,14 @@ export function decodePathname(pathname: string): string {
       continue;
     }
     if (name.includes('/')) throw new TeraboxError(-9, 'Invalid path encoding');
+    // `%5c` is the only way a backslash reaches this point (URL parsing
+    // maps a raw '\' to '/'). If Terabox-side normalization treats '\' as
+    // a separator, a backslash-split segment carrying ".." escapes the
+    // mount exactly like the literal ".." the check above rejects. Plain
+    // "a\b.txt" names stay legal.
+    if (name.includes('\\') && name.split(/[\\/]/).includes('..')) {
+      throw new TeraboxError(-9, 'Invalid path encoding');
+    }
     parts.push(name);
   }
   return '/' + parts.join('/');
@@ -209,6 +217,59 @@ export function normalizeBasePath(raw?: string): string {
   if (!value || value === '/') return '';
   const base = ('/' + value.replace(/^\/+/, '')).replace(/\/+$/, '');
   return base === '' ? '' : base;
+}
+
+/**
+ * `base` percent-encoded exactly the way the URL parser encodes request
+ * pathnames. Routing compares the raw `url.pathname` (always percent-encoded)
+ * against the base: a PATH with non-ASCII/space/#/? must be encoded by the
+ * same algorithm byte-for-byte, or every request on such a mount 404s.
+ * `#`/`?` cannot survive a URL parse as path characters, so they are
+ * pre-encoded before the parse; `%` is left alone (the parser keeps it).
+ */
+export function mountBasePath(base: string): string {
+  if (!base) return base;
+  const safe = base.replace(/[#?]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  try {
+    return new URL(`http://x${safe.startsWith('/') ? safe : `/${safe}`}`).pathname;
+  } catch {
+    return safe;
+  }
+}
+
+/** XML request bodies are read from the wire at most this much (see below). */
+const MAX_XML_BODY = 4 * 1024 * 1024;
+
+/**
+ * Buffer an XML request body up to MAX_XML_BODY bytes; `null` = over the
+ * cap (the caller answers 413). The body is read as a stream so a ~100 MB
+ * authenticated PROPFIND/PROPPATCH/LOCK/MKCOL can never land whole in the
+ * 128 MB isolate before `validateXml` even runs.
+ */
+async function readTextCapped(request: Request): Promise<string | null> {
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_XML_BODY) return null;
+  if (request.body === null) return '';
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_XML_BODY) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return new TextDecoder().decode(all);
 }
 
 /** Normalise ROOT_ID: "" / "/" → whole account; "/backup/" → "/backup". */
@@ -477,6 +538,9 @@ interface IfList {
   terms: IfTerm[];
 }
 
+/** Cap on distinct tagged targets per If header (see checkMutationPreconditions). */
+const MAX_IF_TAG_TARGETS = 8;
+
 /**
  * Parse `If: [<tag>] (<token> [etag]) (Not <token2> …)` into OR-ed lists,
  * keeping each list's Resource-Tag. A `<…>` outside the parens counts as a
@@ -629,23 +693,41 @@ async function checkMutationPreconditions(
         return null;
       }
       if (url.host !== requestOrigin.host) return null;
+      // Same order as routing: strip the (encoded) base from the RAW
+      // pathname, then decode — a tag and the identical Request-URI
+      // resolve to the same resource under a mount.
+      let raw = url.pathname.split(/[?#]/, 1)[0]!;
+      if (mount.base) {
+        const basePath = mountBasePath(mount.base);
+        if (raw === basePath) raw = '/';
+        else if (raw.startsWith(basePath + '/')) raw = raw.slice(basePath.length);
+        else return null;
+      }
       let davPath: string;
       try {
-        davPath = decodePathname(url.pathname.split(/[?#]/, 1)[0]!);
+        davPath = decodePathname(raw);
       } catch {
         return null;
       }
       if (davPath.length > 1 && davPath.endsWith('/')) davPath = davPath.slice(0, -1);
-      if (mount.base) {
-        if (davPath === mount.base) davPath = '/';
-        else if (davPath.startsWith(mount.base + '/')) davPath = davPath.slice(mount.base.length);
-        else return null;
-      }
       return mount.toTera(sanitizeDavPath(davPath));
     };
     const resolved: Array<string | null> = lists.map((list) =>
       list.tag === null ? path : resolveTag(list.tag),
     );
+    // Round-8 tag support made the per-request work O(distinct tagged
+    // targets): one store lookup plus one paced upstream stat each. Cap
+    // them (the Free plan allows 50 subrequests total) — 9+ distinct tagged
+    // targets in one If is a client bug, and answering 400 beats 500.
+    const distinctTargets = new Set(
+      lists.flatMap((list, index) => {
+        const target = resolved[index]!;
+        return list.tag !== null && target !== null && target !== path ? [target] : [];
+      }),
+    );
+    if (distinctTargets.size > MAX_IF_TAG_TARGETS) {
+      return errorResponse('Too many tagged If targets', 400);
+    }
     // One store lookup per tagged resource: which of the submitted tokens
     // actually apply there (untagged terms reuse the Request-URI result
     // above, byte-for-byte the pre-tag behavior).
@@ -671,13 +753,16 @@ async function checkMutationPreconditions(
     for (let i = 0; i < lists.length; i += 1) {
       const list = lists[i]!;
       const target = resolved[i]!;
+      // An unresolvable Resource-Tag fails its entire list (§10.4.10): no
+      // term in it — negated or not — may make the list true. Evaluating
+      // terms as plain `false` and then applying `Not` would flip an
+      // all-failed list to true and silently ignore the condition.
+      if (target === null) continue;
       let listTrue = list.terms.length > 0;
       for (const term of list.terms) {
         let value: boolean;
         if (term.kind === 'token') {
-          if (target === null) {
-            value = false;
-          } else if (list.tag === null || target === path) {
+          if (list.tag === null || target === path) {
             value = applies.has(term.value);
             // Only Request-URI terms feed the mod_dav-style invalid-token
             // upgrade (412/423); a tagged token is judged against the
@@ -688,17 +773,13 @@ async function checkMutationPreconditions(
             value = taggedApplies.get(target)?.has(term.value) ?? false;
           }
         } else {
-          if (target === null) {
-            value = false;
-          } else {
-            let etag = etags.get(target);
-            if (etag === undefined) {
-              const dentry = await statResourceFresh(client, target);
-              etag = dentry ? dentry.etag : null;
-              etags.set(target, etag);
-            }
-            value = etag !== null && etag === term.value.trim();
+          let etag = etags.get(target);
+          if (etag === undefined) {
+            const dentry = await statResourceFresh(client, target);
+            etag = dentry ? dentry.etag : null;
+            etags.set(target, etag);
           }
+          value = etag !== null && etag === term.value.trim();
         }
         if (term.negated) value = !value;
         listTrue = listTrue && value;
@@ -980,15 +1061,19 @@ export async function handleWebDav(
 
   // Base path (gdrive parity): the surface only exists below `mount.base`.
   // The bare base redirects to its slash form; anything else outside 404s.
+  // Both sides of the comparison are percent-encoded by the same URL
+  // algorithm (see mountBasePath) — a raw non-ASCII PATH never matches
+  // the encoded pathname the request actually carries.
   let pathname = url.pathname;
   if (mount.base) {
-    if (pathname === mount.base) {
+    const basePath = mountBasePath(mount.base);
+    if (pathname === basePath) {
       const redirect = new URL(request.url);
-      redirect.pathname = mount.base + '/';
+      redirect.pathname = basePath + '/';
       return Response.redirect(redirect.toString(), 301);
     }
-    if (!pathname.startsWith(mount.base + '/')) return errorResponse('Not Found', 404);
-    pathname = pathname.slice(mount.base.length);
+    if (!pathname.startsWith(basePath + '/')) return errorResponse('Not Found', 404);
+    pathname = pathname.slice(basePath.length);
   }
 
   let davPath: string;
@@ -1354,7 +1439,8 @@ async function handlePropfind(
   mount: Mount,
 ): Promise<Response> {
   const depth = request.headers.get('Depth') || '1';
-  const body = await request.text();
+  const body = await readTextCapped(request);
+  if (body === null) return errorResponse('Payload Too Large', 413);
   if (body.trim()) {
     // RFC 4918 §9.1: a malformed or namespace-invalid body is a 400,
     // never a silent allprop (litmus propfind_invalid/propfind_invalid2).
@@ -1416,7 +1502,8 @@ async function handleMkcol(
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   // RFC 4918 §9.3.1: a non-empty MKCOL body must be refused with 415
   // (litmus checks this), not silently ignored.
-  const body = await request.text();
+  const body = await readTextCapped(request);
+  if (body === null) return errorResponse('Payload Too Large', 413);
   if (body.length > 0) return errorResponse('Unsupported Media Type', 415);
   const existing = await statResourceFresh(client, absPath);
   if (existing) {
@@ -1943,13 +2030,26 @@ async function handleLock(
   mount: Mount,
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
-  const body = await request.text();
-  // A resource-tag If (`<http://host/x>`, RFC 4918 §10.4.1) is not a lock
+  const body = await readTextCapped(request);
+  if (body === null) return errorResponse('Payload Too Large', 413);
+  // A Resource-Tag (`<http://host/x>`, RFC 4918 §10.4.1) is not a lock
   // token: it must not satisfy the gates below, or a body-less LOCK would
   // mint a brand-new lock (§9.10.1 makes a body-less LOCK a refresh, and a
-  // refresh needs an actual lock token).
-  const presentedLocks = collectTokens(request.headers.get('If')).filter(
-    (t) => !/^[a-z][a-z0-9+.-]*:\/\//i.test(t),
+  // refresh needs an actual lock token). Only paren-list terms are
+  // presented tokens; the old `scheme://` text filter missed relative tags
+  // like `</a>`. A malformed If answers 400 here, like every other method.
+  const ifHeader = request.headers.get('If');
+  const parsedIf = ifHeader === null ? [] : parseIfHeader(ifHeader);
+  if (parsedIf === null) return errorResponse('Bad Request', 400);
+  const presentedLocks = parsedIf.flatMap((list) =>
+    list.terms
+      .filter((t) => t.kind === 'token')
+      .map((t) => t.value)
+      // A scheme://-shaped value is a Resource-Tag / URL name (§10.4.1),
+      // never a lock token — same exclusion the old text filter applied,
+      // now after the parse so relative tags reach the refresh check
+      // below instead of sneaking past the body-less gate as tokens.
+      .filter((value) => !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)),
   );
   // RFC 4918 §9.10: a LOCK body is XML; validate it exactly like PROPFIND /
   // PROPPATCH. Without this a client could persist ill-formed markup as the
@@ -1968,6 +2068,15 @@ async function handleLock(
     }
   } else if (presentedLocks.length === 0) {
     return errorResponse('lockinfo body required', 400);
+  } else {
+    // §9.10.1: a body-less LOCK is a refresh, never a create. A presented
+    // token that identifies no live lock covering this URI is not a valid
+    // refresh credential — without this check the acquire path below would
+    // mint a brand-new lock from a bare `If: </relative>` or a bogus token.
+    const refresh = await store.checkTokens(absPath, presentedLocks);
+    if (!refresh.recordTokens.some((t) => presentedLocks.includes(t))) {
+      return errorResponse('Lock Token Does Not Match Any Lock on this Resource', 409);
+    }
   }
   const resource = await statResource(client, absPath);
 
@@ -2014,7 +2123,7 @@ async function handleLock(
       shared,
       depth,
       owner,
-      presented: collectTokens(request.headers.get('If')),
+      presented: presentedLocks,
       seconds,
       rootHref: encodeHref(mount.href(absPath), resource?.isDir ?? false),
     });
@@ -2081,7 +2190,8 @@ async function handleProppatch(
   absPath: string,
   mount: Mount,
 ): Promise<Response> {
-  const body = await request.text();
+  const body = await readTextCapped(request);
+  if (body === null) return errorResponse('Payload Too Large', 413);
   if (body.trim()) {
     const xmlError = validateXml(body);
     if (xmlError) return errorResponse(`Invalid XML: ${xmlError}`, 400);

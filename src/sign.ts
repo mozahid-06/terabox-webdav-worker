@@ -5,6 +5,7 @@
 
 /** RC4-style keystream XOR signature used by /api/download. */
 export function sign(s1: string, s2: string): string {
+  if (!s1) return '';
   const a = new Array<number>(256);
   const p = new Array<number>(256);
   const o: number[] = [];
@@ -45,8 +46,16 @@ export function valuedCookie(cookie: string): string {
     value = value.slice(1, -1);
   }
   const parts = value.split(';');
-  if (parts.length === 1 && !parts[0]!.includes('=')) {
-    return `ndus=${parts[0]}; lang=en`;
+  if (parts.length === 1) {
+    const bare = parts[0]!;
+    if (!bare.includes('=')) return `ndus=${bare}; lang=en`;
+    // A bare ndus value is base64: pasting it with its trailing '=' padding
+    // must still wrap. Discriminator: base64 padding sits at the END, so a
+    // single nameless token that *ends* in '=' is a padded value — a real
+    // name=value pair (`lang=en`) has text after the '='.
+    if (bare.endsWith('=') && !bare.startsWith('ndus=') && !/\s/.test(bare)) {
+      return `ndus=${bare}; lang=en`;
+    }
   }
   return value;
 }

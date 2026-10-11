@@ -19,6 +19,7 @@ describe('worker without USERS/COOKIE bindings', () => {
 	});
 });
 import { parseCredentials } from '../src/index';
+import { sign, valuedCookie } from '../src/sign';
 
 describe('parseCredentials fails closed on a malformed USERS mapping', () => {
 	it('accepts a well-formed comma-separated list', () => {
@@ -40,5 +41,20 @@ describe('parseCredentials fails closed on a malformed USERS mapping', () => {
 		expect(parseCredentials(undefined)).toBeNull();
 		expect(parseCredentials('')).toBeNull();
 		expect(parseCredentials('   ')).toBeNull();
+	});
+});
+
+describe('round 9 pins: cookie normalization and signing', () => {
+	it('wraps a bare ndus value even when pasted with base64 padding', () => {
+		expect(valuedCookie('BdSzXnAbC123==')).toBe('ndus=BdSzXnAbC123==; lang=en');
+		expect(valuedCookie('plain-bare')).toBe('ndus=plain-bare; lang=en');
+		expect(valuedCookie('ndus=padded==')).toBe('ndus=padded==');
+		expect(valuedCookie('lang=en')).toBe('lang=en');
+		expect(valuedCookie('ndus=a; lang=en')).toBe('ndus=a; lang=en');
+	});
+
+	it('sign() returns an empty signature for an empty key', () => {
+		expect(sign('', 'payload')).toBe('');
+		expect(sign('key', 'payload')).not.toBe('');
 	});
 });

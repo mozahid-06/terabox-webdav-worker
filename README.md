@@ -70,7 +70,7 @@ rclone lsd terabox:
 | WebDAV surface | `OPTIONS`, `PROPFIND`, `PROPPATCH`, `MKCOL`, `GET`, `HEAD`, `PUT`, `DELETE`, `MOVE`, `COPY`, `LOCK`, `UNLOCK` per RFC 4918 |
 | Auth | HTTP Basic over `USERS`; **fails closed** (`500 WebDAV server not configured`) when `USERS`/`COOKIE` are unset; a TeraBox session that dies mid-flight maps to `401` so clients re-authenticate |
 | Locks & properties | Real `LOCK`/`UNLOCK` with 423 enforcement and dead properties, backed by a `DavState` Durable Object (one serialized instance for the whole account) |
-| Downloads | Terabox CDN links with `Range` support; `HEAD` answers from metadata only |
+| Downloads | Terabox CDN links with `Range` support; `HEAD` streams nothing (the upstream body is cancelled after headers) |
 | Uploads | Chunked Terabox upload (up to 4 GiB per file free, 128 GiB premium) |
 | Rate safety | Every outbound call paced by `MIN_GAP_MS`; `Retry-After` honored (capped 5 s); jsToken re-minted at most once per 5 minutes |
 | State | No persistent server state of your own: everything lives in the TeraBox account |
@@ -348,7 +348,7 @@ per-request, but not shared across isolates. The Worker keeps serving.
 - **Non-zero `Depth` `PROPFIND` returns children** (same policy as the drive
   WebDAV workers); infinite-depth listings are not crawled.
 - **Downloads go through a TeraBox CDN link with `Range` support**; `HEAD`
-  only examines metadata.
+  streams nothing — the upstream body is cancelled after the headers.
 - **`USERS`/`COOKIE` are required** — unset, the Worker answers
   `500 {"error":"WebDAV server not configured"}` for everyone. There is no
   anonymous read mode.
