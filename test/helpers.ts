@@ -61,6 +61,10 @@ export class MockTerabox {
 	/** Direct /dl/ CDN fetches served — a repeat GET with a flat pcsCalls
 	 *  count is a download-URL cache hit. */
 	dlCalls = 0;
+	/** Session Cookie observed on every /dl/ fetch, keyed by link flavour —
+	 *  pins the round-14 cookieless boundary end-to-end: the cached `via=pcs`
+	 *  capability URL must never be replayed with the session attached. */
+	dlCookies: Array<{ flavour: string; cookie: string | null }> = [];
 
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
@@ -215,6 +219,7 @@ export class MockTerabox {
 		if (pathname.startsWith('/dl/')) {
 			this.dlCalls++;
 			const flavour = (url.searchParams.get('via') || 'plain') as 'plain' | 'official' | 'pcs';
+			this.dlCookies.push({ flavour, cookie: req.headers.get('Cookie') });
 			const gated =
 				this.gateDl.includes(flavour) ||
 				this.gateDownloads === 'always' ||

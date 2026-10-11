@@ -483,14 +483,20 @@ describe('account-wide API pacing (pace → DavState /api-slot)', () => {
 	it('offers an account-wide slot reservation on the remote store', async () => {
 		const store = createDavStore(env);
 		expect(typeof store.apiSlot).toBe('function');
-		// Serialisation proof: the second reservation queues one full gap
-		// behind the first. Asserted as a DELTA, not an absolute bound on
-		// the first call — the DO's in-memory timeline is not reset between
-		// tests, so a stale nextApiSlot (or a scheduling pause) would break
-		// `first < 50` while the contract itself is perfectly held.
+		// The DO's nextApiSlot is in-memory (not storage-backed) and survives
+		// sibling tests, so force a cold timeline first — only then is
+		// "the first reservation is immediate" a deterministic assertion
+		// instead of a stale-timeline flake, while the delta below still
+		// proves serialisation regardless of timeline state.
+		const ns = (env as unknown as { DAV_STATE: DurableObjectNamespace }).DAV_STATE;
+		const stub = ns.get(ns.idFromName(DO_NAME));
+		await runInDurableObject(stub, async (instance) => {
+			(instance as unknown as { nextApiSlot: number }).nextApiSlot = 0;
+		});
 		const first = await store.apiSlot!(200);
 		const second = await store.apiSlot!(200);
-		expect(second - first).toBeGreaterThanOrEqual(100);
+		expect(first).toBeLessThan(50); // cold timeline: no gap charged up front
+		expect(second - first).toBeGreaterThanOrEqual(100); // second queues a full gap behind the first
 	});
 
 	it('wires the reservation into every paced upstream call of a request', async () => {

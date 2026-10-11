@@ -330,6 +330,17 @@ function streamWindows(
   };
 }
 
+/**
+ * Options for {@link TeraboxClient.fetchDownload}. `resolved` is a
+ * cache-recalled URL, so the caller MUST state its cookieless boundary
+ * explicitly: a forgotten flag would default to replaying the session to
+ * whatever host the URL names. The union makes that omission a type error
+ * rather than a fail-open default.
+ */
+export type ResolvedFetchOpts =
+  | { resolved?: false; cookieless?: never; headerTimeoutMs?: never }
+  | { resolved: true; cookieless: boolean; headerTimeoutMs?: number };
+
 export class TeraboxClient {
   private cookie: string;
   private baseUrl: string;
@@ -389,9 +400,11 @@ export class TeraboxClient {
    *  at most API_SLOT_TIMEOUT_MS before the cooldown skips it entirely.
    *  A reservation that times out still consumed its slot on the DO timeline
    *  (the response was merely lost): later reservations queue briefly behind
-   *  a gap nobody waits on — a phantom delay. Accepted: it happens at most
-   *  once per cooldown window, the local floor already bounds the burst, and
-   *  the timeline re-syncs on the next successful reservation. */
+   *  a gap nobody waits on — a phantom delay. Accepted: every request already
+   *  inside this call when the DO hangs times out together (N phantoms for
+   *  the N in-flight, not a per-window trickle), the cooldown then stops new
+   *  reservations for API_SLOT_COOLDOWN_MS, the local floor already bounds
+   *  the burst, and the timeline re-syncs on the next successful reservation. */
   private reserveAccountSlot(reserver: (minGapMs: number) => Promise<number>): Promise<number> {
     return new Promise<number>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('api slot reservation timed out')), API_SLOT_TIMEOUT_MS);
@@ -798,7 +811,7 @@ export class TeraboxClient {
   async fetchDownload(
     url: string,
     range?: string | null,
-    opts: { resolved?: boolean; cookieless?: boolean; headerTimeoutMs?: number } = {},
+    opts: ResolvedFetchOpts = {},
   ): Promise<{ response: Response; finalUrl: string; cookieless: boolean }> {
     // Follow the browser: fetch the rewritten main-origin URL, not the gated
     // <prefix>-d data-gateway host the raw dlink points at. A `resolved` URL

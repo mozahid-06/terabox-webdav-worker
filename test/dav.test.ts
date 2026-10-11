@@ -629,6 +629,42 @@ describe('GET download-URL cache (repeat-open TTFB)', () => {
 		expect((await request('/a.txt')).status).toBe(200);
 		expect(tb.pcsCalls).toBe(2);
 	});
+
+	it('replays the cached capability URL with no session cookie (round-15 #2 boundary)', async () => {
+		// End-to-end pin for the round-14 cookieless threading: the client
+		// tests prove header shapes for hand-supplied flags; this proves the
+		// dav layer records the mint-time boundary, hands it to phase 0, and
+		// never lets a replay's own hopped=false clobber the stored flag —
+		// the mock's /dl/ handler would happily serve either way, so only the
+		// observed Cookie (or its absence) distinguishes a leak.
+		expect((await request('/a.txt')).status).toBe(200); // mint: PCS 302 → hop (UA-only)
+		expect((await request('/a.txt')).status).toBe(200); // phase-0 replay #1
+		expect((await request('/a.txt')).status).toBe(200); // phase-0 replay #2 (after any rewrite)
+		expect(tb.pcsCalls).toBe(1);
+		const capabilityFetches = tb.dlCookies.filter((e) => e.flavour === 'pcs');
+		expect(capabilityFetches.length).toBeGreaterThanOrEqual(3);
+		for (const seen of capabilityFetches) expect(seen.cookie).toBeNull();
+	});
+
+	it('slides the entry TTL on hits — a hot file never re-ladders mid-session (round-15 #4)', async () => {
+		expect((await request('/a.txt')).status).toBe(200); // mint at t0
+		expect(tb.pcsCalls).toBe(1);
+		const t0 = Date.now();
+		const at = vi.spyOn(Date, 'now');
+		try {
+			// t0+20min: inside the original TTL — still a hit.
+			at.mockReturnValue(t0 + 20 * 60_000);
+			expect((await request('/a.txt')).status).toBe(200);
+			expect(tb.pcsCalls).toBe(1);
+			// t0+40min: past the ORIGINAL TTL. The hit above must have slid
+			// expires forward; with an absolute TTL this re-ladders (RED).
+			at.mockReturnValue(t0 + 40 * 60_000);
+			expect((await request('/a.txt')).status).toBe(200);
+			expect(tb.pcsCalls).toBe(1);
+		} finally {
+			at.mockRestore();
+		}
+	});
 });
 
 describe('PUT and MKCOL parents', () => {

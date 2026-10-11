@@ -1,4 +1,4 @@
-import { TeraboxClient, TeraboxError, errIsNum } from './terabox';
+import { TeraboxClient, TeraboxError, errIsNum, type ResolvedFetchOpts } from './terabox';
 import { joinPath, splitPath } from './sign';
 import {
   collectXmlScope,
@@ -522,6 +522,14 @@ function dlUrlCacheGet(absPath: string, item: TeraboxItem): { url: string; cooki
     return undefined;
   }
   return { url: entry.url, cookieless: entry.cookieless };
+}
+
+/** Slide the TTL of an entry that just served a hit — a hot file keeps its
+ *  warm URL for as long as it keeps being opened. Touches only `expires`:
+ *  the URL and the mint-time cookieless boundary stay exactly as written. */
+function dlUrlCacheTouch(absPath: string): void {
+  const entry = dlUrlCache.get(absPath);
+  if (entry) entry.expires = Date.now() + DLURL_TTL_MS;
 }
 
 /**
@@ -1870,7 +1878,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   /** Try one candidate; resolves the ready-to-stream Response or records why it failed. */
   const tryUrl = async (
     downloadUrl: string,
-    opts?: { resolved?: boolean; cookieless?: boolean; headerTimeoutMs?: number },
+    opts?: ResolvedFetchOpts,
   ): Promise<Response | undefined> => {
     try {
       // Paced, cookie-authenticated stream fetch: retries a jsToken gate once
@@ -1958,12 +1966,17 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   // refusal so the ladder below (and a refreshed cache entry) takes over.
   // The cookieless boundary recorded at mint time replays with the fetch: a
   // post-302 URL lives on a CDN host the session must never reach. A hit
-  // returns without re-writing — the replay itself never hops, and writing
-  // its `false` would clobber the flag that keeps the cookie off-origin.
+  // slides the TTL but does NOT rewrite the entry — the replay computes its
+  // own hopped/cookieless pair (a rotating capability URL may even hop to a
+  // NEW finalUrl), and writing that back would replace the mint-time
+  // boundary — and URL — with a response this path did not re-validate.
   const cached = dlUrlCacheGet(absPath, item);
   if (cached) {
     const res = await tryUrl(cached.url, { resolved: true, cookieless: cached.cookieless });
-    if (res) return res;
+    if (res) {
+      dlUrlCacheTouch(absPath);
+      return res;
+    }
     dlUrlCache.delete(absPath);
   }
 

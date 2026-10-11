@@ -181,7 +181,8 @@ describe('fetchDownload resolved URLs (download-URL cache path)', () => {
 	it('fetches a resolved URL verbatim — no browser rewrite, and reports the final URL', async () => {
 		// The cache stores the final post-302 capability URL: re-running the
 		// browser /file/ host rewrite on it would send the fetch somewhere the
-		// bytes never came from, so the resolved flag must bypass it.
+		// bytes never came from, so the resolved flag must bypass it. The
+		// URL is direct-200 (never hopped), so the session still rides along.
 		const seen: string[] = [];
 		vi.stubGlobal('fetch', async (input: unknown) => {
 			seen.push(String(input));
@@ -191,7 +192,7 @@ describe('fetchDownload resolved URLs (download-URL cache path)', () => {
 		const { response, finalUrl } = await client.fetchDownload(
 			'https://d.mock.terabox.com/file/abc',
 			undefined,
-			{ resolved: true },
+			{ resolved: true, cookieless: false },
 		);
 		expect(seen[0]).toBe('https://d.mock.terabox.com/file/abc');
 		expect(finalUrl).toBe('https://d.mock.terabox.com/file/abc');
@@ -322,5 +323,29 @@ describe('resolved fetches honour the session cookie boundary (review R14 #1)', 
 		await new Promise((r) => setTimeout(r, 10));
 		expect(capturedSignal).toBeInstanceOf(AbortSignal);
 		await expect(pending).rejects.toThrow();
+	});
+
+	it('disarms the header timer — no bound timer survives a completed resolved fetch (round-15 #3)', async () => {
+		// The bound covers ONLY the header phase: the timer must be cleared
+		// in `finally` the moment fetchDownload returns. Pinned with fake
+		// timers + getTimerCount because workerd does NOT error an
+		// already-resolved body when a late abort fires (verified), so the
+		// observable regression is the zombie timer itself — a future
+		// runtime change wiring abort → body would then be caught by the
+		// contract this keeps true: headers phase bounded, body never raced.
+		vi.useFakeTimers();
+		try {
+			vi.stubGlobal('fetch', async () => new Response('bytes', { status: 200 }));
+			const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+			const { response } = await client.fetchDownload('https://kul-cdn.example/file/ok', null, {
+				resolved: true,
+				cookieless: true,
+				headerTimeoutMs: 15_000,
+			});
+			expect(vi.getTimerCount()).toBe(0);
+			await expect(response.text()).resolves.toBe('bytes');
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
