@@ -1,6 +1,7 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetDavVolatileState } from '../src/webdav';
+import { resetTeraboxCaches } from '../src/terabox';
 import { AUTH, MockTerabox, ORIGIN, installMock } from './helpers';
 
 // This vitest project deploys the worker with PATH="/dav" and ROOT_ID="/sub"
@@ -20,7 +21,9 @@ const request = (path: string, init: RequestInit = {}): Promise<Response> =>
 beforeEach(() => {
 	// Advisory lock/dead-prop state lives per isolate: clear it so cases
 	// never leak locks or properties into each other (same as dav.test.ts).
+	// Terabox module caches are isolate-global too.
 	resetDavVolatileState();
+	resetTeraboxCaches();
 	tb = new MockTerabox();
 	tb.seed('/sub', { isdir: 1 });
 	tb.seed('/sub/inside.txt', { content: 'inside data' });

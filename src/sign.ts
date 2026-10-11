@@ -92,11 +92,16 @@ const GiB = 1024 * MiB;
 /** Chunk size for slotted uploads (4 MiB free, up to 128 MiB premium). */
 export function getChunkSize(fileSize: number, isVIP: boolean): number {
   const limitSizes = [4, 8, 16, 32, 64, 128];
+  // Hard 32 MiB ceiling even for VIP: the Free plan rejects request bodies
+  // over ~100 MB at the edge (413 before this Worker runs), and a 64 MiB
+  // chunk would hold chunk + multipart envelope in memory at once (~128 MB —
+  // the whole isolate limit). VIP buys more requests, not unsafe ones.
+  const cap = 32;
   if (!isVIP) return limitSizes[0]! * MiB;
   for (const limit of limitSizes) {
-    if (fileSize <= limit * GiB) return limit * MiB;
+    if (fileSize <= limit * GiB) return Math.min(limit, cap) * MiB;
   }
-  return limitSizes[limitSizes.length - 1]! * MiB;
+  return Math.min(limitSizes[limitSizes.length - 1]!, cap) * MiB;
 }
 
 export const MAX_FREE_FILE_BYTES = 4 * GiB;

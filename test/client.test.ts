@@ -1,0 +1,118 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { TeraboxClient, resetTeraboxCaches } from '../src/terabox';
+
+// Unit tests for TeraboxClient request-layer behavior that the worker-level
+// suite cannot reach: the -6 re-root recursion bound (review H1) and the
+// jsToken cache/configured-token precedence (review M2). Global fetch is
+// stubbed exactly the way test/helpers.ts installMock does it.
+
+const BASE = 'https://terabox.com';
+const JPBASE = 'https://jp.terabox.com';
+
+const tokenHtml = (token: string): string =>
+  '<html><script>`function%20fn%28a%29%7Bwindow.jsToken%20%3D%20a%7D%3Bfn%28%22' +
+  token +
+  '%22%29`</script></html>';
+
+const errnoResponse = (errno: number, prefix?: string): Response =>
+  new Response(JSON.stringify({ errno }), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(prefix ? { 'Url-Domain-Prefix': prefix } : {}),
+    },
+  });
+
+beforeEach(() => {
+  resetTeraboxCaches();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('-6 re-root is bounded (review H1)', () => {
+	// The stubs degrade to a prefix-less -6 after a couple of calls so the
+	// UNFIXED code fails the assertions (extra calls) instead of spinning
+	// forever — the pin must never hang the suite.
+	it('refuses a no-op re-root naming the host it is already on', async () => {
+		const calls: string[] = [];
+		vi.stubGlobal('fetch', async (input: unknown) => {
+			const withPrefix = calls.length < 1;
+			calls.push(String(input));
+			return errnoResponse(-6, withPrefix ? 'jp' : undefined);
+		});
+		const client = new TeraboxClient('ndus=x', JPBASE, { minGapMs: 0 });
+		await expect(client.quota()).rejects.toMatchObject({ errno: -6 });
+		// Same host as baseUrl → refuse the no-op re-root outright (the old
+		// code re-entered request() unconditionally and re-rooted forever).
+		expect(calls.length).toBe(1);
+	});
+
+	it('re-roots at most once when the prefix names a different host', async () => {
+		const calls: string[] = [];
+		vi.stubGlobal('fetch', async (input: unknown) => {
+			const withPrefix = calls.length < 2;
+			calls.push(String(input));
+			return errnoResponse(-6, withPrefix ? 'jp' : undefined);
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await expect(client.quota()).rejects.toMatchObject({ errno: -6 });
+		// One genuine re-root (terabox.com → jp.terabox.com), then the latch
+		// refuses a second: exactly two upstream calls, then a clean errno.
+		expect(calls.length).toBe(2);
+		expect(calls[1]).toContain('jp.terabox.com');
+	});
+
+	it('a -6 without a prefix header fails fast without recursing', async () => {
+		let calls = 0;
+		vi.stubGlobal('fetch', async () => {
+			calls += 1;
+			return errnoResponse(-6);
+		});
+		const client = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await expect(client.quota()).rejects.toMatchObject({ errno: -6 });
+		expect(calls).toBe(1);
+	});
+});
+
+describe('jsToken cache precedence and mint dedup (review M2)', () => {
+	it('prefers a freshly minted cached token over a stale configured one', async () => {
+		vi.stubGlobal('fetch', async () => new Response(tokenHtml('fresh-token-abc'), { status: 200 }));
+		const first = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await (first as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken(true);
+		expect((first as never as { jsToken: string }).jsToken).toBe('fresh-token-abc');
+
+		const second = new TeraboxClient('ndus=x', BASE, {
+			jsToken: 'stale-env-token',
+			minGapMs: 0,
+		});
+		await (second as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken();
+		// Old order: configured env token won forever → every write repeated
+		// reject → force-mint → retry even with a valid token cached.
+		expect((second as never as { jsToken: string }).jsToken).toBe('fresh-token-abc');
+	});
+
+	it('still uses the configured token while the cache is cold', async () => {
+		const client = new TeraboxClient('ndus=x', BASE, { jsToken: 'cold-env-token', minGapMs: 0 });
+		await (client as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken();
+		expect((client as never as { jsToken: string }).jsToken).toBe('cold-env-token');
+	});
+
+	it('shares one in-flight mint across concurrent force callers', async () => {
+		let mintFetches = 0;
+		vi.stubGlobal('fetch', async () => {
+			mintFetches += 1;
+			return new Response(tokenHtml('shared-token'), { status: 200 });
+		});
+		const a = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		const b = new TeraboxClient('ndus=x', BASE, { minGapMs: 0 });
+		await Promise.all([
+			(a as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken(true),
+			(b as never as { ensureJsToken(force?: boolean): Promise<void> }).ensureJsToken(true),
+		]);
+		expect(mintFetches).toBe(1);
+		expect((a as never as { jsToken: string }).jsToken).toBe('shared-token');
+		expect((b as never as { jsToken: string }).jsToken).toBe('shared-token');
+	});
+});

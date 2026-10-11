@@ -528,10 +528,66 @@ successful non-`200` frees davfs2's stored etag) and is fixed on `main`
 since `d065d53` as RFC 7233 §4.1 conformance hardening — defence-in-depth, not this
 incident's cause. Full write-up: `docs/davfs2-etag-hang-investigation.md`.
 
+## Campaign 6 — review rounds 4–6 + 4 GB upload proof (2026-10-11)
+
+Second-opinion subagent reviews (rounds 4–6) against the live worker; every
+finding fixed, revert-verified (surgical reverts → pinned failing tests), and
+deployed (`7a370940`, 277 tests green, gate = `npm run review`).
+
+**Round 4 (write path):** MOVE onto an ancestor → 409 with source intact;
+protocol-relative `Destination: //evil` → 502; errno −11/−12 → 409, −22 → 403
+(never a bare 500); conflict policy forced server-side (client `rtype`
+ignored; `existed ? 3 : 0`); chunk `Content-Length` precheck; fresh metadata
+at every write precondition. Batch 2: chunk failover gate widened to
+`error instanceof TeraboxError` (200-with-no-md5 no longer aborts the host
+ladder); `/meta-gen` DO route persists one key, not the whole state; **atomic
+finalize claim** (`UploadSession.finalizing`, `/upload-claim` +
+`/upload-claim-release`, 16×500 ms busy-poll, claim released on every exit) —
+concurrent finalizes both answer `201`, retries replay the original status;
+`safeRelocate` retries 3×; `DELETE /.resumable/:id` cancels a session
+(204 / 404).
+
+**Round 5 (read path):** `xmlEscape` sanitizes C0/PS chars → U+FFFD and
+`validateXml` rejects raw control characters (hostile PROPPATCH/LOCK → 400;
+PROPFIND output parses under a strict parser); `safeMtimeSeconds` (bogus mtime
+→ 0: no RangeError 500, no header-hostile etag); GET/HEAD
+`If-Match`/`If-Unmodified-Since` → 412; every 405 carries `Allow`; `bytes=`
+range regex case-insensitive + canonicalized before upstream; If-Range requires
+an exact date/strong-etag match; md5-less etags weak (`W/"…"`), If-None-Match
+normalizes weak prefixes.
+
+**Round 6 (auth/status/headers/session):** **H1** — the errno −6 re-root is
+bounded (`rerooted` latch + no-op-host refusal; it previously recursed without
+limit until the subrequest budget or client timeout); `AUTH_ERRNOS` is one set
+shared by `statusFor` and the 401 challenge (−1/6/−19 → 401+challenge,
+4/2 → 400, 5 → 409, 7/11 → 403, 15 → 502 — live control-char MKCOL now 400);
+a fresh minted token outranks a stale env `JSTOKEN`, with a single in-flight
+mint per isolate; CORS preflight fails closed to 401 (no unauthenticated
+branch); `USERS` parsing is all-or-nothing (`bob:h,unter` → config 500, never
+a silently truncated credential); the `.resumable` control plane is
+shape-gated after path decoding (a real `.resumable` file lists and fetches at
+its own href; begin/chunk/cancel/finalize stay owned); relative `Destination`
+strips `?query`/`#fragment`; `X-Content-Type-Options: nosniff` on every
+response plus a sandbox CSP on file GET; branchless credential compare (no
+username-existence timing oracle); pacing comments now state per-isolate truth.
+
+**4 GB upload proven live:** 1024 × 4 MiB chunks through the resumable API →
+`201`, remote size exactly `4294967296` (free-tier ceiling
+`MAX_FREE_FILE_BYTES = 4 GiB`), range GET 206, ~23 min (bandwidth-bound), then
+deleted. Nautilus integration ships as
+`~/.local/share/Nautilus/scripts/Upload to Terabox` (right-click → Scripts →
+upload) driving `tbbig` — gvfs' native PUT still dies at Cloudflare's ~100 MB
+body cap, so large files go through the script. No R2 anywhere: 4 MiB chunk
+requests + the DO already cover any size, and S3 staging would not help gvfs.
+
+Deferred (user decisions): taskid `async=1` confirmation (deliberate bclone
+parity), uploadId nonce (would break the `tbbig` client), account password
+rotation (`taxin:404` still live), DO-backed cross-isolate pacing.
+
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-10, post-audit): `main` = production, auto-deploys on
-push (litmus 105/105, 173 unit tests). It includes the RFC 7233 GET/ETag
+Branch state (2026-10-11, post review rounds 4–6): `main` = production,
+auto-deploys on push (litmus 105/105, 277 unit tests). It includes the RFC 7233 GET/ETag
 conformance hardening (merged `d065d53`, deployed) and the full-repo audit
 hardening (merged `4d87f47`: traversal containment, metaCache cap, errno→status
 maps, DO-backed lock/prop tests, docs/config fixes — see the Phase 2–4 commit

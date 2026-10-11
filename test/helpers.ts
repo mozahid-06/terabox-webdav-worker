@@ -52,12 +52,21 @@ export class MockTerabox {
 	private uploads = new Map<string, Map<number, Uint8Array>>();
 	/** filemetas round-trips served — lets tests assert cache behaviour. */
 	filemetasCalls = 0;
+	/** /api/create calls that finalize a chunked upload — pins that racing
+	 *  finalizes reach upstream exactly once. */
+	createCalls = 0;
 
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
 	precreateErrno = 0;
 	/** Force the whole /api/filemetas response to fail with this errno. */
 	filemetasErrno = 0;
+	/** Make /api/create return a control md5 that does NOT describe the bytes
+	 *  it just stored — exercises the post-create integrity check. */
+	corruptCreateMd5 = false;
+	/** Last rtype the worker sent to /api/create — pins which conflict policy
+	 *  (0 create-only / 1 rename / 3 overwrite) the SERVER chose. */
+	lastRtype: number | null = null;
 	/** Per-path /api/filemetas failures — lets a test make ONE stat fail
 	 *  (e.g. the PUT target) while its parent stays healthy. */
 	filemetasFailPaths = new Map<string, number>();
@@ -70,6 +79,9 @@ export class MockTerabox {
 	locateServers: string[] | null = null;
 	/** Hosts whose superfile2 answers HTTP 403 error_code 31045 "user not exists". */
 	rejectHosts = new Set<string>();
+	/** Hosts whose superfile2 answers HTTP 200 WITHOUT an md5 — a failure
+	 *  carrying no HTTP status, which the old failover gate dropped. */
+	silentHosts = new Set<string>();
 	/** Gate direct-download links like the live 400141 "need verify" endpoint:
 	 *  'once' passes requests carrying jsToken (proves the retry remedy),
 	 *  'always' fails every request (proves the mapped error path). */
@@ -352,8 +364,10 @@ export class MockTerabox {
 					return json({ errno: 0 });
 				}
 				// Finalize a chunked upload.
+				this.createCalls++;
 				const uploadId = String(form?.get('uploadid'));
 				const rtype = Number(url.searchParams.get('rtype') || '0');
+				this.lastRtype = rtype;
 				const existing = this.nodes.get(path);
 				if (existing && rtype === 0) return json({ errno: -8 });
 				const parts = this.uploads.get(uploadId) || new Map<number, Uint8Array>();
@@ -376,7 +390,8 @@ export class MockTerabox {
 				// md5 of the JSON array of per-chunk md5s — which is what the
 				// worker validates its chunk list against.
 				const wireMd5 = chunkMd5s.length === 1 ? real : md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
-				return json({ errno: 0, md5: encodeMD5(wireMd5), uploadid: uploadId });
+				const reported = this.corruptCreateMd5 ? md5Hex(new TextEncoder().encode('corrupted')) : wireMd5;
+				return json({ errno: 0, md5: encodeMD5(reported), uploadid: uploadId });
 			}
 			if (pathname === '/api/precreate' && method === 'POST') {
 				if (this.precreateErrno) return json({ errno: this.precreateErrno, msg: 'simulated verify required' });
@@ -487,6 +502,9 @@ export class MockTerabox {
 		if (pathname === '/rest/2.0/pcs/superfile2' && method === 'POST') {
 			if (this.rejectHosts.has(url.hostname)) {
 				return json({ error_code: 31045, error_msg: 'user not exists' }, 403);
+			}
+			if (this.silentHosts.has(url.hostname)) {
+				return json({ errno: -5, error_msg: 'silent cluster failure' }, 200);
 			}
 			this.superfile2Calls++;
 			// The web client always echoes precreate's uploadsign back

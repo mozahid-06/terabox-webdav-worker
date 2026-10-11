@@ -23,28 +23,53 @@ export function constantTimeEquals(a: string, b: string): boolean {
   return diff === 0;
 }
 
-export function parseCredentials(users: string | undefined): Credential[] {
-  if (!users) return [];
-  return users
+/**
+ * Parse the USERS mapping. Fail-closed contract: returns null when the
+ * configuration is unusable — a colon-less entry, an empty password, or a
+ * duplicate username must never silently drop an account or truncate a
+ * password into a weaker working credential (comma is a separator:
+ * `bob:h,unter` must NOT become the credential bob:h). Leading/trailing
+ * whitespace is stripped from each entry; credentials must not begin or end
+ * with whitespace, and commas/newlines cannot appear inside a credential.
+ */
+export function parseCredentials(users: string | undefined): Credential[] | null {
+  if (!users) return null;
+  const entries = users
     .split(/[\r\n,]+/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const idx = line.indexOf(':');
-      if (idx === -1) return { username: line, password: '' };
-      return { username: line.slice(0, idx), password: line.slice(idx + 1) };
-    });
+    .filter(Boolean);
+  if (entries.length === 0) return null;
+  const creds: Credential[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const idx = entry.indexOf(':');
+    if (idx < 1) return null;
+    const password = entry.slice(idx + 1);
+    if (!password) return null;
+    const username = entry.slice(0, idx);
+    if (seen.has(username)) return null;
+    seen.add(username);
+    creds.push({ username, password });
+  }
+  return creds;
 }
 
 function validBasicAuth(request: Request, env: Env): boolean {
   const header = request.headers.get('Authorization') || '';
-  if (!header.startsWith('Basic ')) return false;
+  // RFC 7235 §2.1: the auth-scheme is case-insensitive ("basic", "BASIC").
+  if (header.slice(0, 6).toLowerCase() !== 'basic ') return false;
   const creds = parseCredentials(env.USERS);
-  if (creds.length === 0) return false;
+  if (!creds || creds.length === 0) return false;
 
+  // RFC 7617: the challenge advertises charset="UTF-8", so the client
+  // base64s the UTF-8 bytes of the credentials. `atob` alone yields one
+  // char per byte (latin1), which never equals a multi-byte password —
+  // decode the bytes as UTF-8 so a non-ASCII password can authenticate.
+  // For ASCII (the common case) both paths produce the identical string.
   let decoded: string;
   try {
-    decoded = atob(header.slice(6));
+    const bytes = Uint8Array.from(atob(header.slice(6)), (char) => char.charCodeAt(0));
+    decoded = new TextDecoder('utf-8').decode(bytes);
   } catch {
     return false;
   }
@@ -53,18 +78,54 @@ function validBasicAuth(request: Request, env: Env): boolean {
   const username = decoded.slice(0, sep);
   const password = decoded.slice(sep + 1);
 
-  return creds.some(
-    (c) => constantTimeEquals(c.username, username) && constantTimeEquals(c.password, password),
-  );
+  // Branchless full-list comparison: every entry gets BOTH compares on every
+  // attempt and the loop never exits early, so total work depends only on the
+  // configured credential count — never on whether a presented username
+  // exists (the `.some(a && b)` composition short-circuited the password
+  // compare for unknown usernames: a credential-existence oracle). Residual:
+  // constantTimeEquals still early-returns on length mismatch (node's
+  // timingSafeEqual does too); length is not treated as a secret here.
+  let matched = 0;
+  for (const c of creds) {
+    const userOk = Number(constantTimeEquals(c.username, username));
+    const passOk = Number(constantTimeEquals(c.password, password));
+    matched |= userOk & passOk;
+  }
+  return matched === 1;
+}
+
+/**
+ * Errnos meaning "the credentials/session/token presented are not
+ * acceptable". Used in BOTH places that decide 401 — statusFor and the
+ * fetch handler's TeraboxError branch — so the table and the Basic
+ * challenge can never drift apart: a 401 without WWW-Authenticate makes
+ * rclone/litmus/davfs never resend credentials, turning a mid-session
+ * expiry into a permanent failure.
+ *   -6 / -1 / 6: login/verification failure (expired ndus, wrong origin)
+ *   -19: upstream wants a verification code
+ *   450016 / 400141 / 4000023: invalid session / gate / jsToken
+ */
+const AUTH_ERRNOS = new Set([-6, -1, 6, -19, 450016, 400141, 4000023]);
+
+function errnoIn(error: unknown, set: Set<number>): boolean {
+  return error instanceof TeraboxError && set.has(error.errno);
 }
 
 function statusFor(error: unknown): number {
-  if (errIsNum(error, -6)) return 401;
+  if (errnoIn(error, AUTH_ERRNOS)) return 401;
   if (errIsNum(error, -9)) return 404;
   if (errIsNum(error, -8)) return 409;
-  if (errIsNum(error, 4000023)) return 401;
-  if (errIsNum(error, 400141)) return 401;
-  if (errIsNum(error, 450016)) return 401;
+  // 4 "new file name error" / 2 "required parameters missing": caller-side
+  // faults — no retry can succeed, and a 500 would blame this server.
+  if (errIsNum(error, 4) || errIsNum(error, 2)) return 400;
+  // 5 "illegal target directory": the target's state conflicts with the
+  // operation — the client recovers by re-reading the namespace (409).
+  if (errIsNum(error, 5)) return 409;
+  // 7 / 11 "no access permission": ACL, not credentials — a 401 would loop
+  // the client through re-authentication that cannot help.
+  if (errIsNum(error, 7) || errIsNum(error, 11)) return 403;
+  // 15 "operation failed": unclassifiable upstream-side fault → gateway.
+  if (errIsNum(error, 15)) return 502;
   // -10 / -32: "Your space is insufficient"; 58: "File is too large for
   // your plan" — every storage-capacity refusal is 507 per RFC 4918
   // §9.3.1/§9.7.1, so davfs/rclone can distinguish "disk full" from a
@@ -72,11 +133,21 @@ function statusFor(error: unknown): number {
   if (errIsNum(error, -10) || errIsNum(error, -32) || errIsNum(error, 58)) return 507;
   // -7: Terabox rejects the file name — a client error, not a server fault.
   if (errIsNum(error, -7)) return 403;
+  // -11 "parent folder missing" (a namespace conflict, RFC 4918 §9.7.1/§9.9.3)
+  // and 12 "some files already exist" (conflicting destination): both are
+  // resolved by the client re-reading the namespace, so 409 — not a 500.
+  if (errIsNum(error, -11) || errIsNum(error, 12)) return 409;
+  // -22: the entry sits in a shared folder the caller may not change.
+  if (errIsNum(error, -22)) return 403;
   // 31045 "user not exists": the request reached a wrong-region upload
   // cluster — an upstream routing problem, not ours.
   if (errIsNum(error, 31045)) return 502;
   // -5: an upstream HTTP hop failed — that's a gateway problem, not ours.
   if (errIsNum(error, -5)) return 502;
+  // Any failure that already stamped an upstream HTTP status is somebody
+  // else's answer we could not translate — a gateway error, never a 500
+  // that blames this worker.
+  if (error instanceof TeraboxError && error.httpStatus !== undefined) return 502;
   return 500;
 }
 
@@ -96,23 +167,22 @@ const worker: ExportedHandler<Env> = {
     };
 
     // Fail closed: an unconfigured or malformed USERS mapping never exposes data.
-    if (!parseCredentials(env.USERS).length) {
-      log('error', 'WebDAV server disabled: USERS is unset or empty');
-      return errorResponse('WebDAV server not configured', 500);
+    const configuredCreds = parseCredentials(env.USERS);
+    if (!configuredCreds || configuredCreds.length === 0) {
+      log('error', 'WebDAV server disabled: USERS is unset, empty, or malformed');
+      return withSecurityHeaders(errorResponse('WebDAV server not configured', 500));
     }
     if (!env.COOKIE) {
       log('error', 'WebDAV server disabled: COOKIE is unset');
-      return errorResponse('WebDAV server not configured', 500);
+      return withSecurityHeaders(errorResponse('WebDAV server not configured', 500));
     }
     if (!validBasicAuth(request, env)) {
-      if (reqIsPreflight(request)) {
-        return new Response(null, { status: 204 });
-      }
-      // RFC 7235 §3.1: a 401 must carry the challenge or clients (neon/
-      // litmus, Windows Mini-Redirector) never send their credentials.
-      return errorResponse('Unauthorized', 401, undefined, {
-        'WWW-Authenticate': 'Basic realm="terabox WebDAV", charset="UTF-8"',
-      });
+      // Fail closed for every method, CORS preflight included: a preflight
+      // branch that answered 204 without credentials was both an auth bypass
+      // on an otherwise airtight surface and a config-state oracle — and it
+      // emitted no Access-Control-Allow-* headers anyway, so it never enabled
+      // cross-origin use in the first place.
+      return withSecurityHeaders(errorResponse('Unauthorized', 401, undefined, WWW_AUTHENTICATE));
     }
 
     const client = new TeraboxClient(env.COOKIE, env.TERABOX_DOMAIN, {
@@ -131,7 +201,7 @@ const worker: ExportedHandler<Env> = {
       );
       const elapsed = Date.now() - started;
       if (elapsed > 500) log('info', `slow ${request.method} ${url.pathname} (${elapsed}ms)`);
-      return response;
+      return withSecurityHeaders(response);
     } catch (error) {
       if (error instanceof TeraboxError) {
         log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname, step: error.step });
@@ -146,19 +216,43 @@ const worker: ExportedHandler<Env> = {
             .map((part) => part.split('=')[0]?.trim())
             .filter(Boolean),
         };
-        if (error.errno === -6 || error.errno === 4000023 || error.errno === 400141 || error.errno === 450016) {
-          return errorResponse('Terabox session expired or invalid', 401, detail);
+        if (errnoIn(error, AUTH_ERRNOS)) {
+          // Same challenge as the initial 401: without it neon/litmus and
+          // Windows Mini-Redirector never resend credentials, so a mid-session
+          // expiry becomes a permanent failure instead of a re-auth.
+          return withSecurityHeaders(
+            errorResponse('Terabox session expired or invalid', 401, detail, WWW_AUTHENTICATE),
+          );
         }
-        return errorResponse(error.message, statusFor(error), detail);
+        return withSecurityHeaders(errorResponse(error.message, statusFor(error), detail));
       }
       log('error', 'unhandled error', { path: url.pathname, message: error instanceof Error ? error.message : String(error) });
-      return errorResponse('Internal Server Error', 500);
+      return withSecurityHeaders(errorResponse('Internal Server Error', 500));
     }
   },
 };
 
-function reqIsPreflight(request: Request): boolean {
-  return request.method.toUpperCase() === 'OPTIONS' && Boolean(request.headers.get('Access-Control-Request-Method'));
+/**
+ * Defense-in-depth on every response leaving the fetch handler:
+ * `nosniff` stops a browser from reinterpreting a response as some other
+ * type if a content-type is ever wrong or missing. (File GETs add their own
+ * sandbox CSP in handleGet — the wrapper cannot tell content from API.)
+ * Runtime-constructed responses allow header mutation; an immutable
+ * passthrough (if any ever appears) ships without the header rather than
+ * throwing.
+ */
+function withSecurityHeaders(response: Response): Response {
+  try {
+    response.headers.set('X-Content-Type-Options', 'nosniff');
+  } catch {
+    // immutable headers — leave as-is
+  }
+  return response;
 }
+
+// RFC 7235 §3.1: a 401 must carry the challenge on EVERY code path.
+const WWW_AUTHENTICATE = {
+  'WWW-Authenticate': 'Basic realm="terabox WebDAV", charset="UTF-8"',
+};
 
 export default worker;

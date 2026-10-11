@@ -25,13 +25,42 @@ const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 509]);
 const JS_TOKEN_ERRORS = new Set([4000023, 400141, 450016]);
 /** Minimum gap between outbound Terabox calls (bclone minSleep 400 ms parity). */
 const DEFAULT_MIN_GAP_MS = 400;
-/** Shared pacing state per isolate: slots are assigned in order so even
- *  concurrent WebDAV requests cannot burst the upstream. */
+/** Next free upstream slot, shared by every request handled by THIS isolate.
+ *  Cloudflare runs one module registry per isolate, so N isolates can each
+ *  schedule one call per MIN_GAP_MS: the aggregate upstream rate is
+ *  (isolate count) / MIN_GAP_MS, not 1 / MIN_GAP_MS. Within one isolate the
+ *  reservation in pace() is race-free (no await between read and write), so
+ *  concurrent requests in this isolate cannot burst. If account-wide pacing
+ *  is ever required, move this slot into the DAV_STATE DO (see the
+ *  cross-isolate generation pattern the meta cache already uses). */
 let nextUpstreamSlot = 0;
 /** Reused jsToken across WebDAV requests — the root fetch is the call most
  *  exposed to Terabox's verification gate, so mint at most once per TTL. */
 const JS_TOKEN_CACHE = { token: '', at: 0 };
 const JS_TOKEN_TTL_MS = 5 * 60_000;
+/** One in-flight mint per isolate: concurrent gate-rejected requests share it
+ *  instead of each hitting the verification gate with its own root fetch. */
+let inflightMint: Promise<string> | null = null;
+/** Module-level caches: the premium probe and locateupload walk are
+ *  account-scoped, not request-scoped. Re-running them per HTTP request
+ *  burned the Free plan's 10 ms CPU budget (Cloudflare error 1102) once the
+ *  resumable `begin` endpoint chained them with precreate + stat + parent
+ *  checks. Cache once per isolate; a forced refresh still works. */
+const PREMIUM_CACHE = { checked: false, isPremium: false };
+const UPLOAD_HOSTS_CACHE: { hosts: string[] | null; at: number } = { hosts: null, at: 0 };
+/** Upload clusters retire and gates rotate — don't pin a list for a lifetime. */
+const UPLOAD_HOSTS_TTL_MS = 10 * 60_000;
+
+/** Test hook: clear the module-level account caches between test cases. */
+export function resetTeraboxCaches(): void {
+  JS_TOKEN_CACHE.token = '';
+  JS_TOKEN_CACHE.at = 0;
+  inflightMint = null;
+  PREMIUM_CACHE.checked = false;
+  PREMIUM_CACHE.isPremium = false;
+  UPLOAD_HOSTS_CACHE.hosts = null;
+  UPLOAD_HOSTS_CACHE.at = 0;
+}
 /** Desktop-app UA used when minting the jsToken from the root page. */
 const DESKTOP_APP_USER_AGENT = 'terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox';
 
@@ -75,6 +104,13 @@ export class TeraboxError extends Error {
   upstream?: string;
   /** HTTP status of a non-2xx upstream response (drives cluster failover). */
   httpStatus?: number;
+  /**
+   * Set when the file was created upstream but failed the control-md5
+   * comparison. The bytes Terabox stored are not the bytes we sent, so the
+   * caller must not treat a retry as a fresh create — re-running create
+   * reproduces the mismatch (and answers -8 → 409 on a create-only path).
+   */
+  integrity?: boolean;
 
   constructor(
     public readonly errno: number,
@@ -187,7 +223,10 @@ export interface ApiOptions {
   method?: string;
   query?: Record<string, string>;
   form?: FormData | Record<string, string>;
-  body?: string;
+  /** Raw body: a string, or a prebuilt buffer (the hand-built multipart for
+   *  a chunk upload — one copy instead of FormData's two, and a known
+   *  Content-Length, which Terabox's origin requires). */
+  body?: string | Uint8Array;
   contentType?: string;
   /** Do not append app_id/channel/clienttype/jsToken and skip jsToken / host retries. */
   skipCommonParams?: boolean;
@@ -241,7 +280,10 @@ export class TeraboxClient {
   /**
    * Reserve the next upstream slot and sleep until it (rate-limit guard).
    * Every outbound Terabox call — API, jsToken mint, download stream — passes
-   * through here so the account never bursts past bclone's pacing.
+   * through here, which serializes calls WITHIN THIS ISOLATE at one per
+   * MIN_GAP_MS. It does not coordinate across isolates (see nextUpstreamSlot
+   * above): treat MIN_GAP_MS as a per-isolate floor, not an account-wide
+   * guarantee.
    */
   async pace(): Promise<void> {
     const slot = Math.max(Date.now(), nextUpstreamSlot + this.minGapMs);
@@ -268,6 +310,7 @@ export class TeraboxClient {
     opts: ApiOptions = {},
     attempt = 0,
     jsTokenTried = false,
+    rerooted = false,
   ): Promise<ApiResult<T>> {
     const url = new URL(opts.absoluteUrl || this.baseUrl + path);
 
@@ -325,7 +368,7 @@ export class TeraboxClient {
       const delay =
         Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 5000) : attempt * 1000;
       await this.sleep(delay);
-      return this.request<T>(path, opts, attempt + 1, jsTokenTried);
+      return this.request<T>(path, opts, attempt + 1, jsTokenTried, rerooted);
     }
     // Follow Terabox's cluster hint for the *-data upload-host endpoint.
     const domainPrefix = response.headers.get('Url-Domain-Prefix');
@@ -356,20 +399,30 @@ export class TeraboxClient {
       const errno = typeof json.errno === 'number' ? json.errno : typeof json.errno === 'string' ? Number(json.errno) : 0;
 
       if (errno !== 0) {
-        // Refresh jsToken exactly once, then retry the request.
+        // Refresh jsToken exactly once, then retry the request. The re-root
+        // latch must survive the mint recursion (otherwise a mint-then--6
+        // sequence could spend a second host change).
         if (JS_TOKEN_ERRORS.has(errno) && !jsTokenTried) {
           await this.ensureJsToken(true);
-          return this.request<T>(path, opts, attempt, true);
+          return this.request<T>(path, opts, attempt, true, rerooted);
         }
 
-        // Some accounts are served from a mirrored host; re-root and retry once.
+        // Some accounts are served from a mirrored host; re-root and retry —
+        // at most ONCE per request (the rerooted latch) and only to a host
+        // that actually differs (a prefix naming the host we are already on,
+        // or one that keeps arriving after the re-root, used to recurse with
+        // no bound at all: one upstream call + pace() slot per iteration
+        // until the subrequest budget or the client's timeout fired).
         const prefix = response.headers.get('Url-Domain-Prefix');
-        if (prefix && errno === -6) {
+        if (prefix && errno === -6 && !rerooted) {
           const host = new URL(this.baseUrl).hostname.split('.');
           const sld = host.length >= 2 ? host[host.length - 2] : 'terabox';
           const tld = host.length >= 2 ? host[host.length - 1]! : 'com';
-          this.baseUrl = `https://${prefix}.${sld}.${tld}`;
-          return this.request<T>(path, opts, attempt, jsTokenTried);
+          const next = `https://${prefix}.${sld}.${tld}`;
+          if (next !== this.baseUrl) {
+            this.baseUrl = next;
+            return this.request<T>(path, opts, attempt, jsTokenTried, true);
+          }
         }
 
         // The caller wants to inspect info[] itself; retries above still ran.
@@ -397,22 +450,45 @@ export class TeraboxClient {
 
   private async ensureJsToken(force = false): Promise<void> {
     if (this.jsToken && !force) return;
-    // A pre-minted token (env JSTOKEN — the same window.jsToken Alist and
-    // TeraboxUploaderCLI ask their users to paste) skips minting entirely;
-    // only an API rejection (force) triggers a fresh mint.
-    if (this.configuredJsToken && !force) {
-      this.jsToken = this.configuredJsToken;
-      return;
+    if (!force) {
+      // A freshly minted cached token outranks the configured env JSTOKEN
+      // (the same window.jsToken Alist and TeraboxUploaderCLI ask their users
+      // to paste): a stale configured token is never marked rejected, so
+      // preferring it made every write repeat reject → force-mint → retry
+      // forever. The env token still seeds the choice while the cache is
+      // cold; only an API rejection (force) mints fresh.
+      if (JS_TOKEN_CACHE.token && Date.now() - JS_TOKEN_CACHE.at < JS_TOKEN_TTL_MS) {
+        this.jsToken = JS_TOKEN_CACHE.token;
+        return;
+      }
+      if (this.configuredJsToken) {
+        this.jsToken = this.configuredJsToken;
+        return;
+      }
     }
-    // Reuse the last minted token: the root fetch is the call most exposed
-    // to Terabox's verification gate, so don't repeat it per WebDAV request.
-    if (!force && JS_TOKEN_CACHE.token && Date.now() - JS_TOKEN_CACHE.at < JS_TOKEN_TTL_MS) {
-      this.jsToken = JS_TOKEN_CACHE.token;
-      return;
+    // Concurrent gate-rejected writes share ONE in-flight mint: two parallel
+    // force-mints would otherwise hit the verification gate twice, exactly
+    // the pressure the mint cache exists to avoid.
+    let mint = inflightMint;
+    if (!mint) {
+      mint = this.mintJsToken();
+      inflightMint = mint;
+      const clear = () => {
+        if (inflightMint === mint) inflightMint = null;
+      };
+      void mint.then(clear, clear);
     }
-    // The session Cookie must be sent: a token minted for an anonymous request
-    // (192 hex chars) is rejected by precreate/create with 4000023/400141
-    // "need verify". Only a token bound to the account (128 hex chars) works.
+    this.jsToken = await mint;
+  }
+
+  /**
+   * Mint a session-bound jsToken from the root page and record it in the
+   * module cache. The session Cookie must be sent: a token minted for an
+   * anonymous request (192 hex chars) is rejected by precreate/create with
+   * 4000023/400141 "need verify". Only a token bound to the account
+   * (128 hex chars) works.
+   */
+  private async mintJsToken(): Promise<string> {
     const pages = [`${this.baseUrl}/`, `${this.baseUrl}/main?category=all`];
     const outcome: string[] = [];
     for (const page of pages) {
@@ -421,10 +497,9 @@ export class TeraboxClient {
       const landed = (response.url || page).replace(this.baseUrl, '') || '/';
       outcome.push(`${landed}=${token ? 'token' : 'none'}`);
       if (token) {
-        this.jsToken = token;
         JS_TOKEN_CACHE.token = token;
         JS_TOKEN_CACHE.at = Date.now();
-        return;
+        return token;
       }
     }
     // Terabox answers pages with a 302 to /simple-verify when the IP or the
@@ -811,6 +886,12 @@ export class TeraboxClient {
     // A host that already accepted an upload in this session is listed first.
     if (this.uploadHost) return [this.uploadHost, ...(this.uploadHosts ?? [])];
     if (this.uploadHosts) return this.uploadHosts;
+    // Account-scoped: reuse the isolate's cached candidate list so each
+    // request doesn't re-walk up to 8 locateupload origins (CPU + latency).
+    if (UPLOAD_HOSTS_CACHE.hosts && Date.now() - UPLOAD_HOSTS_CACHE.at < UPLOAD_HOSTS_TTL_MS) {
+      this.uploadHosts = UPLOAD_HOSTS_CACHE.hosts;
+      return this.uploadHosts;
+    }
     // locateupload returns a *candidate list* (server[] plus a host fallback)
     // and the client walks it until a cluster accepts the upload. The origin
     // matters more than the IP: regional deployments host different clusters.
@@ -854,28 +935,45 @@ export class TeraboxClient {
           ].filter((host, index, all) => Boolean(host) && all.indexOf(host) === index);
           if (!candidates.length) throw es(-5);
           this.uploadHosts = candidates;
+          UPLOAD_HOSTS_CACHE.hosts = candidates;
+          UPLOAD_HOSTS_CACHE.at = Date.now();
           return candidates;
         } catch (error) {
           lastError = error;
         }
       }
     }
+    // Every candidate origin failed: the cached list (if any) is bad, so drop
+    // it or every later upload re-fails identically until the isolate recycles.
+    UPLOAD_HOSTS_CACHE.hosts = null;
     throw lastError instanceof Error ? lastError : es(-5);
   }
 
   private async checkPremium(): Promise<void> {
     if (this.premiumChecked) return;
     this.premiumChecked = true;
+    // Account-scoped, not request-scoped: reuse the isolate's cached answer
+    // so every WebDAV request doesn't re-spend CPU on the membership probe.
+    if (PREMIUM_CACHE.checked) {
+      this.isPremium = PREMIUM_CACHE.isPremium;
+      return;
+    }
     try {
       const { json } = await this.request<{
         errno?: number;
         data?: { member_info?: { is_vip?: number } };
       }>('/rest/2.0/membership/proxy/user', { query: { method: 'query', membership_version: '1.0' } });
       this.isPremium = (json.data?.member_info?.is_vip || 0) > 0;
+      PREMIUM_CACHE.checked = true;
+      PREMIUM_CACHE.isPremium = this.isPremium;
     } catch {
       // bclone discards this probe's error too (`_ = f.apiCheckPremium(ctx)`):
       // a failed premium check must not block uploads — fall back to
-      // free-tier limits (4 MiB chunks, 4 GiB file cap) until proven VIP.
+      // free-tier limits (4 MiB chunks, 4 GiB file cap) for THIS request.
+      // Deliberately NOT cached: a transient 429/gate would otherwise pin
+      // the isolate to free-tier limits for its whole lifetime, turning
+      // every >4 GiB upload into a 507 for a VIP account.
+      this.isPremium = false;
     }
   }
 
@@ -920,9 +1018,32 @@ export class TeraboxClient {
     partSeq: number,
     data: Uint8Array,
   ): Promise<string> {
-    const form = new FormData();
     const fileName = splitPath(absPath).base || 'blob';
-    form.set('file', new Blob([data as unknown as BufferSource], { type: 'application/octet-stream' }), fileName);
+    // Hand-built multipart as ONE Uint8Array instead of FormData. FormData
+    // costs TWO extra copies of the chunk (Blob construction + runtime
+    // multipart assembly); building the envelope manually costs one, which
+    // keeps a 4 MiB chunk PUT inside the Free plan's 10 ms CPU budget
+    // (Cloudflare 1102 under GC pressure). A single buffer also carries a
+    // known Content-Length — Terabox's origin 524s on chunked-transfer
+    // multipart with no length header.
+    // Random boundary: a guessable one lets crafted file *content* contain
+    // it and split the part early (self-harm only, but free to prevent).
+    const boundary = `----teraboxBoundary${crypto.randomUUID()}`;
+    const encoder = new TextEncoder();
+    // CR/LF/NUL in a decoded filename would terminate the part headers and
+    // inject the rest of the name into the body — corrupting the upload
+    // while the control-md5 check still passes (it hashes what we sent).
+    const safeName = fileName.replace(/[\u0000-\u001f\u007f"\\]/g, '') || 'blob';
+    const head = encoder.encode(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${safeName}"\r\n` +
+        `Content-Type: application/octet-stream\r\n\r\n`,
+    );
+    const tail = encoder.encode(`\r\n--${boundary}--\r\n`);
+    const multipart = new Uint8Array(head.length + data.length + tail.length);
+    multipart.set(head, 0);
+    multipart.set(data, head.length);
+    multipart.set(tail, head.length + data.length);
     // Identity on the PCS cluster comes from the session Cookie. Neither
     // working client (Alist, TeraboxUploaderCLI) sends jsToken here — the
     // superfile2 call failed with error_code 31045 "user not exists" while
@@ -953,7 +1074,8 @@ export class TeraboxClient {
           Referer: `${this.baseUrl}/main?category=all`,
           'User-Agent': WEB_USER_AGENT,
         },
-        form,
+        body: multipart,
+        contentType: `multipart/form-data; boundary=${boundary}`,
         skipErrorRetry: true,
       },
     );
@@ -1005,47 +1127,47 @@ export class TeraboxClient {
     if (returnType === 2) throw es(-8);
 
     const chunkSize = getChunkSize(size, this.isPremium);
-    // Views, not copies: the previous implementation pre-built a `chunks`
-    // array of `bytes.slice(...)` windows — a full second copy of the file
-    // held for the whole upload (peak ~3× body with the Blob copies), which
-    // OOMs the isolate near the Workers request-body ceiling. Subarray views
-    // share the single arrayBuffer; md5s are computed per window and only
-    // the digest strings are retained. (True streaming would additionally
-    // drop the 1× body itself, but forfeits the transparent host-failover
-    // replay below — the body is single-use once consumed.)
+    // Views, not copies: subarray windows share the single arrayBuffer so the
+    // file is held once. Chunk md5s come from the server (below) — no local
+    // hashing, which is what used to blow the Workers 10 ms CPU budget.
     const chunkCount = size === 0 ? 1 : Math.ceil(bytes.byteLength / chunkSize);
-    const chunkMd5s: string[] = [];
     const windowAt = (index: number): Uint8Array =>
       size === 0
         ? new Uint8Array(0)
         : bytes.subarray(index * chunkSize, Math.min((index + 1) * chunkSize, bytes.byteLength));
-    for (let index = 0; index < chunkCount; index += 1) {
-      chunkMd5s.push(await md5Hex(windowAt(index)));
-    }
 
     // The browser walks locateupload's candidate server list until one
     // accepts the upload (wrong-cluster hosts answer HTTP 403
     // error_code 31045 "user not exists"). Mirror that: retry the chunk
     // sequence on the next candidate; lock onto the first host that works.
+    // superfile2 returns the md5 of each chunk it received, so we collect
+    // those instead of re-hashing locally (identical value, zero CPU).
+    const chunkMd5s: string[] = [];
     let uploaded = false;
     let lastHostError: TeraboxError | undefined;
     for (let hostIndex = 0; hostIndex < hosts.length; hostIndex += 1) {
       const host = hosts[hostIndex]!;
       try {
+        chunkMd5s.length = 0;
         for (let index = 0; index < chunkCount; index += 1) {
           const uploadedMd5 = await atStep(`chunk${index}@${host}`, () =>
             this.uploadChunk(host, absPath, uploadId, uploadSign, index, windowAt(index)),
           );
-          if (uploadedMd5 !== chunkMd5s[index]) {
-            throw new TeraboxError(-5, `Uploaded chunk ${index} md5 mismatch`);
+          if (!uploadedMd5) {
+            throw new TeraboxError(-5, `Uploaded chunk ${index} returned no md5`);
           }
+          chunkMd5s.push(uploadedMd5);
         }
         this.uploadHost = host;
         uploaded = true;
         break;
       } catch (error) {
         const isLastHost = hostIndex === hosts.length - 1;
-        if (error instanceof TeraboxError && error.httpStatus !== undefined && !isLastHost) {
+        // Same rule as the resumable ladder: anything thrown inside the
+        // per-host try IS that host's answer (chunk uploads only), whether
+        // or not it carries an HTTP status — a200-with-error-body must not
+        // abort the failover.
+        if (error instanceof TeraboxError && !isLastHost) {
           lastHostError = error;
           continue;
         }
@@ -1058,10 +1180,92 @@ export class TeraboxClient {
       this.createFile(absPath, uploadId, uploadSign, size, mtimeMs, chunkMd5s, overwriteMode),
     );
 
+    // Single-chunk control md5 IS the chunk md5 the server returned; the
+    // multi-chunk form hashes only the tiny JSON array of digests (a few
+    // hundred bytes) — negligible CPU either way.
     const controlMd5 =
       chunkMd5s.length === 1 ? chunkMd5s[0]! : await md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
     if (decodeMD5(createdMd5) !== controlMd5) {
-      throw new TeraboxError(-5, 'Server file md5 does not match uploaded chunks');
+      const integrity = new TeraboxError(-5, 'Server file md5 does not match uploaded chunks');
+      integrity.integrity = true;
+      throw integrity;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // resumable upload (exposes Terabox's native multipart across many small
+  // HTTP requests, so a single body never exceeds Cloudflare's ~100 MB cap)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Step 1 of a resumable upload: run precreate and return the upload
+   * coordinates. The caller stores these (in the Durable Object) and feeds
+   * them back to {@link uploadResumableChunk} / {@link finalizeResumable}.
+   */
+  async beginResumable(
+    absPath: string,
+    size: number,
+    mtimeMs: number,
+  ): Promise<{ uploadId: string; uploadSign: string; chunkSize: number; chunkCount: number; hosts: string[] }> {
+    await this.checkPremium();
+    const limit = this.isPremium ? MAX_PREMIUM_FILE_BYTES : MAX_FREE_FILE_BYTES;
+    if (size > limit) throw es(58);
+    await atStep('jsToken', () => this.ensureJsToken());
+    const hosts = await atStep('locateupload', () => this.ensureUploadHosts());
+    const { uploadId, returnType, uploadSign } = await atStep('precreate', () =>
+      this.precreate(absPath, size, mtimeMs),
+    );
+    if (returnType === 2) throw es(-8);
+    // An empty uploadid would store a session under `""`; the chunk route
+    // requires a non-empty id, so every follow-up would 404 with no clue why.
+    if (!uploadId) throw new TeraboxError(-5, 'precreate returned no uploadid');
+    const chunkSize = getChunkSize(size, this.isPremium);
+    const chunkCount = size === 0 ? 1 : Math.ceil(size / chunkSize);
+    return { uploadId, uploadSign, chunkSize, chunkCount, hosts };
+  }
+
+  /**
+   * Step 2 of a resumable upload: send one chunk to the upload cluster and
+   * return the md5 Terabox computed for it (never re-hash locally).
+   */
+  async uploadResumableChunk(
+    host: string,
+    absPath: string,
+    uploadId: string,
+    uploadSign: string,
+    partSeq: number,
+    data: Uint8Array,
+  ): Promise<string> {
+    const md5 = await atStep(`chunk${partSeq}@${host}`, () =>
+      this.uploadChunk(host, absPath, uploadId, uploadSign, partSeq, data),
+    );
+    if (!md5) throw new TeraboxError(-5, `Uploaded chunk ${partSeq} returned no md5`);
+    return md5;
+  }
+
+  /**
+   * Step 3 of a resumable upload: run create with the collected chunk md5s
+   * and verify the control md5. The caller must have stored every chunk's
+   * md5 from {@link uploadResumableChunk}.
+   */
+  async finalizeResumable(
+    absPath: string,
+    uploadId: string,
+    uploadSign: string,
+    size: number,
+    mtimeMs: number,
+    chunkMd5s: string[],
+    overwriteMode = 0,
+  ): Promise<void> {
+    const createdMd5 = await atStep('create', () =>
+      this.createFile(absPath, uploadId, uploadSign, size, mtimeMs, chunkMd5s, overwriteMode),
+    );
+    const controlMd5 =
+      chunkMd5s.length === 1 ? chunkMd5s[0]! : await md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
+    if (decodeMD5(createdMd5) !== controlMd5) {
+      const integrity = new TeraboxError(-5, 'Server file md5 does not match uploaded chunks');
+      integrity.integrity = true;
+      throw integrity;
     }
   }
 

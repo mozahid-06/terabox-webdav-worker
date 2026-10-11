@@ -8,7 +8,10 @@ const compat = {
 };
 
 const davBindings = {
-	USERS: 'test:pass',
+	// Second credential is non-ASCII: locks in RFC 7617 UTF-8 decoding of
+	// the Basic header (see validBasicAuth — a latin1 atob can never match
+	// a multi-byte password).
+	USERS: 'test:pass,üser:pässword',
 	COOKIE: 'ndus=mock-session-cookie; lang=en',
 	TERABOX_DOMAIN: 'https://mock.terabox.example',
 	// Rate pacing is exercised live; tests must not sleep.
@@ -25,7 +28,7 @@ export default defineConfig({
 						miniflare: { ...compat, bindings: davBindings },
 					}),
 				],
-				test: { name: 'dav', include: ['test/dav.test.ts', 'test/md5.test.ts', 'test/dlink.test.ts'] },
+				test: { name: 'dav', include: ['test/dav.test.ts', 'test/md5.test.ts', 'test/dlink.test.ts', 'test/client.test.ts'] },
 			},
 			{
 				plugins: [

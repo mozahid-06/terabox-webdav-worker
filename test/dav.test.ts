@@ -1,6 +1,16 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { metaCacheHasForTest, metaCacheSeedForTest, metaCacheSize, resetDavVolatileState } from '../src/webdav';
+import {
+	metaCacheHasForTest,
+	metaCacheSeedForTest,
+	metaCacheSize,
+	resetDavVolatileState,
+	safeRelocate,
+} from '../src/webdav';
+import type { DavStore, RelocateItem } from '../src/davstate';
+import { validateXml } from '../src/davxml';
+import { resetTeraboxCaches } from '../src/terabox';
+import { getChunkSize } from '../src/sign';
 import { AUTH, MockTerabox, ORIGIN, UPLOAD_BASE, installMock } from './helpers';
 
 let tb: MockTerabox;
@@ -22,8 +32,11 @@ const request = (path: string, init: RequestInit = {}): Promise<Response> =>
 
 beforeEach(() => {
 	// Advisory lock/dead-prop state lives per isolate: clear it so cases
-	// never leak locks or properties into each other.
+	// never leak locks or properties into each other. The Terabox module
+	// caches (jsToken/premium/upload-hosts) are isolate-global too and would
+	// otherwise leak a prior test's configured host list.
 	resetDavVolatileState();
+	resetTeraboxCaches();
 	tb = new MockTerabox();
 	seed(tb);
 	installMock(tb);
@@ -34,6 +47,23 @@ afterEach(() => {
 });
 
 describe('auth', () => {
+	it('authenticates a non-ASCII password (RFC 7617 UTF-8)', async () => {
+		// RFC 7617: with charset="UTF-8" the client base64s the UTF-8 bytes,
+		// not latin1 — a latin1 decode of these bytes is mojibake and can
+		// never equal the configured password.
+		const utf8Basic = (username: string, password: string): string =>
+			'Basic ' + btoa(String.fromCharCode(...new TextEncoder().encode(`${username}:${password}`)));
+
+		const ok = await SELF.fetch(ORIGIN + '/', {
+			method: 'PROPFIND',
+			headers: { Authorization: utf8Basic('üser', 'pässword'), Depth: '0' },
+		});
+		expect(ok.status).toBe(207);
+
+		const bad = await SELF.fetch(ORIGIN + '/', { headers: { Authorization: utf8Basic('üser', 'wrong') } });
+		expect(bad.status).toBe(401);
+	});
+
 	it('requires credentials', async () => {
 		const res = await SELF.fetch(ORIGIN + '/');
 		expect(res.status).toBe(401);
@@ -49,6 +79,27 @@ describe('auth', () => {
 	it('rejects malformed base64 without crashing', async () => {
 		const res = await request('/', { headers: { Authorization: 'Basic not-valid@#$' } });
 		expect(res.status).toBe(401);
+	});
+
+	it('accepts the auth-scheme in any case (RFC 7235 §2.1)', async () => {
+		const res = await request('/a.txt', {
+			headers: { Authorization: 'basic ' + btoa('test:pass') },
+		});
+		expect(res.status).toBe(200);
+	});
+
+	it('carries a WWW-Authenticate challenge on a mid-session 401 too', async () => {
+		// The challenge on the FIRST 401 is what makes clients send
+		// credentials at all; a later 401 without it stops neon/litmus and
+		// Windows Mini-Redirector from ever retrying.
+		const initial = await SELF.fetch(ORIGIN + '/');
+		expect(initial.status).toBe(401);
+		expect(initial.headers.get('WWW-Authenticate')).toContain('Basic');
+
+		tb.precreateErrno = -6; // session-class Terabox failure
+		const expired = await request('/expired-session.txt', { method: 'PUT', body: 'x' });
+		expect(expired.status).toBe(401);
+		expect(expired.headers.get('WWW-Authenticate')).toContain('Basic');
 	});
 });
 
@@ -271,7 +322,9 @@ describe('GET validators for md5-less items', () => {
 	it('answers the PROPFIND fallback etag on GET/HEAD and honours it with 304', async () => {
 		tb.seed('/nomd5.bin', { content: '0123456789', md5: '' });
 		const node = tb.find('/nomd5.bin')!;
-		const fallback = `"${node.server_mtime}-${node.size}-0"`;
+		// RFC 7232 §2.3: one-second mtime + size cannot distinguish same-second
+		// rewrites, so the fallback validator is weak (W/).
+		const fallback = `W/"${node.server_mtime}-${node.size}-0"`;
 		// PROPFIND and GET must serve the *same* validator: a GET without an
 		// ETag header nulls davfs2's stored one and poisons every later open.
 		const propfind = await request('/nomd5.bin', { method: 'PROPFIND', headers: { Depth: '0' } });
@@ -286,6 +339,126 @@ describe('GET validators for md5-less items', () => {
 		const revalidated = await request('/nomd5.bin', { headers: { 'If-None-Match': fallback } });
 		expect(revalidated.status).toBe(304);
 		expect(revalidated.headers.get('ETag')).toBe(fallback);
+	});
+
+	it('revalidates a stripped weak tag (If-None-Match weak comparison)', async () => {
+		// RFC 7232 §3.2: W/"x" and "x" are the SAME validator for
+		// If-None-Match — a client that strips the prefix must still 304.
+		tb.seed('/nomd5-stripped.bin', { content: '0123456789', md5: '' });
+		const node = tb.find('/nomd5-stripped.bin')!;
+		const stripped = `"${node.server_mtime}-${node.size}-0"`;
+		const res = await request('/nomd5-stripped.bin', { headers: { 'If-None-Match': stripped } });
+		expect(res.status).toBe(304);
+	});
+
+	it('refuses a weak fallback etag for If-Range (serves the full body)', async () => {
+		// RFC 7233 §3.2 needs a STRONG validator for If-Range: splicing a
+		// ranged slice under a one-second-resolution etag could mix a
+		// same-second rewrite into the client's partial copy.
+		tb.seed('/nomd5-range.bin', { content: '0123456789', md5: '' });
+		const node = tb.find('/nomd5-range.bin')!;
+		const weak = `W/"${node.server_mtime}-${node.size}-0"`;
+		const res = await request('/nomd5-range.bin', { headers: { Range: 'bytes=0-2', 'If-Range': weak } });
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('0123456789');
+	});
+});
+
+describe('timestamp sanitization (upstream garbage must not 500)', () => {
+	it('serves PROPFIND 207 and GET 200 for an out-of-range server_mtime', async () => {
+		// 1e15 seconds x 1000 overflows the Date range: creationdate used to
+		// throw a RangeError and 500 the ENTIRE Depth-1 listing — one poisoned
+		// child took down every sibling's view too.
+		tb.seed('/huge-mtime.txt', { content: 'x', md5: '', server_mtime: 1e15 });
+		const propfind = await request('/', { method: 'PROPFIND', headers: { Depth: '1' } });
+		expect(propfind.status).toBe(207);
+		const body = await propfind.text();
+		expect(validateXml(body)).toBeNull();
+		expect(body).toContain('<D:creationdate>1970-01-01T00:00:00.000Z</D:creationdate>');
+		const res = await request('/huge-mtime.txt');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Last-Modified')).toBe('Thu, 01 Jan 1970 00:00:00 GMT');
+		expect(res.headers.get('ETag')).toBe('W/"0-1-0"');
+	});
+
+	it('agrees between GET and PROPFIND for a non-numeric mtime', async () => {
+		// One fallback rule for every surface: GET's Last-Modified used to
+		// emit `Invalid Date` while PROPFIND answered epoch — and NaN made
+		// If-Modified-Since never match (perpetual full re-downloads).
+		tb.seed('/weird-mtime.txt', { content: 'x', server_mtime: 'not-a-number' as unknown as number });
+		const propfind = await request('/weird-mtime.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
+		expect(propfind.status).toBe(207);
+		const modified = /<D:getlastmodified>([^<]+)<\/D:getlastmodified>/.exec(await propfind.text())?.[1];
+		const res = await request('/weird-mtime.txt');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Last-Modified')).toBe(modified);
+		expect(res.headers.get('Last-Modified')).toMatch(/GMT$/);
+	});
+
+	it('keeps a header-hostile mtime out of the ETag (md5-less GET stays 200)', async () => {
+		// Number('123\n') is 123, but the raw string used to be embedded in
+		// the etag — headers.set then threw and GET 500'd while the same
+		// file's PROPFIND answered 207.
+		tb.seed('/nl-mtime.bin', { content: '0123456789', md5: '', server_mtime: '123\n' as unknown as number });
+		const res = await request('/nl-mtime.bin');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('ETag')).toBe('W/"123-10-0"');
+		const propfind = await request('/nl-mtime.bin', { method: 'PROPFIND', headers: { Depth: '0' } });
+		expect(propfind.status).toBe(207);
+		expect(await propfind.text()).toContain('W/&quot;123-10-0&quot;');
+	});
+});
+
+describe('PROPFIND output well-formedness (hostile names)', () => {
+	it('never lets a control-character name break the 207', async () => {
+		// %01 and %00 names are creatable through this worker (MKCOL/PUT):
+		// the response must still be parseable XML, so sanitization happens
+		// at the emission choke point instead of trusting upstream to refuse.
+		expect((await request('/bad%01name.txt', { method: 'MKCOL' })).status).toBe(201);
+		expect((await request('/nul%00file.txt', { method: 'PUT', body: 'x' })).status).toBe(201);
+
+		const res = await request('/', { method: 'PROPFIND', headers: { Depth: '1' } });
+		expect(res.status).toBe(207);
+		const body = await res.text();
+		expect(validateXml(body)).toBeNull();
+		expect(body).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/);
+
+		expect((await request('/bad%01name.txt', { method: 'DELETE' })).status).toBe(204);
+		expect((await request('/nul%00file.txt', { method: 'DELETE' })).status).toBe(204);
+	});
+});
+
+describe('GET/HEAD preconditions and 405 discovery (RFC 7232 §6, RFC 7231 §6.5.5)', () => {
+	it('412s a stale If-Match and If-Unmodified-Since on GET and HEAD', async () => {
+		const md5 = tb.find('/a.txt')!.md5;
+		expect((await request('/a.txt', { headers: { 'If-Match': '"stale"' } })).status).toBe(412);
+		expect((await request('/a.txt', { method: 'HEAD', headers: { 'If-Match': '"stale"' } })).status).toBe(412);
+		expect((await request('/a.txt', { headers: { 'If-Match': `"${md5}"` } })).status).toBe(200);
+		// Step 2 applies only when If-Match is absent (§6 order).
+		expect(
+			(await request('/a.txt', { headers: { 'If-Unmodified-Since': 'Wed, 01 Jan 2020 00:00:00 GMT' } })).status,
+		).toBe(412);
+		expect(
+			(await request('/a.txt', {
+				headers: { 'If-Match': `"${md5}"`, 'If-Unmodified-Since': 'Wed, 01 Jan 2020 00:00:00 GMT' },
+			})).status,
+		).toBe(200);
+		// `*` asserts existence only (§3.1); a missing resource keeps 404 (§5
+		// precedence: preconditions are ignored when the unconditioned
+		// response would be non-2xx and not 412).
+		expect((await request('/a.txt', { headers: { 'If-Match': '*' } })).status).toBe(200);
+		expect((await request('/gone.txt', { headers: { 'If-Match': '"x"' } })).status).toBe(404);
+	});
+
+	it('carries Allow on the collection 405', async () => {
+		// RFC 7231 §6.5.5 MUST: the collection root is the most-probed 405
+		// on this surface, and it used to answer with no method discovery.
+		for (const method of ['GET', 'HEAD']) {
+			const res = await request('/', { method });
+			expect(res.status).toBe(405);
+			expect(res.headers.get('Allow')).toContain('PROPFIND');
+			expect(res.headers.get('Allow')).toContain('GET');
+		}
 	});
 });
 
@@ -457,6 +630,335 @@ describe('PUT and MKCOL parents', () => {
 		expect(res.status).toBe(201);
 		expect(new TextDecoder().decode(tb.find('/failover.txt')!.content)).toBe('via second server');
 	});
+
+	it('fails over when a host answers 200 with no md5 (no HTTP status)', async () => {
+		// A 200-with-error-body throws a TeraboxError WITHOUT httpStatus, so
+		// the old gate (`httpStatus !== undefined`) aborted the ladder and the
+		// upload failed 502 where failover was designed to succeed.
+		const good = new URL(UPLOAD_BASE).host;
+		tb.locateServers = ['silent-pcs.example', good];
+		tb.silentHosts.add('silent-pcs.example');
+		const res = await request('/silent.txt', { method: 'PUT', body: 'via second server' });
+		expect(res.status).toBe(201);
+		expect(new TextDecoder().decode(tb.find('/silent.txt')!.content)).toBe('via second server');
+	});
+
+	it('an integrity failure still refreshes the metadata cache', async () => {
+		// create() replaced the content upstream before the md5 check failed,
+		// so the read path must not keep serving the pre-PUT validators.
+		tb.seed('/integrity.txt', { content: 'old' });
+		const before = await request('/integrity.txt', { method: 'HEAD' });
+		const beforeEtag = before.headers.get('ETag');
+		expect(before.headers.get('Content-Length')).toBe('3');
+
+		tb.corruptCreateMd5 = true;
+		try {
+			const put = await request('/integrity.txt', { method: 'PUT', body: 'new bytes' });
+			expect(put.status).toBe(502);
+		} finally {
+			tb.corruptCreateMd5 = false;
+		}
+		expect(tb.find('/integrity.txt')!.size).toBe(9);
+
+		const after = await request('/integrity.txt', { method: 'HEAD' });
+		expect(after.headers.get('Content-Length')).toBe('9');
+		expect(after.headers.get('ETag')).not.toBe(beforeEtag);
+	});
+});
+
+describe('resumable upload', () => {
+	it('uploads a multi-chunk file across separate requests', async () => {
+		// A file larger than one chunk exercises the multipart path end-to-end:
+		// begin → per-chunk PUTs → finalize, each a distinct HTTP request.
+		const chunkSize = 4 * 1024 * 1024; // free-tier chunk size
+		const total = chunkSize + 1000; // 2 chunks: full + short tail
+		const data = new Uint8Array(total);
+		for (let i = 0; i < total; i += 1) data[i] = i % 251;
+
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/big.bin', size: total }),
+		});
+		expect(begin.status).toBe(200);
+		const begun = (await begin.json()) as { uploadId: string; chunkSize: number; chunkCount: number };
+		expect(begun.chunkSize).toBe(chunkSize);
+		expect(begun.chunkCount).toBe(2);
+
+		for (let index = 0; index < begun.chunkCount; index += 1) {
+			const start = index * chunkSize;
+			const end = Math.min(start + chunkSize, total);
+			const chunk = data.subarray(start, end);
+			const put = await request(`/.resumable/${begun.uploadId}/${index}`, {
+				method: 'PUT',
+				body: chunk,
+			});
+			expect(put.status).toBe(200);
+			const { md5 } = (await put.json()) as { md5: string };
+			expect(md5).toMatch(/^[0-9a-f]{32}$/);
+		}
+
+		const fin = await request(`/.resumable/${begun.uploadId}/finalize`, { method: 'POST' });
+		expect(fin.status).toBe(201);
+		expect(tb.find('/big.bin')!.size).toBe(total);
+		expect(tb.find('/big.bin')!.content).toEqual(data);
+	}, 30000);
+
+	it('replays the same status when finalize is retried', async () => {
+		// If the finalize response is lost in transit, the client's retry
+		// must not read 404 as "upload failed" for a file that landed.
+		const data = new Uint8Array(64).fill(7);
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/retry-fin.bin', size: data.byteLength }),
+		});
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: data });
+		expect(put.status).toBe(200);
+
+		const first = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(first.status).toBe(201);
+		const retry = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(retry.status).toBe(201);
+		expect(tb.find('/retry-fin.bin')!.content).toEqual(data);
+	}, 30000);
+
+	it('two concurrent finalizes run one create and answer the same status', async () => {
+		// A client retry can land while the first finalize is still running
+		// its create. Without the atomic claim both requests passed the
+		// `finalized` read and raced a second create — the loser got -8
+		// (path conflict) for a file that HAD landed.
+		const data = new Uint8Array(64).fill(9);
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/race-fin.bin', size: data.byteLength }),
+		});
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: data });
+		expect(put.status).toBe(200);
+
+		const before = tb.createCalls;
+		const [first, second] = await Promise.all([
+			request(`/.resumable/${uploadId}/finalize`, { method: 'POST' }),
+			request(`/.resumable/${uploadId}/finalize`, { method: 'POST' }),
+		]);
+		expect(first.status).toBe(201);
+		expect(second.status).toBe(201);
+		// Exactly one upstream create: the loser replayed instead of racing.
+		expect(tb.createCalls - before).toBe(1);
+		expect(tb.find('/race-fin.bin')!.content).toEqual(data);
+	}, 30000);
+
+	it('rejects finalize when a chunk is missing', async () => {
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/missing.bin', size: 8 * 1024 * 1024 }),
+		});
+		const { uploadId, chunkCount } = (await begin.json()) as { uploadId: string; chunkCount: number };
+		expect(chunkCount).toBe(2);
+		// Upload only chunk 0; chunk 1 stays missing.
+		const put = await request(`/.resumable/${uploadId}/0`, {
+			method: 'PUT',
+			body: new Uint8Array(4 * 1024 * 1024),
+		});
+		expect(put.status).toBe(200);
+		const fin = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(fin.status).toBe(409);
+	});
+
+	it('rejects a chunk whose size does not match the session', async () => {
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/badsize.bin', size: 8 * 1024 * 1024 }),
+		});
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, {
+			method: 'PUT',
+			body: new Uint8Array(100), // wrong: should be 4 MiB
+		});
+		expect(put.status).toBe(400);
+	});
+
+	it('404s an unknown upload session', async () => {
+		const put = await request('/.resumable/nope/0', { method: 'PUT', body: 'x' });
+		expect(put.status).toBe(404);
+		const fin = await request('/.resumable/nope/finalize', { method: 'POST' });
+		expect(fin.status).toBe(404);
+	});
+
+	it('cancels an upload with DELETE so its chunks stop lingering', async () => {
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/cancel.bin', size: 4 }),
+		});
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: 'abcd' });
+		expect(put.status).toBe(200);
+
+		expect((await request(`/.resumable/${uploadId}`, { method: 'DELETE' })).status).toBe(204);
+		// The session is gone: finalize reads unknown, not as a replay.
+		expect((await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' })).status).toBe(404);
+		// Unknown ids are 404, same as the other routes.
+		expect((await request('/.resumable/nope', { method: 'DELETE' })).status).toBe(404);
+	});
+
+	it('never lets the client choose the conflict policy (overwriteMode)', async () => {
+		// rtype 1 (rename) would make Terabox write `dest(1).txt` while we
+		// answer 204 at the requested path — a success reported for a path
+		// never touched. Existing → overwrite (3), new → create-only (0).
+		const beginOver = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/dest.txt', size: 5, overwriteMode: 1 }),
+		});
+		const over = (await beginOver.json()) as { uploadId: string };
+		await request(`/.resumable/${over.uploadId}/0`, { method: 'PUT', body: 'fresh' });
+		const done = await request(`/.resumable/${over.uploadId}/finalize`, { method: 'POST' });
+		expect(done.status).toBe(204);
+		expect(tb.lastRtype).toBe(3); // server's choice, not the client's 1
+		expect(new TextDecoder().decode(tb.find('/dest.txt')!.content)).toBe('fresh');
+		expect(tb.find('/dest(1).txt')).toBeUndefined();
+
+		const beginNew = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/brand-new.bin', size: 4, overwriteMode: 3 }),
+		});
+		const fresh = (await beginNew.json()) as { uploadId: string };
+		await request(`/.resumable/${fresh.uploadId}/0`, { method: 'PUT', body: 'abcd' });
+		const created = await request(`/.resumable/${fresh.uploadId}/finalize`, { method: 'POST' });
+		expect(created.status).toBe(201);
+		expect(tb.lastRtype).toBe(0); // create-only for a path that did not exist
+	});
+
+	it('collapses `..` segments in the JSON path (no mount escape)', async () => {
+		// A crafted `..` in the JSON body must not walk above the mount root:
+		// decodePathname collapses it for URL paths, and the resumable JSON
+		// path gets the identical cleanup before toTera concatenates.
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/docs/../../escape.bin', size: 5 }),
+		});
+		expect(begin.status).toBe(200);
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: 'oops!' });
+		expect(put.status).toBe(200);
+		const fin = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(fin.status).toBe(201);
+		// ".." collapses out: /docs/../../escape.bin → /escape.bin, not a
+		// traversal above the root.
+		expect(tb.find('/escape.bin')).toBeTruthy();
+		expect(tb.find('/docs/../../escape.bin')).toBeFalsy();
+	});
+
+	it('respects locks: begin on a locked path is 423 without the token', async () => {
+		const lockBody =
+			'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner><D:href>tester</D:href></D:owner></D:lockinfo>';
+		const lock = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: lockBody,
+		});
+		expect(lock.status).toBe(200);
+		// Resumable upload is a write; without the lock token it must 423
+		// exactly like PUT, not slip past the lock.
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/a.txt', size: 5 }),
+		});
+		expect(begin.status).toBe(423);
+	});
+
+	it('overwrites an existing file (204) via resumable', async () => {
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/a.txt', size: 5 }),
+		});
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: 'fresh' });
+		expect(put.status).toBe(200);
+		const fin = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(fin.status).toBe(204);
+		expect(new TextDecoder().decode(tb.find('/a.txt')!.content)).toBe('fresh');
+	});
+
+	it('finalize honours a lock taken AFTER begin', async () => {
+		// begin is not the write — finalize is. A lock landing between the two
+		// must still block the resource creation (RFC 4918 §6).
+		const put = await request('/mid-lock.txt', { method: 'PUT', body: 'original' });
+		expect(put.status).toBe(201);
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/mid-lock.txt', size: 5 }),
+		});
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		expect((await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: 'fresh' })).status).toBe(200);
+
+		const lock = await request('/mid-lock.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: '<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>t</D:owner></D:lockinfo>',
+		});
+		expect(lock.status).toBe(200);
+		const token = lock.headers.get('Lock-Token')!;
+
+		const blocked = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+		expect(blocked.status).toBe(423);
+		expect(new TextDecoder().decode(tb.find('/mid-lock.txt')!.content)).toBe('original');
+
+		const allowed = await request(`/.resumable/${uploadId}/finalize`, {
+			method: 'POST',
+			headers: { If: `(${token})` },
+		});
+		expect(allowed.status).toBe(204);
+		expect(new TextDecoder().decode(tb.find('/mid-lock.txt')!.content)).toBe('fresh');
+	});
+
+	it('an integrity failure at finalize answers 502 on every retry', async () => {
+		// create() succeeded upstream but the control md5 disagrees. Re-running
+		// create would reproduce the mismatch and (create-only) answer -8/409 —
+		// the session must replay the real failure instead.
+		tb.corruptCreateMd5 = true;
+		try {
+			const begin = await request('/.resumable', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ path: '/corrupt.bin', size: 4 }),
+			});
+			const { uploadId } = (await begin.json()) as { uploadId: string };
+			expect((await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: 'abcd' })).status).toBe(200);
+
+			const first = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+			expect(first.status).toBe(502);
+			expect(tb.find('/corrupt.bin')).toBeDefined(); // the file DID land
+
+			const retry = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
+			expect(retry.status).toBe(502);
+		} finally {
+			tb.corruptCreateMd5 = false;
+		}
+	});
+
+	it('never sizes a chunk above the request-body budget', async () => {
+		const MiB = 1024 * 1024;
+		const GiB = 1024 * MiB;
+		// Free tier keeps Terabox's 4 MiB; VIP tiers are capped so the chunk +
+		// its multipart envelope stay under both the edge body limit and the
+		// isolate's memory ceiling.
+		expect(getChunkSize(1024, false)).toBe(4 * MiB);
+		expect(getChunkSize(8 * GiB, true)).toBe(8 * MiB);
+		expect(getChunkSize(64 * GiB, true)).toBe(32 * MiB);
+		expect(getChunkSize(128 * GiB, true)).toBe(32 * MiB);
+	});
 });
 
 describe('DELETE', () => {
@@ -478,6 +980,55 @@ describe('DELETE', () => {
 });
 
 describe('MOVE / COPY', () => {
+	it('a Destination on another host is 502, never a local path', async () => {
+		// RFC 4918 §10.3 contemplates 502 here. Treating a foreign host as a
+		// local path would move the file somewhere the client never named.
+		const res = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: 'https://other.example/dav/somewhere.txt' },
+		});
+		expect(res.status).toBe(502);
+		expect(tb.find('/a.txt')).toBeDefined();
+		expect(tb.find('/somewhere.txt')).toBeUndefined();
+	});
+
+	it('treats a protocol-relative Destination as another origin (502)', async () => {
+		// `new URL('//other.example/x')` throws without a base; the path
+		// fallback would have moved the file to a LOCAL `/other.example/x`.
+		const res = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: '//other.example/x.txt' },
+		});
+		expect(res.status).toBe(502);
+		expect(tb.find('/a.txt')).toBeDefined();
+		expect(tb.find('/other.example')).toBeUndefined();
+		expect(tb.find('/other.example/x.txt')).toBeUndefined();
+	});
+
+	it('ignores a stale cached destination (fresh stat drives Overwrite)', async () => {
+		// The cache claims /newfile.txt exists; upstream says it does not.
+		// A cached stat would pre-delete a missing path (-9 → 404) and lose
+		// the move; the overwrite decision must use live metadata.
+		metaCacheSeedForTest('/newfile.txt', {
+			path: '/newfile.txt',
+			server_filename: 'newfile.txt',
+			isdir: 0,
+			size: 9,
+			server_mtime: 1704067200,
+			md5: 'ffffffffffffffffffffffffffffffff',
+		} as never);
+		expect(metaCacheHasForTest('/newfile.txt')).toBe(true);
+		const res = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/newfile.txt' },
+		});
+		expect(res.status).toBe(201);
+		expect(new TextDecoder().decode(tb.find('/newfile.txt')!.content)).toBe(
+			'the quick brown fox\n',
+		);
+		expect(tb.find('/a.txt')).toBeUndefined();
+	});
+
 	it('MOVE to a new destination returns 201', async () => {
 		const originalSize = tb.find('/a.txt')!.size;
 		const res = await request('/a.txt', {
@@ -627,6 +1178,26 @@ describe('RFC 4918 conformance', () => {
 
 	it('still streams on a mismatched If-None-Match', async () => {
 		const res = await request('/a.txt', { headers: { 'If-None-Match': '"stale"' } });
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
+	it('treats the range unit case-insensitively (BYTES=0-2 -> 206)', async () => {
+		// ABNF literals are case-insensitive (RFC 7230 §3.2.2): a satisfied
+		// range must not fall into the "unit not understood -> ignore" path.
+		const res = await request('/a.txt', { headers: { Range: 'BYTES=0-2' } });
+		expect(res.status).toBe(206);
+		expect(await res.text()).toBe('the');
+		expect(res.headers.get('Content-Range')).toBe(`bytes 0-2/${tb.find('/a.txt')!.size}`);
+	});
+
+	it('ignores Range when If-Range carries a date we never sent (serves 200)', async () => {
+		// RFC 7233 §3.2: EXACT match, not "earlier or equal" — a newer date
+		// (or an mtime that rolled back) must fall back to 200 rather than
+		// splice fresh bytes into the client's old partial copy.
+		const res = await request('/a.txt', {
+			headers: { Range: 'bytes=0-2', 'If-Range': 'Thu, 01 Jan 2031 00:00:00 GMT' },
+		});
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe('the quick brown fox\n');
 	});
@@ -841,6 +1412,29 @@ describe('overwrite semantics (server never replaces in place)', () => {
 });
 
 describe('XML request validation', () => {
+	it('rejects raw XML-invalid characters (C0 controls) in PROPPATCH and LOCK', async () => {
+		// Numeric references (\u0026#1;) were already rejected — the RAW byte
+		// slipped through, got stored, and re-appeared in every later
+		// PROPFIND 207: strict clients then failed the whole listing, a
+		// persistent browse DoS with no client-side workaround.
+		const patched = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><X:t xmlns:X="urn:x">\u0001</X:t></D:prop></D:set></D:propertyupdate>',
+		});
+		expect(patched.status).toBe(400);
+
+		const locked = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+				'<D:locktype><D:write/></D:locktype><D:owner>bad\u0000owner</D:owner></D:lockinfo>',
+		});
+		expect(locked.status).toBe(400);
+	});
+
 	it('PROPFIND with non-well-formed XML is 400, not a silent allprop', async () => {
 		const res = await request('/a.txt', {
 			method: 'PROPFIND',
@@ -885,6 +1479,70 @@ describe('XML request validation', () => {
 			body: '<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>',
 		});
 		expect(res.status).toBe(400);
+	});
+
+	it('rejects shapes that are well-formed-looking but not XML', async () => {
+		// Each of these would be accepted, STORED as a dead property, and then
+		// re-emitted in every later PROPFIND — turning one bad request into a
+		// permanently unparseable response for every client that reads it.
+		const bodies = [
+			// '<' inside an attribute value must be &lt; (XML 1.0 §3.1).
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x" a="x<y">v</X:foo></D:prop></D:set></D:propertyupdate>',
+			// ']]>' is banned in character data outside CDATA (§2.4).
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x">a]]>b</X:foo></D:prop></D:set></D:propertyupdate>',
+			// No '--' inside a comment (§2.5).
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x"><!-- a -- b -->v</X:foo></D:prop></D:set></D:propertyupdate>',
+			// Numeric references must name a legal XML character (§2.2).
+			'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x">&#0;</X:foo></D:prop></D:set></D:propertyupdate>',
+		];
+		for (const body of bodies) {
+			const res = await request('/a.txt', {
+				method: 'PROPPATCH',
+				headers: { 'Content-Type': 'application/xml' },
+				body,
+			});
+			expect(res.status, body.slice(0, 60)).toBe(400);
+		}
+		// Nothing was persisted by any of them.
+		const probe = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:" xmlns:X="urn:x"><D:allprop/></D:propfind>',
+		});
+		expect(await probe.text()).not.toContain('X:foo');
+	});
+
+	it('accepts ]]> inside a quoted attribute value (§2.4 bans it only in content)', async () => {
+		const find = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body:
+				'<D:propfind xmlns:D="DAV:" xmlns:X="urn:x"><D:prop>' +
+				'<X:foo a="x]]>y"/></D:prop></D:propfind>',
+		});
+		expect(find.status).toBe(207);
+		expect(validateXml(await find.text())).toBeNull();
+
+		const set = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:attr xmlns:X="urn:x" note="a]]>b">v</X:attr></D:prop></D:set></D:propertyupdate>',
+		});
+		expect(set.status).toBe(207);
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><X:attr xmlns:X="urn:x"/></D:prop></D:propfind>',
+		});
+		const body = await res.text();
+		expect(validateXml(body)).toBeNull();
+		expect(body).toContain('a]]>b');
 	});
 });
 
@@ -1037,6 +1695,68 @@ describe('dead properties', () => {
 		expect(await propfind.text()).toContain('<D:displayname>a.txt</D:displayname>');
 	});
 
+	it('stores a dead property whose local name is `set` intact', async () => {
+		// The operation scanner must bind each <set>/<remove> to its OWN
+		// closing prefix: an <X:set>…</X:set> sitting inside <D:prop> is a
+		// property, not a second operation. Matching any prefix cut the block
+		// at the property's close tag, which then reported the <D:prop>
+		// wrapper itself as a forbidden live prop and stored a half element.
+		const set = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:set xmlns:X="urn:x-example">value</X:set>'),
+		});
+		expect(set.status).toBe(207);
+		const setBody = await set.text();
+		expect(setBody).toContain('HTTP/1.1 200 OK');
+		expect(setBody).not.toContain('403 Forbidden');
+
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:set xmlns:X="urn:x-example"/>'),
+		});
+		const found = await res.text();
+		expect(found).toContain('HTTP/1.1 200 OK');
+		expect(found).toContain('>value</X:set>');
+	});
+
+	it('stores a dead property whose local name is `prop` intact', async () => {
+		// Same prefix-binding rule as `set`/`remove`: the <D:prop> container
+		// closes on ITS prefix, not on the first `</…prop>` in the document.
+		const set = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:prop xmlns:X="urn:x-example">vv</X:prop>'),
+		});
+		expect(set.status).toBe(207);
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:prop xmlns:X="urn:x-example"/>'),
+		});
+		const found = await res.text();
+		expect(found).toContain('HTTP/1.1 200 OK');
+		expect(found).toContain('>vv</X:prop>');
+	});
+
+	it('escapes a namespace URI taken from a single-quoted declaration', async () => {
+		// The client's own declaration is legal XML; re-emitting the URI raw
+		// into a double-quoted attribute breaks the quote pairing — and the
+		// malformed markup would be STORED on the PROPPATCH path.
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: `<D:propfind xmlns:D="DAV:" xmlns:Q='urn:a"b"'><D:prop><Q:missing/></D:prop></D:propfind>`,
+		});
+		const body = await res.text();
+		expect(res.status).toBe(207);
+		expect(body).not.toContain('urn:a"b"');
+		expect(body).toContain('urn:a&quot;b&quot;');
+		// Well-formed: no dangling quote pair inside an attribute value.
+		expect(body).toContain('xmlns:Q="urn:a&quot;b&quot;"');
+	});
+
 	it('migrates dead properties with the resource on MOVE', async () => {
 		await request('/a.txt', {
 			method: 'PROPPATCH',
@@ -1105,6 +1825,60 @@ describe('dead properties', () => {
 			body: '<D:propfind xmlns:D="DAV:"><D:propname/></D:propfind>',
 		});
 		expect(await names.text()).toContain('<X:tag xmlns:X="urn:x-example"/>');
+	});
+
+	it('stores a container whose text spells its own close tag', async () => {
+		// Legal XML: close markup inside a comment or CDATA section is text.
+		// A close-search blind to that truncates the container — the response
+		// then carries an unclosed comment (unparseable 207 forever) — and the
+		// inner element gets promoted to a property of its own.
+		const inner =
+			'<X:g xmlns:X="urn:x"><!-- </X:g> --><X:h xmlns:X="urn:x">h</X:h></X:g>' +
+			'<X:c xmlns:X="urn:x"><![CDATA[</X:c>]]></X:c>';
+		const set = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET(inner),
+		});
+		expect(set.status).toBe(207);
+		expect(validateXml(await set.text())).toBeNull();
+
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:g xmlns:X="urn:x"/><X:c xmlns:X="urn:x"/>'),
+		});
+		const body = await res.text();
+		expect(validateXml(body)).toBeNull();
+		expect(body).toContain('h</X:h></X:g>');
+		expect(body).toContain(']]></X:c>');
+		// The nested element never became a property of its own.
+		const probe = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:h xmlns:X="urn:x"/>'),
+		});
+		expect(await probe.text()).toContain('HTTP/1.1 404 Not Found');
+	});
+
+	it('binds a dotted-qname close tag to its own element', async () => {
+		// The close regex interpolates the qname: an unescaped `.` matches any
+		// character, so `</pQq:g>` would terminate a `<p.q:g>` container early.
+		const inner = '<p.q:g xmlns:p.q="urn:one" xmlns:pQq="urn:two">v<pQq:g>in</pQq:g></p.q:g>';
+		const set = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET(inner),
+		});
+		expect(set.status).toBe(207);
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<p.q:g xmlns:p.q="urn:one"/>'),
+		});
+		const body = await res.text();
+		expect(validateXml(body)).toBeNull();
+		expect(body).toContain('in</pQq:g></p.q:g>');
 	});
 });
 
@@ -1302,9 +2076,236 @@ describe('lock enforcement', () => {
 		expect((await request('/lockcoll', { method: 'UNLOCK', headers: { 'Lock-Token': token } })).status).toBe(204);
 		expect((await request('/lockcoll/file.txt', { method: 'PUT', body: 'free' })).status).toBe(204);
 	});
+
+	it('UNLOCK through a child releases the ancestor Infinity lock (§9.11)', async () => {
+		// The collection's lock covers the child, so unlocking with that token
+		// at the child MUST remove the lock — not answer 204 and leave the
+		// 423 in force until the timeout expires.
+		await request('/lockcol2', { method: 'MKCOL' });
+		const token = await lock('/lockcol2');
+		expect((await request('/lockcol2/file.txt', { method: 'PUT', body: 'guarded' })).status).toBe(423);
+
+		const unlock = await request('/lockcol2/file.txt', {
+			method: 'UNLOCK',
+			headers: { 'Lock-Token': token },
+		});
+		expect(unlock.status).toBe(204);
+		expect((await request('/lockcol2/file.txt', { method: 'PUT', body: 'free' })).status).toBe(201);
+		// …and the collection itself is free too.
+		expect((await request('/lockcol2', { method: 'DELETE' })).status).toBe(204);
+	});
+
+	it('UNLOCK with a token belonging to an unrelated lock is 409', async () => {
+		const token = await lock('/a.txt');
+		const res = await request('/dest.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
+		expect(res.status).toBe(409);
+		// The real lock is untouched.
+		expect((await request('/a.txt', { method: 'PUT', body: 'no' })).status).toBe(423);
+	});
+
+	it('LOCK with an If token that does not cover the URI is 412 (§9.10.6)', async () => {
+		const token = await lock('/a.txt');
+		const res = await request('/dest.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: `(${token})` },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(412);
+		// No second lock may be minted REUSING the presented token: that would
+		// make one token satisfy conditions on two unrelated resources.
+		expect((await request('/dest.txt', { method: 'PUT', body: 'free' })).status).toBe(204);
+		expect(
+			(await request('/dest.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } })).status,
+		).toBe(409);
+		// The original lock still owns its token.
+		expect((await request('/a.txt', { method: 'PUT', body: 'no' })).status).toBe(423);
+	});
+
+	it('does not invent properties from comments or CDATA', async () => {
+		// A flat tag scan over the fragment would answer for a prop that only
+		// appears inside a comment — and on the PROPPATCH path a comment
+		// inside <D:prop> would silently CREATE dead state. The `>` before the
+		// inner tag matters: it is what defeats a scan that merely skips to
+		// the first `>` of the comment/CDATA construct.
+		const find = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body:
+				'<D:propfind xmlns:D="DAV:" xmlns:X="urn:x"><D:prop><!-- n > 1 <D:displayname/> --> ' +
+				'<![CDATA[ a > b <D:getcontentlength/> ]]> <X:real/></D:prop></D:propfind>',
+		});
+		expect(find.status).toBe(207);
+		const findBody = await find.text();
+		expect(findBody).not.toContain('<D:displayname>');
+		expect(findBody).not.toContain('<D:getcontentlength>');
+
+		const patch = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<!-- x > y <X:ghost xmlns:X="urn:x"/> --></D:prop></D:set></D:propertyupdate>',
+		});
+		expect(patch.status).toBe(207);
+		const probe = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body:
+				'<D:propfind xmlns:D="DAV:"><D:prop>' +
+				'<X:ghost xmlns:X="urn:x"/></D:prop></D:propfind>',
+		});
+		// 404 = never created. A 200 here means a comment mutated our state.
+		expect(await probe.text()).toContain('HTTP/1.1 404 Not Found');
+	});
+
+	it('honours a shared scope declared with a hyphenated prefix', async () => {
+		// XML NameChar allows '-' and '.' in a prefix; the old `[A-Za-z0-9_]*`
+		// sniffing missed them and granted the request as EXCLUSIVE, which
+		// would wedge every other client's shared lock.
+		const body =
+			'<D:lockinfo xmlns:D="DAV:" xmlns:my-ns="urn:mine">' +
+			'<D:lockscope><my-ns:shared/></D:lockscope>' +
+			'<D:locktype><D:write/></D:locktype><D:owner>t</D:owner></D:lockinfo>';
+		const first = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body,
+		});
+		expect(first.status).toBe(200);
+		expect(await first.text()).toContain('<D:shared/>');
+
+		// Shared locks stack: a second shared request must be granted.
+		const second = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: SHARED_BODY,
+		});
+		expect(second.status).toBe(200);
+	});
+
+	it('LOCK without a lockinfo body or an If token is 400 (§9.10.1)', async () => {
+		const res = await request('/dest.txt', { method: 'LOCK' });
+		expect(res.status).toBe(400);
+		expect((await request('/dest.txt', { method: 'PUT', body: 'no lock was taken' })).status).toBe(204);
+	});
+
+	it('renders activelock in RFC 4918 §14.12 order with lockroot and lowercase depth', async () => {
+		const res = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		const xml = await res.text();
+		const scope = xml.indexOf('<D:lockscope>');
+		const type = xml.indexOf('<D:locktype>');
+		const root = xml.indexOf('<D:lockroot>');
+		expect(scope).toBeGreaterThan(-1);
+		expect(type).toBeGreaterThan(scope); // DTD order: lockscope before locktype
+		expect(root).toBeGreaterThan(type); // lockroot last, as §14.1 requires
+		expect(xml).toContain('<D:depth>infinity</D:depth>'); // §14.4: lowercase
+		expect(xml).toContain('<D:lockroot><D:href>/a.txt</D:href></D:lockroot>');
+		await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': res.headers.get('Lock-Token')! } });
+	});
+
+	it('keeps lockroot on the collection when refreshed through a descendant', async () => {
+		// §14.12 lockroot is the href of the resource that is LOCKED. Answering
+		// an indirect refresh through a child with the child's own href
+		// advertises the wrong root for the rest of the lock's life.
+		await request('/col2', { method: 'MKCOL' });
+		await request('/col2/file.txt', { method: 'PUT', body: 'in' });
+		const token = await lock('/col2');
+		const refresh = await request('/col2/file.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: `(${token})` },
+			body: LOCK_BODY,
+		});
+		expect(refresh.status).toBe(200);
+		expect(await refresh.text()).toContain('<D:lockroot><D:href>/col2/</D:href></D:lockroot>');
+
+		// …and a lockdiscovery PROPFIND on the child reports the same root.
+		const probe = await request('/col2/file.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body:
+				'<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>',
+		});
+		const body = await probe.text();
+		expect(body).toContain('<D:lockroot><D:href>/col2/</D:href></D:lockroot>');
+		expect(body).not.toContain('/col2/file.txt</D:href></D:lockroot>');
+
+		await request('/col2', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
+		await request('/col2/file.txt', { method: 'DELETE' });
+		await request('/col2', { method: 'DELETE' });
+	});
+
+	it('a resource-tag If does not substitute for a lockinfo body', async () => {
+		// `(<http://host/a.txt>)` is a resource-tag condition (§10.4.1), not a
+		// lock token: letting it satisfy the gate would mint a whole new lock
+		// from a body-less LOCK that §9.10.1 defines as a refresh.
+		const res = await request('/dest.txt', {
+			method: 'LOCK',
+			headers: { If: `(<${ORIGIN}/a.txt>)` },
+		});
+		expect(res.status).toBe(400);
+		expect((await request('/dest.txt', { method: 'PUT', body: 'no lock taken' })).status).toBe(204);
+	});
+
+	it('a refresh carrying an unrelated live token is 412 (§9.10.6)', async () => {
+		const own = await lock('/a.txt');
+		const other = await lock('/dest.txt');
+		const res = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: `(${own})(${other})` },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(412);
+		// Neither lock was disturbed.
+		expect((await request('/a.txt', { method: 'PUT', body: 'no' })).status).toBe(423);
+		expect((await request('/dest.txt', { method: 'PUT', body: 'no' })).status).toBe(423);
+	});
 });
 
 describe('audit hardening (Phase 2 regressions)', () => {
+	it('retries a failed relocate instead of stranding lock state', async () => {
+		// A single dropped relocate (DELETE/MOVE/COPY) would leave locks at
+		// the old path — stale 423s for whatever lands there next — or a lock
+		// that never followed a rename. safeRelocate must retry, not swallow.
+		let attempts = 0;
+		const store = new Proxy({} as DavStore, {
+			get: (_target, prop) =>
+				prop === 'relocate'
+					? async () => {
+							attempts += 1;
+							if (attempts < 3) throw new Error('transient DO blip');
+						}
+					: async () => {
+							throw new Error(`unexpected store call: ${String(prop)}`);
+						},
+		});
+		await safeRelocate(store, [{ src: '/x.txt', mode: 'forget', recursive: false }]);
+		expect(attempts).toBe(3);
+	}, 15000);
+
+	it('gives up after three relocate attempts without throwing', async () => {
+		let attempts = 0;
+		const store = new Proxy({} as DavStore, {
+			get: (_target, prop) =>
+				prop === 'relocate'
+					? async () => {
+							attempts += 1;
+							throw new Error('down');
+						}
+					: async () => {
+							throw new Error(`unexpected store call: ${String(prop)}`);
+						},
+		});
+		// Advisory state must never fail the HTTP response it trails.
+		await expect(safeRelocate(store, [{ src: '/x.txt', mode: 'forget', recursive: false }])).resolves.toBeUndefined();
+		expect(attempts).toBe(3);
+	}, 15000);
+
+
 	describe('path traversal containment', () => {
 		it('normalizes a percent-encoded ".." segment inside the path', async () => {
 			// %2e%2e decodes to the literal ".." and must get the identical
@@ -1461,6 +2462,47 @@ describe('audit hardening (Phase 2 regressions)', () => {
 			const res = await request('/nowhere.txt', { method: 'PUT', body: 'x' });
 			expect(res.status).toBe(502);
 		});
+
+		it('maps a missing parent (-11) and partial conflict (12) to 409', async () => {
+			// Both are namespace conflicts the client resolves by re-reading
+			// the tree (RFC 4918 §9.7.1/§9.9.3) — never a bare 500.
+			tb.precreateErrno = -11;
+			expect((await request('/n11.txt', { method: 'PUT', body: 'x' })).status).toBe(409);
+			tb.precreateErrno = 12;
+			expect((await request('/n12.txt', { method: 'PUT', body: 'x' })).status).toBe(409);
+		});
+
+		it('maps a shared-folder refusal (-22) to 403', async () => {
+			tb.precreateErrno = -22;
+			expect((await request('/shared.txt', { method: 'PUT', body: 'x' })).status).toBe(403);
+		});
+
+		it.each([-1, 6, -19])(
+			'maps auth errno %s to 401 carrying the Basic challenge',
+			async (errno) => {
+				// Auth-class errnos must re-authenticate like -6/400141: a 401
+				// without WWW-Authenticate makes davfs/rclone retry forever.
+				tb.precreateErrno = errno;
+				const res = await request('/auth-errno.txt', { method: 'PUT', body: 'x' });
+				expect(res.status).toBe(401);
+				expect(res.headers.get('WWW-Authenticate')).toBe(
+					'Basic realm="terabox WebDAV", charset="UTF-8"',
+				);
+			},
+		);
+
+		it.each([
+			[4, 400],
+			[2, 400],
+			[5, 409],
+			[7, 403],
+			[11, 403],
+			[15, 502],
+		])('maps non-auth upstream errno %s to %s, never a bare 500', async (errno, want) => {
+			tb.precreateErrno = errno;
+			const res = await request('/errno-map.txt', { method: 'PUT', body: 'x' });
+			expect(res.status).toBe(want);
+		});
 	});
 
 	describe('LOCK request validation and owner storage', () => {
@@ -1518,6 +2560,36 @@ describe('audit hardening (Phase 2 regressions)', () => {
 			expect(res.status).toBe(409);
 			expect(tb.find('/tree/sub/copied')).toBeUndefined();
 		});
+
+		it('MOVE onto an ANCESTOR of the source is 409, never a subtree wipe', async () => {
+			// Overwrite: T pre-deletes the destination first — and /docs
+			// CONTAINS the source, so the tree (recycle-bin only) would be
+			// destroyed before the move could even run.
+			const res = await request('/docs/b & c.txt', {
+				method: 'MOVE',
+				headers: { Destination: ORIGIN + '/docs' },
+			});
+			expect(res.status).toBe(409);
+			expect(tb.find('/docs/b & c.txt')).toBeDefined();
+			expect(tb.find('/docs')).toBeDefined();
+			expect(tb.find('/docs/sub&dir')).toBeDefined();
+		});
+
+		it('refuses to MOVE or COPY the mounted root itself', async () => {
+			// A root source normalises to `/`, whose descendant prefix is `//`
+			// — nothing matches, so the containment test would let it through.
+			const move = await request('/', {
+				method: 'MOVE',
+				headers: { Destination: ORIGIN + '/elsewhere' },
+			});
+			expect(move.status).toBe(403);
+			const copy = await request('/', {
+				method: 'COPY',
+				headers: { Destination: ORIGIN + '/elsewhere' },
+			});
+			expect(copy.status).toBe(403);
+			expect(tb.find('/elsewhere')).toBeUndefined();
+		});
 	});
 
 	describe('PUT stat-error propagation', () => {
@@ -1561,7 +2633,7 @@ describe('audit hardening (Phase 2 regressions)', () => {
 			const res = await request('/no-server-mtime.bin');
 			expect(res.status).toBe(200);
 			expect(res.headers.get('Last-Modified')).toBe(new Date(1704067200 * 1000).toUTCString());
-			expect(res.headers.get('ETag')).toBe('"1704067200-10-0"');
+			expect(res.headers.get('ETag')).toBe('W/"1704067200-10-0"');
 		});
 
 		it('falls back to ctime when mtime is missing too', async () => {
@@ -1634,5 +2706,235 @@ describe('audit hardening (Phase 2 regressions)', () => {
 			});
 			expect(res.status).toBe(400);
 		});
+	});
+});
+
+describe('HTTP write preconditions (RFC 7232)', () => {
+	it('accepts a matching If-Match and rejects a stale one with 412', async () => {
+		const head = await request('/a.txt', { method: 'HEAD' });
+		expect(head.status).toBe(200);
+		const etag = head.headers.get('ETag')!;
+		expect(etag).toBeTruthy();
+
+		const ok = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-Match': etag },
+			body: 'replaced under guard',
+		});
+		expect(ok.status).toBe(204); // existed → 204 No Content
+		expect(await (await request('/a.txt')).text()).toBe('replaced under guard');
+
+		// The tag fetched before the write is now stale: the guarded write
+		// must fail instead of silently overwriting again.
+		const stale = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-Match': etag },
+			body: 'must not land',
+		});
+		expect(stale.status).toBe(412);
+		expect(await (await request('/a.txt')).text()).toBe('replaced under guard');
+	});
+
+	it('If-None-Match: * creates but never overwrites', async () => {
+		const create = await request('/if-none-star.txt', {
+			method: 'PUT',
+			headers: { 'If-None-Match': '*' },
+			body: 'first',
+		});
+		expect(create.status).toBe(201);
+
+		const clash = await request('/if-none-star.txt', {
+			method: 'PUT',
+			headers: { 'If-None-Match': '*' },
+			body: 'second',
+		});
+		expect(clash.status).toBe(412);
+		expect(await (await request('/if-none-star.txt')).text()).toBe('first');
+	});
+
+	it('If-Match: * on a missing resource is 412', async () => {
+		const res = await request('/never-existed.txt', {
+			method: 'PUT',
+			headers: { 'If-Match': '*' },
+			body: 'nope',
+		});
+		expect(res.status).toBe(412);
+		expect(tb.find('/never-existed.txt')).toBeUndefined();
+	});
+
+	it('a past If-Unmodified-Since rejects the write', async () => {
+		const res = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-Unmodified-Since': 'Thu, 01 Jan 1970 00:00:00 GMT' },
+			body: 'must not land',
+		});
+		expect(res.status).toBe(412);
+		expect(await (await request('/a.txt')).text()).toBe('the quick brown fox\n');
+	});
+
+	it('DELETE honours If-Match too', async () => {
+		const head = await request('/dest.txt', { method: 'HEAD' });
+		const etag = head.headers.get('ETag')!;
+		const rejected = await request('/dest.txt', { method: 'DELETE', headers: { 'If-Match': '"nope"' } });
+		expect(rejected.status).toBe(412);
+		expect(tb.find('/dest.txt')).toBeDefined();
+		const allowed = await request('/dest.txt', { method: 'DELETE', headers: { 'If-Match': etag } });
+		expect(allowed.status).toBe(204);
+		expect(tb.find('/dest.txt')).toBeUndefined();
+	});
+
+	it('If-None-Match on a write uses WEAK comparison (W/"x" blocks a PUT)', async () => {
+		// RFC 7232 §6: unsafe methods with If-None-Match compare weakly, so the
+		// W/-prefixed tag davfs2 sends must collide with our strong etag —
+		// otherwise the guard silently never fires and the write lands.
+		const head = await request('/a.txt', { method: 'HEAD' });
+		const etag = head.headers.get('ETag')!;
+		expect(etag.startsWith('"')).toBe(true);
+
+		const rejected = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-None-Match': `W/${etag}` },
+			body: 'must not land',
+		});
+		expect(rejected.status).toBe(412);
+		expect(await (await request('/a.txt')).text()).toBe('the quick brown fox\n');
+
+		// A different validator (weakly) still allows the write.
+		const allowed = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-None-Match': 'W/"something-else"' },
+			body: 'landed',
+		});
+		expect(allowed.status).toBe(204);
+		expect(await (await request('/a.txt')).text()).toBe('landed');
+	});
+
+	it('MKCOL evaluates If-Match: a guard on a missing path is 412', async () => {
+		const guarded = await request('/never-dir', {
+			method: 'MKCOL',
+			headers: { 'If-Match': '"whatever"' },
+		});
+		expect(guarded.status).toBe(412);
+		expect(tb.find('/never-dir')).toBeUndefined();
+
+		// If-None-Match: * on an unmapped path is the "create if absent" case.
+		const create = await request('/fresh-dir', {
+			method: 'MKCOL',
+			headers: { 'If-None-Match': '*' },
+		});
+		expect(create.status).toBe(201);
+		expect(tb.find('/fresh-dir')).toBeDefined();
+	});
+
+	it('evaluate preconditions against live metadata, not the 60 s cache', async () => {
+		// Seed a deliberately stale etag into the read cache: a guarded write
+		// must still be judged on what Terabox says NOW.
+		const head = await request('/a.txt', { method: 'HEAD' });
+		const live = head.headers.get('ETag')!;
+		metaCacheSeedForTest('/a.txt', {
+			path: '/a.txt',
+			server_filename: 'a.txt',
+			isdir: 0,
+			size: 3,
+			server_mtime: 1704067200,
+			md5: 'ffffffffffffffffffffffffffffffff',
+		} as never);
+		expect(metaCacheHasForTest('/a.txt')).toBe(true);
+
+		const staleShouldBlock = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-Match': '"ffffffffffffffffffffffffffffffff"' },
+			body: 'nope',
+		});
+		expect(staleShouldBlock.status).toBe(412);
+
+		const liveShouldPass = await request('/a.txt', {
+			method: 'PUT',
+			headers: { 'If-Match': live },
+			body: 'guarded by the live etag',
+		});
+		expect(liveShouldPass.status).toBe(204);
+	});
+});
+
+describe('review round 6: preflight, Allow, control-plane shapes, Destination, headers', () => {
+	it('requires credentials for a CORS preflight (no unauthenticated branch)', async () => {
+		const res = await SELF.fetch(ORIGIN + '/', {
+			method: 'OPTIONS',
+			headers: { 'Access-Control-Request-Method': 'PROPFIND' },
+		});
+		expect(res.status).toBe(401);
+		expect(res.headers.get('WWW-Authenticate')).toContain('Basic');
+	});
+
+	it('PUT onto a collection answers 405 with the full Allow list', async () => {
+		const res = await request('/docs/', { method: 'PUT', body: 'x' });
+		expect(res.status).toBe(405);
+		expect(res.headers.get('Allow')).toContain('PROPFIND');
+		expect(res.headers.get('Allow')).toContain('OPTIONS');
+	});
+
+	it('resumable begin onto a collection answers 405 with Allow', async () => {
+		const res = await request('/.resumable', {
+			method: 'POST',
+			body: JSON.stringify({ path: '/docs', size: 4 }),
+		});
+		expect(res.status).toBe(405);
+		expect(res.headers.get('Allow')).toContain('PROPFIND');
+	});
+
+	it('MKCOL over an existing file answers 405 advertising discovery methods', async () => {
+		const res = await request('/a.txt', { method: 'MKCOL' });
+		expect(res.status).toBe(405);
+		// The old hardcoded five-method list omitted OPTIONS/PROPFIND/PROPPATCH,
+		// which made discovery clients conclude the resource supported nothing.
+		expect(res.headers.get('Allow')).toContain('PROPFIND');
+		expect(res.headers.get('Allow')).toContain('OPTIONS');
+	});
+
+	it('a root-level .resumable file stays reachable at its listed href', async () => {
+		// The control plane owns only its four method×shape routes; a real
+		// resource with the reserved name must still round-trip: the old
+		// textual prefix match listed it via PROPFIND but 404'd at GET.
+		const put = await request('/%2eresumable', { method: 'PUT', body: 'ghost content' });
+		expect(put.status).toBe(201);
+		const list = await request('/', { method: 'PROPFIND', headers: { Depth: '1' } });
+		expect(await list.text()).toContain('/.resumable');
+		const get = await request('/.resumable');
+		expect(get.status).toBe(200);
+		expect(await get.text()).toBe('ghost content');
+		// The four control routes still belong to the control plane.
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			body: JSON.stringify({ path: '/new-res.txt', size: 4 }),
+		});
+		expect(begin.status).toBe(200);
+	});
+
+	it('MOVE ignores a query string on a relative Destination', async () => {
+		const res = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: '/moved-q.txt?token=1' },
+		});
+		expect(res.status).toBe(201);
+		expect(tb.find('/moved-q.txt')).toBeTruthy();
+		expect(tb.find('/moved-q.txt?token=1')).toBeFalsy();
+		expect((await request('/a.txt')).status).toBe(404);
+	});
+
+	it('GET of a file carries nosniff and a sandbox CSP', async () => {
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+		expect(res.headers.get('Content-Security-Policy')).toBe("sandbox; default-src 'none'");
+	});
+
+	it('JSON errors and the auth 401 carry nosniff', async () => {
+		const missing = await request('/no-such-file.txt');
+		expect(missing.status).toBe(404);
+		expect(missing.headers.get('X-Content-Type-Options')).toBe('nosniff');
+		const unauth = await SELF.fetch(ORIGIN + '/no-such-file.txt');
+		expect(unauth.status).toBe(401);
+		expect(unauth.headers.get('X-Content-Type-Options')).toBe('nosniff');
 	});
 });

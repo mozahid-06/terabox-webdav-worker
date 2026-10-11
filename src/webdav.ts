@@ -15,7 +15,9 @@ import {
   type LockRecord,
   type PathState,
   type PropPatchOp,
+  type RelocateItem,
   type TokenCheck,
+  type UploadStore,
 } from './davstate';
 import type { Dentry, TeraboxItem } from './types';
 
@@ -23,6 +25,8 @@ import type { Dentry, TeraboxItem } from './types';
 export function resetDavVolatileState(): void {
   resetDavStoreState();
   metaCache.clear();
+  metaGenState.value = -1;
+  metaGenState.checkedAt = 0;
 }
 
 /** Test hook: current metaCache occupancy (cap assertions in dav.test.ts). */
@@ -90,13 +94,26 @@ export function rfc1123(ms: number): string {
   return new Date(ms).toUTCString();
 }
 
+/** Methods this surface implements — advertised on OPTIONS and any 405. */
+const ALLOW_HEADER =
+  'OPTIONS, PROPFIND, PROPPATCH, MKCOL, GET, HEAD, PUT, DELETE, COPY, MOVE, LOCK, UNLOCK';
+
 export function xmlEscape(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+  return (
+    value
+      // XML 1.0 §2.2 Char production: C0 controls (save TAB/LF/CR) and the
+      // non-characters cannot appear AT ALL — one raw NUL or ^A in a
+      // filename, dead prop or lock owner makes the whole PROPFIND 207
+      // unparseable (rclone/libxml2 hard-fail the listing). Names and props
+      // arrive from clients and from upstream, so they cannot all be
+      // rejected on input: this is the single emission choke point.
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '\uFFFD')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;')
+  );
 }
 
 /** WebDAV href (URL-encoded, trailing slash for collections). */
@@ -140,6 +157,25 @@ export function decodePathname(pathname: string): string {
     }
     if (name.includes('/')) throw new TeraboxError(-9, 'Invalid path encoding');
     parts.push(name);
+  }
+  return '/' + parts.join('/');
+}
+
+/**
+ * Sanitize an already-decoded absolute path (e.g. from a JSON body) by
+ * collapsing `.` and `..` segments. The resumable-upload JSON `path` skips
+ * `decodePathname`, so without this a crafted `..` could walk above a
+ * ROOT_ID mount before `toTera` concatenates it.
+ */
+function sanitizeDavPath(davPath: string): string {
+  const parts: string[] = [];
+  for (const segment of davPath.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(segment);
   }
   return '/' + parts.join('/');
 }
@@ -224,10 +260,29 @@ export function mtimeSecondsOf(item: TeraboxItem): number {
   return item.server_mtime || item.mtime || item.ctime || 0;
 }
 
+/**
+ * mtimeSecondsOf() through one validity rule: numeric AND inside the range
+ * `new Date` accepts. Anything else collapses to 0 (the epoch fallback
+ * PROPFIND already used for non-numerics), so GET, HEAD and PROPFIND always
+ * agree and no upstream timestamp can RangeError out of `toISOString()` —
+ * which500'd not just the poisoned child but its parent's whole Depth-1
+ * listing — or drop header-illegal bytes into an ETag (GET 500 while the
+ * same file's PROPFIND answered207).
+ */
+export function safeMtimeSeconds(item: TeraboxItem): number {
+  const seconds = Number(mtimeSecondsOf(item));
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.abs(seconds * 1000) <= 8.64e15 ? seconds : 0;
+}
+
 export function etagFor(item: TeraboxItem): string {
-  return item.md5
-    ? `"${item.md5}"`
-    : `"${mtimeSecondsOf(item)}-${item.size || 0}-${item.isdir || 0}"`;
+  if (item.md5) return `"${item.md5}"`;
+  // One-second mtime + size cannot distinguish two same-second rewrites, so
+  // RFC 7232 §2.3 requires a WEAK validator here. Quoted-strong it would
+  // satisfy If-Match/If-Range as "unchanged": a206 could then splice bytes
+  // the client's validator never described, and If-None-Match would304
+  // content that changed within the same second.
+  return `W/"${safeMtimeSeconds(item)}-${item.size || 0}-${item.isdir || 0}"`;
 }
 
 async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
@@ -236,7 +291,7 @@ async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
     path: item.path || '',
     isDir: (item.isdir || 0) > 0,
     size: item.size || 0,
-    mtimeMs: mtimeSecondsOf(item) * 1000,
+    mtimeMs: safeMtimeSeconds(item) * 1000,
     etag: etagFor(item),
     contentType: (item.isdir || 0) > 0 ? 'httpd/unix-directory' : contentTypeFor(item.server_filename || ''),
   };
@@ -294,13 +349,58 @@ async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<T
   return item;
 }
 
-/** Drop a mutated path, everything beneath it, and the parent's own entry. */
-function invalidateMeta(absPath: string): void {
+/**
+ * Drop a mutated path, everything beneath it, and the parent's own entry —
+ * then bump the generation held in the Durable Object so every OTHER isolate
+ * drops its own copy too. The read cache is per isolate, so without that bump
+ * the contract above ("writes through this worker invalidate immediately")
+ * would only hold inside the isolate that happened to serve the write.
+ * With DAV_STATE unbound the fallback store keeps its own counter per
+ * isolate, so this cross-isolate guarantee degrades to the 60 s TTL — the
+ * bound Durable Object is what makes the contract global.
+ * Advisory: the metadata is already correct on Terabox when this runs, so a
+ * failed bump must never fail the write.
+ */
+async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> {
   metaCache.delete(absPath);
   const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
   for (const key of [...metaCache.keys()]) if (key.startsWith(prefix)) metaCache.delete(key);
   const slash = absPath.lastIndexOf('/');
   metaCache.delete(slash <= 0 ? '/' : absPath.slice(0, slash));
+  if (!store) return;
+  try {
+    await store.metaGeneration(true);
+  } catch (error) {
+    console.log(`metaGen bump failed: ${String(error).slice(0, 200)}`);
+  }
+}
+
+/** Last shared generation this isolate reconciled against. */
+const metaGenState = { value: -1, checkedAt: 0 };
+/** Reconciliation cadence: one Durable Object read per second per isolate is
+ *  enough to keep stale size/etag/dlink off the response path (the previous
+ *  design served them for the full 60 s TTL in any isolate but the writer's)
+ *  while staying far below the cost of re-filling the cache every request. */
+const META_GEN_CHECK_MS = 1_000;
+
+/**
+ * Compare the shared generation with the one this isolate last saw and drop
+ * the local cache when it moved. Called once per request (throttled), so a
+ * write through any other isolate is visible here within a second instead of
+ * a minute. Fail-open: if the Durable Object is unreachable the cache is kept
+ * and staleness falls back to META_TTL_MS.
+ */
+async function syncMetaGeneration(store: DavStore): Promise<void> {
+  const now = Date.now();
+  if (now - metaGenState.checkedAt < META_GEN_CHECK_MS) return;
+  metaGenState.checkedAt = now;
+  try {
+    const gen = await store.metaGeneration(false);
+    if (metaGenState.value !== -1 && gen !== metaGenState.value) metaCache.clear();
+    metaGenState.value = gen;
+  } catch {
+    // advisory only — see doc comment
+  }
 }
 
 async function statResource(client: TeraboxClient, absPath: string): Promise<Dentry | null> {
@@ -310,6 +410,46 @@ async function statResource(client: TeraboxClient, absPath: string): Promise<Den
   } catch (error) {
     if (errIsNum(error, -9)) return null;
     throw error;
+  }
+}
+
+/**
+ * statResource, bypassing the 60 s read cache. Precondition evaluation must
+ * see live validators: a stale etag satisfies If-Match and lets a lost update
+ * through, and a stale mtime rejects a write that RFC 7232 says must pass.
+ * Only requests that actually carry conditionals pay for the extra round-trip.
+ */
+async function statResourceFresh(client: TeraboxClient, absPath: string): Promise<Dentry | null> {
+  try {
+    return await itemToDentry(await client.itemInfo(absPath, false));
+  } catch (error) {
+    if (errIsNum(error, -9)) return null;
+    throw error;
+  }
+}
+
+/**
+ * Advisory state (lock records, dead properties) for a write that has ALREADY
+ * committed upstream. It must never turn a real success into a 500 — and a
+ * DELETE that forgot nothing leaves its lock records behind, so a later
+ * recreation of the path would resurrect a stale 423.
+ */
+export async function safeRelocate(store: DavStore, items: RelocateItem[]): Promise<void> {
+  // Advisory bookkeeping (locks + dead props after DELETE/MOVE/COPY), but a
+  // dropped call leaves real damage: locks stranded at the old path (stale
+  // 423s for whatever lands there next) or a lock that never followed a
+  // rename. Retry transient failures instead of swallowing the first one.
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await store.relocate(items);
+      return;
+    } catch (error) {
+      if (attempt === 3) {
+        console.log(`relocate failed after 3 attempts: ${String(error).slice(0, 200)}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+    }
   }
 }
 
@@ -367,6 +507,57 @@ function parseIfHeader(header: string): IfTerm[][] | null {
  * already-locked resource, which is what mod_dav does and litmus expects),
  * then lock enforcement applies.
  */
+/**
+ * RFC 7232 conditionals on an unsafe method: If-Match, then If-Unmodified-
+ * Since (only when If-Match is absent), then If-None-Match. A client that
+ * says "only if unchanged" (`If-Match`, or `If-None-Match: *` for
+ * create-only) must get 412 rather than a silent overwrite — before this,
+ * those headers were evaluated only on reads, so the write path ignored
+ * them entirely. Strong comparison per §2.3.2: a weak `W/…` tag never
+ * matches a strong one.
+ */
+async function checkHttpPreconditions(
+  request: Request,
+  client: TeraboxClient,
+  path: string,
+): Promise<Response | null> {
+  const ifMatch = request.headers.get('If-Match');
+  const ifNoneMatch = request.headers.get('If-None-Match');
+  if (ifMatch) {
+    const dentry = await statResourceFresh(client, path);
+    if (!dentry) return errorResponse('Precondition Failed', 412);
+    if (ifMatch.trim() !== '*') {
+      const tags = ifMatch.split(',').map((tag) => tag.trim());
+      if (!tags.includes(dentry.etag)) return errorResponse('Precondition Failed', 412);
+    }
+  } else {
+    const ifUnmodified = request.headers.get('If-Unmodified-Since');
+    if (ifUnmodified) {
+      const since = Date.parse(ifUnmodified);
+      if (!Number.isNaN(since)) {
+        const dentry = await statResourceFresh(client, path);
+        if (dentry && dentry.mtimeMs > since) return errorResponse('Precondition Failed', 412);
+      }
+    }
+  }
+  if (ifNoneMatch) {
+    const dentry = ifNoneMatch.trim() === '*' || ifNoneMatch.includes('"')
+      ? await statResourceFresh(client, path)
+      : null;
+    if (dentry) {
+      if (ifNoneMatch.trim() === '*') return errorResponse('Precondition Failed', 412);
+      // §6: an unsafe method with If-None-Match uses the WEAK comparison
+      // function, so `W/"abc"` and `"abc"` are the same validator (davfs2
+      // emits W/-prefixed tags unless drop_weak_etags is set). Comparing
+      // literally would never match and the write would land anyway.
+      const strip = (tag: string) => tag.replace(/^W\//, '');
+      const tags = ifNoneMatch.split(',').map(strip);
+      if (tags.includes(strip(dentry.etag))) return errorResponse('Precondition Failed', 412);
+    }
+  }
+  return null;
+}
+
 async function checkMutationPreconditions(
   request: Request,
   client: TeraboxClient,
@@ -374,6 +565,11 @@ async function checkMutationPreconditions(
   path: string,
   opts?: { enforce?: boolean },
 ): Promise<Response | null> {
+  // HTTP conditionals first (§6 evaluation order): a failing If-Match is a
+  // definitive 412 regardless of how the WebDAV If header below evaluates.
+  const httpPre = await checkHttpPreconditions(request, client, path);
+  if (httpPre) return httpPre;
+
   const ifHeader = request.headers.get('If');
   const presented = collectTokens(ifHeader);
   let check: TokenCheck | null = null;
@@ -394,7 +590,7 @@ async function checkMutationPreconditions(
           if (!term.negated && !value) invalidTokens.add(term.value);
         } else {
           if (etag === undefined) {
-            const dentry = await statResource(client, path);
+            const dentry = await statResourceFresh(client, path);
             etag = dentry ? dentry.etag : null;
           }
           value = etag !== null && etag === term.value.trim();
@@ -441,20 +637,26 @@ async function enforceWrite(
   return errorResponse('Locked', 423);
 }
 
-function activelockXml(rec: LockRecord): string {
+function activelockXml(rec: LockRecord, href: string): string {
   // Ceil, not floor: the record was created milliseconds ago with
   // expiresAt = now + 3600s, so the remaining value is 3599.99x — flooring
   // intermittently rendered Second-3599 on the very response that granted a
   // Second-3600 lock (a real sub-second flake, caught by the suite).
   const seconds = Math.max(0, Math.ceil((rec.expiresAt - Date.now()) / 1000));
+  // Element order follows the RFC 4918 §14.12 content model exactly
+  // (lockscope, locktype, depth, owner?, timeout?, locktoken?, lockroot),
+  // and §14.4 defines the depth value in lowercase — strict clients compare
+  // it literally. `lockroot` is SHOULDed in every lockdiscovery value.
+  const depth = rec.depth === 'Infinity' ? 'infinity' : rec.depth;
   return (
     `<D:activelock>` +
-    `<D:locktype><D:write/></D:locktype>` +
     `<D:lockscope><D:${rec.scope}/></D:lockscope>` +
-    `<D:depth>${xmlEscape(rec.depth)}</D:depth>` +
+    `<D:locktype><D:write/></D:locktype>` +
+    `<D:depth>${xmlEscape(depth)}</D:depth>` +
     (rec.owner ? ownerElementXml(rec.owner) : '') +
     `<D:timeout>Second-${seconds}</D:timeout>` +
     `<D:locktoken><D:href>${xmlEscape(rec.token)}</D:href></D:locktoken>` +
+    `<D:lockroot><D:href>${xmlEscape(rec.rootHref ?? href)}</D:href></D:lockroot>` +
     `</D:activelock>`
   );
 }
@@ -472,9 +674,9 @@ function ownerElementXml(owner: string): string {
   return validateXml(wrapped) === null ? wrapped : `<D:owner>${xmlEscape(owner)}</D:owner>`;
 }
 
-function lockdiscoveryMarkup(locks: LockRecord[]): string {
+function lockdiscoveryMarkup(locks: LockRecord[], href: string): string {
   if (locks.length === 0) return '<D:lockdiscovery/>';
-  return `<D:lockdiscovery>${locks.map(activelockXml).join('')}</D:lockdiscovery>`;
+  return `<D:lockdiscovery>${locks.map((rec) => activelockXml(rec, href)).join('')}</D:lockdiscovery>`;
 }
 
 /** Advisory-lock support advertised in `supportedlock` (gdrive parity). */
@@ -540,10 +742,15 @@ export function parsePropfindBody(xml: string): PropQuery {
   }
   // First <...prop> element (the tag itself: "propfind"/"propname" fail the
   // trailing ">" / whitespace requirement and can never match here).
-  const open = body.match(/<(?:[A-Za-z0-9_]+:)?prop(?:\s[^>]*)?>/);
+  const open = body.match(/<([A-Za-z_][\w.-]*:)?prop(?:\s[^>]*)?>/);
   if (!open || open.index === undefined) return all;
   const inner = body.slice(open.index + open[0].length);
-  const close = inner.match(/<\/(?:[A-Za-z0-9_]+:)?prop\s*>/);
+  // Bind the close to the open tag's own prefix: a dead property named
+  // `prop` in another namespace (`<X:prop>…</X:prop>` inside <D:prop>) must
+  // not terminate the container — the prefix-agnostic match cut the markup
+  // in half and echoed an unclosed element into the 207.
+  const pfx = (open[1] ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const close = inner.match(new RegExp(`</${pfx}prop\\s*>`));
   if (!close || close.index === undefined) return all;
 
   const requested = parsePropElements(inner.slice(0, close.index), collectXmlScope(body));
@@ -582,7 +789,7 @@ function multistatus(
       parts.push(`<D:propstat>`);
       parts.push(`<D:prop>`);
       for (const name of ALLPROP_ORDER) parts.push(STATIC_PROPS[name]?.(r) ?? '');
-      parts.push(lockdiscoveryMarkup(locks));
+      parts.push(lockdiscoveryMarkup(locks, r.href));
       if (dead) for (const markup of Object.values(dead)) parts.push(markup);
       parts.push(`</D:prop>`);
       parts.push(`<D:status>HTTP/1.1 200 OK</D:status>`);
@@ -601,7 +808,7 @@ function multistatus(
       const missing: string[] = [];
       for (const el of query.requested) {
         if (el.key === `{${DAV_NS}}lockdiscovery`) {
-          ok.push(lockdiscoveryMarkup(locks));
+          ok.push(lockdiscoveryMarkup(locks, r.href));
           continue;
         }
         const build = el.key.startsWith(`{${DAV_NS}}`) ? STATIC_PROPS[el.local] : undefined;
@@ -658,11 +865,13 @@ export async function handleWebDav(
   request: Request,
   client: TeraboxClient,
   opts?: { basePath?: string; rootId?: string },
-  store: DavStore = createDavStore({}),
+  store: DavStore & UploadStore = createDavStore({}),
 ): Promise<Response> {
   const mount = makeMount(opts);
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
+  // Cross-isolate freshness: drop anything another isolate invalidated.
+  await syncMetaGeneration(store);
 
   // Base path (gdrive parity): the surface only exists below `mount.base`.
   // The bare base redirects to its slash form; anything else outside 404s.
@@ -684,6 +893,37 @@ export async function handleWebDav(
     return errorResponse(error instanceof Error ? error.message : 'Bad Request', 400);
   }
   if (davPath.length > 1 && davPath.endsWith('/')) davPath = davPath.slice(0, -1);
+
+  // Resumable-upload control plane: `/.resumable/...` under the base path.
+  // These drive Terabox's native multipart across many small HTTP requests so
+  // a single body never exceeds Cloudflare's ~100 MB account-plan edge cap
+  // (which would 413 before this Worker ever runs).
+  //
+  // Gated on METHOD × ROUTE SHAPE after path decoding, not on a bare textual
+  // prefix: the old prefix match owned every method on `/.resumable`, so a
+  // real resource with that name was listed by PROPFIND yet 404 at its own
+  // href (GET) and uncreatable (PUT of the literal name). Everything that is
+  // not one of the four control routes — GET/PROPFIND/OPTIONS/HEAD of the
+  // resource, PUT of the root name, DELETE of the root name — now falls
+  // through to WebDAV. The POST routes remain a deliberate root-namespace
+  // reservation (documented in handleResumable); uploadIds are base64-ish
+  // and may contain `/`, so the shapes are greedy like the handler's own
+  // regexes.
+  if (davPath === '/.resumable') {
+    if (method === 'POST') return handleResumable(request, client, store, davPath, mount); // begin
+  } else if (davPath.startsWith('/.resumable/')) {
+    const rest = davPath.slice('/.resumable'.length);
+    if (method === 'PUT' && /^\/.+\/\d+$/.test(rest)) {
+      return handleResumable(request, client, store, davPath, mount); // chunk upload
+    }
+    if (method === 'DELETE' && rest.length > 1) {
+      return handleResumable(request, client, store, davPath, mount); // cancel
+    }
+    if (method === 'POST' && /^\/.+\/finalize$/.test(rest)) {
+      return handleResumable(request, client, store, davPath, mount); // finalize
+    }
+  }
+
   const absPath = mount.toTera(davPath);
 
   switch (method) {
@@ -691,8 +931,7 @@ export async function handleWebDav(
       return new Response(null, {
         status: 204,
         headers: {
-          Allow:
-            'OPTIONS, PROPFIND, PROPPATCH, MKCOL, GET, HEAD, PUT, DELETE, COPY, MOVE, LOCK, UNLOCK',
+          Allow: ALLOW_HEADER,
           DAV: '1, 2',
           'MS-Author-Via': 'DAV',
         },
@@ -728,8 +967,278 @@ export async function handleWebDav(
       return handleMoveCopy(request, client, store, absPath, method, mount);
 
     default:
-      return errorResponse('Method Not Allowed', 405);
+      // RFC 7231 §6.5.5: a 405 carries Allow so the client learns what works.
+      return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
   }
+}
+
+/**
+ * Resumable-upload control plane for bodies larger than Cloudflare's ~100 MB
+ * account-plan edge cap. Drives Terabox's native multipart (precreate →
+ * superfile2 chunks → create) across many small HTTP requests so no single
+ * request body ever trips the 413. Session state lives in the Durable Object
+ * so any isolate can serve the next chunk.
+ *
+ *   POST /.resumable                      begin: { path, size } → { uploadId, chunkSize, chunkCount }
+ *   PUT  /.resumable/:id/:index           one chunk (raw body) → { md5 }
+ *   POST /.resumable/:id/finalize         create + verify → 201/204
+ *   DELETE /.resumable/:id                cancel a session → 204 (404 unknown)
+ */
+async function handleResumable(
+  request: Request,
+  client: TeraboxClient,
+  store: DavStore & UploadStore,
+  pathname: string,
+  mount: Mount,
+): Promise<Response> {
+  const method = request.method.toUpperCase();
+  const rest = pathname.slice('/.resumable'.length);
+
+  // POST /.resumable — begin a session.
+  if (rest === '' && method === 'POST') {
+    let body: { path?: string; size?: number; mtimeMs?: number; overwriteMode?: number };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return errorResponse('Invalid JSON', 400);
+    }
+    const davPath = typeof body.path === 'string' ? body.path : '';
+    // Integer size only: a fractional `size` would make every chunk PUT fail
+    // its exact-length check forever ("expected 1.5"), wedging the session.
+    const size = typeof body.size === 'number' && Number.isInteger(body.size) && body.size >= 0
+      ? body.size
+      : -1;
+    if (!davPath.startsWith('/') || size < 0) return errorResponse('path and size required', 400);
+    // The JSON path is already percent-decoded, but still needs `.`/`..`
+    // collapsing — otherwise a crafted `..` walks above a ROOT_ID mount.
+    const absPath = mount.toTera(sanitizeDavPath(davPath));
+    if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
+
+    // Resumable upload is a write: it must respect locks and HTTP
+    // preconditions exactly like PUT (the resource is created at finalize).
+    const pre = await checkMutationPreconditions(request, client, store, absPath);
+    if (pre) return pre;
+
+    const parentCheck = await requireParent(client, absPath);
+    if (parentCheck) return parentCheck;
+
+    // Mirror handlePut: only errno -9 ("doesn't exist") makes the target
+    // creatable — a network/gate failure must propagate, not be silently
+    // reinterpreted as a fresh create (which then misreports later).
+    let existing: { isDir: boolean } | null = null;
+    try {
+      existing = await statResourceFresh(client, absPath);
+    } catch (error) {
+      if (!errIsNum(error, -9)) throw error;
+      existing = null;
+    }
+    // Resumable upload onto a collection is a method mismatch (RFC 7231).
+    if (existing && existing.isDir) return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
+    const existed = Boolean(existing);
+    const mtimeMs = typeof body.mtimeMs === 'number' && Number.isFinite(body.mtimeMs)
+      ? body.mtimeMs
+      : Date.now();
+    // The conflict policy is never the client's choice: rtype 1 (rename on
+    // conflict) would make Terabox write `file(1).txt` while we answer 204
+    // at the requested path — a success reported for a path never touched.
+    // Mirror PUT exactly: existing → overwrite, new → create-only.
+    const overwriteMode = existed ? 3 : 0;
+
+    const begun = await client.beginResumable(absPath, size, mtimeMs);
+    await store.init({
+      path: absPath,
+      size,
+      mtimeMs,
+      uploadId: begun.uploadId,
+      uploadSign: begun.uploadSign,
+      chunkSize: begun.chunkSize,
+      chunkCount: begun.chunkCount,
+      chunkMd5s: new Array(begun.chunkCount).fill(null),
+      hosts: begun.hosts,
+      overwriteMode,
+      createdAt: Date.now(),
+    });
+    return Response.json({
+      uploadId: begun.uploadId,
+      chunkSize: begun.chunkSize,
+      chunkCount: begun.chunkCount,
+    });
+  }
+
+  // PUT /.resumable/:id/:index — one chunk (raw body). The uploadId is
+  // base64-ish (may contain `:`, `=`, `+`, `/`), so greedily match it and
+  // anchor only the leading slash and trailing /index.
+  const chunkMatch = /^\/(.+)\/(\d+)$/.exec(rest);
+  if (chunkMatch && method === 'PUT') {
+    const [, uploadId, indexRaw] = chunkMatch;
+    const index = Number(indexRaw);
+    const session = await store.get(uploadId!);
+    if (!session) return errorResponse('Unknown upload session', 404);
+    if (!Number.isInteger(index) || index < 0 || index >= session.chunkCount) {
+      return errorResponse('Chunk index out of range', 400);
+    }
+    const isLast = index === session.chunkCount - 1;
+    const expectedLast = session.size - session.chunkSize * (session.chunkCount - 1);
+    const expected = isLast ? expectedLast : session.chunkSize;
+    // Refuse an over-long body from its Content-Length BEFORE buffering it:
+    // otherwise a client can push the ~100 MB edge limit into a 4 MiB-chunk
+    // session just to earn a 400, spending isolate memory on the way.
+    const declaredHeader = request.headers.get('Content-Length');
+    const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
+    if (Number.isFinite(declared) && declared !== expected) {
+      return errorResponse(`Chunk size mismatch: got ${declared}, expected ${expected}`, 400);
+    }
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    // Last chunk may be short; all others must be exactly chunkSize.
+    if (bytes.byteLength !== expected) {
+      return errorResponse(
+        `Chunk size mismatch: got ${bytes.byteLength}, expected ${expected}`,
+        400,
+      );
+    }
+
+    // Try each candidate host until one accepts (wrong-cluster 403 parity
+    // with the non-resumable path). Prefer the host that accepted the last
+    // chunk so a bad leading candidate isn't retried on every request; fall
+    // back to the session's ordered list.
+    const orderedHosts = session.activeHost
+      ? [session.activeHost, ...session.hosts.filter((h) => h !== session.activeHost)]
+      : session.hosts;
+    let md5 = '';
+    let acceptedHost = '';
+    let lastError: unknown;
+    for (const host of orderedHosts) {
+      try {
+        md5 = await client.uploadResumableChunk(host, session.path, session.uploadId, session.uploadSign, index, bytes);
+        acceptedHost = host;
+        break;
+      } catch (error) {
+        lastError = error;
+        // Every error here comes from THIS host (the loop body talks to
+        // nothing else): a 200-with-error-body, an empty md5 or a cluster
+        // refusal must all advance the ladder. Gating on `httpStatus` let a
+        // non-HTTP failure abort the failover the ladder exists for.
+        if (error instanceof TeraboxError) continue;
+        throw error;
+      }
+    }
+    if (!md5) throw lastError ?? new TeraboxError(-5, 'No upload host accepted the chunk');
+    await store.recordChunk(session.uploadId, index, md5, acceptedHost);
+    return Response.json({ md5 });
+  }
+
+  // DELETE /.resumable/:id — cancel an upload session. Without this the
+  // only way out of an abandoned upload was the 24 h TTL sweep, which kept
+  // every uploaded chunk's md5 list (and the memory) alive that long.
+  const cancelMatch = /^\/(.+)$/.exec(rest);
+  if (cancelMatch && method === 'DELETE') {
+    const [, uploadId] = cancelMatch;
+    const session = await store.get(uploadId!);
+    if (!session) return errorResponse('Unknown upload session', 404);
+    await store.delete(session.uploadId);
+    return new Response(null, { status: 204 });
+  }
+
+  // POST /.resumable/:id/finalize — create + verify. Same base64-ish id.
+  const finalizeMatch = /^\/(.+)\/finalize$/.exec(rest);
+  if (finalizeMatch && method === 'POST') {
+    const [, uploadId] = finalizeMatch;
+    const session = await store.get(uploadId!);
+    if (!session) return errorResponse('Unknown upload session', 404);
+    // Atomic claim. The old check (read `finalized`, then go) let two
+    // concurrent finalize POSTs — a client retry racing a slow create — both
+    // pass and race a second create, whose loser got -8 (path conflict) for a
+    // file that DID land. The claim also replays a completed finalize, so a
+    // lost-response retry answers with the original status instead of 404.
+    const claim = await store.claimFinalize(session.uploadId);
+    if (claim.kind === 'unknown') return errorResponse('Unknown upload session', 404);
+    if (claim.kind === 'replay') return new Response(null, { status: claim.status });
+    if (claim.kind === 'busy') {
+      // Another request owns the finalize. Wait for its verdict instead of
+      // racing it; if it fails and releases the claim, take it over.
+      let owned = false;
+      for (let attempt = 0; attempt < 16 && !owned; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const current = await store.get(session.uploadId);
+        if (!current) return errorResponse('Unknown upload session', 404);
+        if (current.finalized !== undefined) return new Response(null, { status: current.finalized });
+        if (current.finalizing === undefined) {
+          const retried = await store.claimFinalize(session.uploadId);
+          if (retried.kind === 'owned') owned = true;
+          else if (retried.kind === 'replay') return new Response(null, { status: retried.status });
+        }
+      }
+      if (!owned) return errorResponse('Finalize already in progress', 409);
+    }
+    // This request holds the claim: every exit below must either record the
+    // verdict (marked) or hand the claim back in `finally`, or a retry would
+    // sit out the stale-claim TTL on a session nobody is working on.
+    let marked = false;
+    try {
+      // This branch is what actually creates the resource, so it is the write
+      // that must respect a lock taken after `begin` (and any If header the
+      // client sent with the finalize POST).
+      const locked = await enforceWrite(request, store, session.path);
+      if (locked) return locked;
+      const missing = session.chunkMd5s.findIndex((m) => m === null);
+      if (missing !== -1) return errorResponse(`Chunk ${missing} not uploaded`, 409);
+      const chunkMd5s = session.chunkMd5s as string[];
+      try {
+        await client.finalizeResumable(
+          session.path,
+          session.uploadId,
+          session.uploadSign,
+          session.size,
+          session.mtimeMs,
+          chunkMd5s,
+          session.overwriteMode,
+        );
+      } catch (error) {
+        // Same conflict mapping as handlePut: -8 (path conflict) and -11 are
+        // resource-exists conditions, not server faults.
+        if (errIsNum(error, -8) || errIsNum(error, -11)) return errorResponse('Conflict', 409);
+        if (error instanceof TeraboxError && error.integrity) {
+          // The file exists upstream but failed the control-md5 comparison, so
+          // re-running create would produce the same mismatch forever (and a
+          // create-only session would answer -8 → 409, poisoning the retry).
+          // Record the failure so a retry replays it instead of re-creating.
+          try {
+            await store.markFinalized(session.uploadId, 502);
+            marked = true;
+          } catch (markError) {
+            console.log(`markFinalized(502) failed for ${session.uploadId}: ${String(markError).slice(0, 200)}`);
+          }
+          await invalidateMeta(session.path, store);
+          return errorResponse('Integrity check failed', 502);
+        }
+        throw error;
+      }
+      // Keep the session (marked finalized) rather than deleting it, so a
+      // lost-response retry replays the same status; the TTL sweep reaps it.
+      // Best-effort: the file already exists on Terabox at this point, so a
+      // failure in advisory state (a DO still running pre-deploy code, a
+      // transient storage error) must not turn a completed upload into a 500.
+      const status = session.overwriteMode > 0 ? 204 : 201;
+      try {
+        await store.markFinalized(session.uploadId, status);
+        marked = true;
+      } catch (error) {
+        console.log(`markFinalized failed for ${session.uploadId}: ${String(error).slice(0, 200)}`);
+      }
+      await invalidateMeta(session.path, store);
+      return new Response(null, { status });
+    } finally {
+      if (!marked) {
+        try {
+          await store.releaseFinalize(session.uploadId);
+        } catch (error) {
+          console.log(`releaseFinalize failed for ${session.uploadId}: ${String(error).slice(0, 200)}`);
+        }
+      }
+    }
+  }
+
+  return errorResponse('Not Found', 404);
 }
 
 async function handlePropfind(
@@ -804,26 +1313,26 @@ async function handleMkcol(
   // (litmus checks this), not silently ignored.
   const body = await request.text();
   if (body.length > 0) return errorResponse('Unsupported Media Type', 415);
-  const existing = await statResource(client, absPath);
+  const existing = await statResourceFresh(client, absPath);
   if (existing) {
     return new Response(
       '<D:error xmlns:D="DAV:"><D:exception>MethodNotAllowed</D:exception>' +
         '<D:message>The resource you tried to create already exists</D:message></D:error>',
-      { status: 405, headers: { 'Content-Type': 'application/xml; charset=utf-8', Allow: 'GET, HEAD, DELETE, MOVE, COPY' } },
+      { status: 405, headers: { 'Content-Type': 'application/xml; charset=utf-8', Allow: ALLOW_HEADER } },
     );
   }
   // RFC 4918 §9.3.1: an intermediate collection must already exist (409).
   const parentCheck = await requireParent(client, absPath);
   if (parentCheck) return parentCheck;
-  const locked = await enforceWrite(request, store, absPath);
-  if (locked) return locked;
+  const pre = await checkMutationPreconditions(request, client, store, absPath);
+  if (pre) return pre;
   try {
     await client.mkdir(absPath);
   } catch (error) {
-    if (errIsNum(error, -8)) return errorResponse('Method Not Allowed', 405);
+    if (errIsNum(error, -8)) return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
     throw error;
   }
-  invalidateMeta(absPath);
+  await invalidateMeta(absPath, store);
   return new Response(null, { status: 201 });
 }
 
@@ -860,23 +1369,59 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     if (errIsNum(error, -9)) return errorResponse('Not Found', 404);
     throw error;
   }
-  if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405);
+  // RFC 7231 §6.5.5: every405 carries Allow — the collection root is the
+  // most-probed405 on this surface.
+  if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
 
-  const lastModifiedMs = mtimeSecondsOf(item) * 1000;
+  const lastModifiedMs = safeMtimeSeconds(item) * 1000;
   const headers = new Headers({
     'Content-Type': contentTypeFor(item.server_filename || ''),
     'Last-Modified': rfc1123(lastModifiedMs),
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
+    // Account content served from the authenticated API origin: sandbox the
+    // document so an attacker-influenced HTML file cannot run script (and
+    // replay the browser-cached Basic credentials against this origin), and
+    // block every subresource load. `default-src 'none'` does not govern a
+    // direct image/PDF navigation, and WebDAV clients ignore both headers.
+    'Content-Security-Policy': "sandbox; default-src 'none'",
   });
   const etag = etagFor(item);
   headers.set('ETag', etag);
 
+  // RFC 7232 §6 order: steps 1–2 gate even safe methods — a client asking
+  // "only if unchanged" must get412, not the changed bytes. §5 precedence
+  // keeps404 above them: this point is only reached when the resource
+  // exists (the itemInfo 404 returns earlier).
+  const ifMatch = request.headers.get('If-Match');
+  if (ifMatch) {
+    // §2.3.2 strong comparison: a weak validator never matches — an md5-less
+    // etag (W/"…") fails every If-Match but `*`.
+    if (ifMatch.trim() !== '*') {
+      const tags = ifMatch.split(',').map((tag) => tag.trim());
+      if (etag.startsWith('W/') || !tags.includes(etag)) {
+        return errorResponse('Precondition Failed', 412);
+      }
+    }
+  } else {
+    const ifUnmodified = request.headers.get('If-Unmodified-Since');
+    if (ifUnmodified) {
+      const since = Date.parse(ifUnmodified);
+      if (!Number.isNaN(since) && lastModifiedMs > since) {
+        return errorResponse('Precondition Failed', 412);
+      }
+    }
+  }
+
   // Conditional GET: validators answer before a download link is minted.
   const inm = request.headers.get('If-None-Match');
   if (inm) {
-    const tags = inm.split(',').map((tag) => tag.trim());
-    if (inm.trim() === '*' || tags.includes(etag) || tags.includes(`W/${etag}`)) {
+    // §3.2 weak comparison: W/"x" and "x" are the same validator — normalize
+    // both sides so a client echoing (or stripping) the weak md5-less tag
+    // revalidates the same.
+    const stripWeak = (tag: string) => tag.replace(/^W\//, '');
+    const tags = inm.split(',').map((tag) => stripWeak(tag.trim()));
+    if (inm.trim() === '*' || tags.includes(stripWeak(etag))) {
       return new Response(null, {
         status: 304,
         headers: { ETag: etag, 'Last-Modified': rfc1123(lastModifiedMs), 'Cache-Control': 'no-store' },
@@ -901,10 +1446,14 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   let range = request.headers.get('Range');
   const ifRange = request.headers.get('If-Range');
   if (range && ifRange) {
-    // RFC 7233 §3.2: a stale If-Range validator means "send it all".
+    // RFC 7233 §3.2: the comparison is an EXACT match — deliberately NOT the
+    // "earlier or equal" of If-Unmodified-Since — and strong. A date newer
+    // than what we sent (or an mtime that rolled back) is stale, and a weak
+    // md5-less etag can never authorize a splice: either would mix fresh
+    // bytes into the client's old partial copy.
     const fresh = ifRange.includes('"')
-      ? ifRange === etag
-      : !Number.isNaN(Date.parse(ifRange)) && lastModifiedMs <= Date.parse(ifRange);
+      ? !etag.startsWith('W/') && ifRange === etag
+      : !Number.isNaN(Date.parse(ifRange)) && Date.parse(rfc1123(lastModifiedMs)) === Date.parse(ifRange);
     if (!fresh) range = null;
   }
   if (range) {
@@ -913,7 +1462,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     // CDN verdict for out-of-bounds ranges varies by cluster — some answer
     // 400141 gates — and the fallback dlinks are gated anyway.) Anything we
     // can't parse is ignored and the full entity is served (RFC 7233 §3.1).
-    const spec = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const spec = /^bytes=(\d*)-(\d*)$/i.exec(range); // ABNF is case-insensitive (RFC 7230 §3.2.2)
     const size = item.size || 0;
     let unsatisfiable = false;
     if (!spec || (spec[1] === '' && spec[2] === '')) {
@@ -932,6 +1481,13 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
           'Content-Range': `bytes */${size}`,
         },
       });
+    }
+    if (spec) {
+      // Canonicalize: our parse is case-insensitive, but the origin matches
+      // `bytes=` literally when slicing — a satisfied `BYTES=0-2` must ride
+      // upstream as `bytes=0-2` or the range silently degrades to a full
+      // 200 body.
+      range = `bytes=${spec[1]}-${spec[2]}`;
     }
   }
 
@@ -1060,7 +1616,7 @@ async function handlePut(
 
   let existing: { isDir: boolean } | null = null;
   try {
-    existing = await statResource(client, absPath);
+    existing = await statResourceFresh(client, absPath);
   } catch (error) {
     // Only "doesn't exist" makes the target creatable; a network/gate
     // failure (-5, -6, …) must propagate instead of being silently
@@ -1069,7 +1625,7 @@ async function handlePut(
     existing = null;
   }
   // PUT onto a collection is a method mismatch (RFC 7231 §6.5.5).
-  if (existing && existing.isDir) return errorResponse('Method Not Allowed', 405);
+  if (existing && existing.isDir) return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
   const existed = Boolean(existing);
 
   try {
@@ -1082,10 +1638,17 @@ async function handlePut(
     if (errIsNum(error, -11)) {
       return errorResponse('Conflict', 409);
     }
+    if (error instanceof TeraboxError && error.integrity) {
+      // create() already replaced the old content upstream, so the cached
+      // entry describes a file that no longer exists — drop it even though
+      // the response is an error.
+      await invalidateMeta(absPath, store);
+      return errorResponse('Integrity check failed', 502);
+    }
     throw error;
   }
 
-  invalidateMeta(absPath);
+  await invalidateMeta(absPath, store);
   return new Response(null, { status: existed ? 204 : 201 });
 }
 
@@ -1097,13 +1660,13 @@ async function handleDelete(
   mount: Mount,
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
-  const resource = await statResource(client, absPath);
+  const resource = await statResourceFresh(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
   const pre = await checkMutationPreconditions(request, client, store, absPath);
   if (pre) return pre;
   await client.fileOperation('delete', [{ path: absPath }]);
-  await store.relocate([{ src: absPath, mode: 'forget', recursive: resource.isDir }]);
-  invalidateMeta(absPath);
+  await safeRelocate(store, [{ src: absPath, mode: 'forget', recursive: resource.isDir }]);
+  await invalidateMeta(absPath, store);
   return new Response(null, { status: 204 });
 }
 
@@ -1119,19 +1682,41 @@ async function handleMoveCopy(
   if (!destinationHeader) return errorResponse('Bad Request', 400);
   const rawDestination = destinationHeader.trim();
   let destDav: string;
+  let destUrl: URL | null = null;
   try {
-    destDav = decodePathname(new URL(rawDestination).pathname);
+    destUrl = new URL(rawDestination);
+    destDav = decodePathname(destUrl.pathname);
   } catch {
     // RFC 4918 §10.3: an absolute-path Destination (no scheme/host) is legal.
     if (!rawDestination.startsWith('/')) return errorResponse('Bad Request', 400);
     try {
-      destDav = decodePathname(rawDestination);
+      // Query and fragment are not path components (RFC 3986 §3.4/§3.5):
+      // keeping them would silently create a node literally named
+      // `/moved.txt?x=1` while the client looks for `/moved.txt`.
+      destDav = decodePathname(rawDestination.split(/[?#]/, 1)[0]!);
     } catch {
       return errorResponse('Bad Request', 400);
     }
   }
+  // RFC 4918 §10.3 contemplates 502 when the Destination names another
+  // server. Silently treating a foreign host as a local path would move the
+  // file somewhere the client never asked for and hide the bug entirely.
+  if (destUrl && destUrl.host !== new URL(request.url).host) {
+    return errorResponse('Destination on another server', 502);
+  }
   // The Destination carries the base path like any other URL; a target
   // outside the mounted surface is not ours to write to.
+  // `new URL('//other.host/x')` throws without a base: a protocol-relative
+  // reference names ANOTHER origin, and the path branch below would treat
+  // `/other.host/x` as a local path — moving the file somewhere the client
+  // never asked for and bypassing the foreign-host check entirely.
+  if (!destUrl && rawDestination.startsWith('//')) {
+    const resolved = new URL(rawDestination, request.url);
+    if (resolved.host !== new URL(request.url).host) {
+      return errorResponse('Destination on another server', 502);
+    }
+    destDav = decodePathname(resolved.pathname);
+  }
   if (mount.base) {
     if (destDav === mount.base) destDav = '/';
     else if (destDav.startsWith(mount.base + '/')) destDav = destDav.slice(mount.base.length);
@@ -1144,21 +1729,33 @@ async function handleMoveCopy(
   const overwrite = (request.headers.get('Overwrite') || 'T').toUpperCase() === 'T';
   const same = joinPath(srcPath) === joinPath(destPath);
 
+  // The mounted surface itself is not a movable/copiable resource — without
+  // this, a root source reaches the containment test below as `/`, whose
+  // prefix becomes `//`, so no destination is ever recognised as a member.
+  if (mount.isRoot(srcPath) || srcPath === '') return errorResponse('Forbidden', 403);
+
   if (same) {
     if (method === 'MOVE') return new Response(null, { status: 204 });
     return errorResponse('Forbidden', 403);
   }
 
-  const srcResource = await statResource(client, srcPath);
+  const srcResource = await statResourceFresh(client, srcPath);
   if (!srcResource) return errorResponse('Not Found', 404);
 
   // RFC 4918 §9.9.3/§9.9.4: a collection must not be copied or moved into
   // its own descendant tree — Terabox would either duplicate the tree
-  // server-side or loop, so reject before touching the API.
-  if (srcResource.isDir) {
+  // server-side or loop, so reject before touching the API. The reverse
+  // direction matters just as much: a destination that is an ANCESTOR of
+  // the source is an existing collection, so Overwrite: T would pre-delete
+  // that subtree first — destroying the source along with it — and then
+  // fail the move. Answer 409 before anything is removed.
+  {
     const srcNorm = joinPath(srcPath);
     const destNorm = joinPath(destPath);
-    if (destNorm.startsWith(srcNorm + '/')) return errorResponse('Conflict', 409);
+    if (destNorm === '/' || srcNorm === '/' || destNorm.startsWith(srcNorm + '/') ||
+        srcNorm.startsWith(destNorm + '/')) {
+      return errorResponse('Conflict', 409);
+    }
   }
 
   // `If` conditions always target the request resource. A lock on the
@@ -1170,7 +1767,7 @@ async function handleMoveCopy(
   });
   if (pre) return pre;
 
-  const destResource = await statResource(client, destPath);
+  const destResource = await statResourceFresh(client, destPath);
   const destLock = await enforceWrite(request, store, destPath);
   if (destLock) return destLock;
   if (destResource && !overwrite) return errorResponse('Precondition Failed', 412);
@@ -1186,8 +1783,8 @@ async function handleMoveCopy(
     // therefore clears the target first — if the move then fails, the old
     // node is recoverable from the recycle bin, never destroyed.
     await client.fileOperation('delete', [{ path: destPath }]);
-    await store.relocate([{ src: destPath, mode: 'forget', recursive: destResource.isDir }]);
-    invalidateMeta(destPath);
+    await safeRelocate(store, [{ src: destPath, mode: 'forget', recursive: destResource.isDir }]);
+    await invalidateMeta(destPath, store);
   }
 
   const recursive = srcResource.isDir;
@@ -1196,8 +1793,8 @@ async function handleMoveCopy(
     // Depth: 0 on a collection: only the (empty) collection is created,
     // never its members (litmus copy_shallow).
     await client.mkdir(destPath);
-    await store.relocate([{ src: srcPath, dest: destPath, mode: 'copy', recursive: false }]);
-    invalidateMeta(destPath);
+    await safeRelocate(store, [{ src: srcPath, dest: destPath, mode: 'copy', recursive: false }]);
+    await invalidateMeta(destPath, store);
     return new Response(null, { status: destResource && overwrite ? 204 : 201 });
   }
 
@@ -1210,7 +1807,7 @@ async function handleMoveCopy(
     },
   ]);
 
-  await store.relocate([
+  await safeRelocate(store, [
     {
       src: srcPath,
       dest: destPath,
@@ -1221,8 +1818,8 @@ async function handleMoveCopy(
     },
   ]);
 
-  invalidateMeta(srcPath);
-  invalidateMeta(destPath);
+  await invalidateMeta(srcPath, store);
+  await invalidateMeta(destPath, store);
   return new Response(null, { status: destResource && overwrite ? 204 : 201 });
 }
 
@@ -1242,12 +1839,30 @@ async function handleLock(
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   const body = await request.text();
+  // A resource-tag If (`<http://host/x>`, RFC 4918 §10.4.1) is not a lock
+  // token: it must not satisfy the gates below, or a body-less LOCK would
+  // mint a brand-new lock (§9.10.1 makes a body-less LOCK a refresh, and a
+  // refresh needs an actual lock token).
+  const presentedLocks = collectTokens(request.headers.get('If')).filter(
+    (t) => !/^[a-z][a-z0-9+.-]*:\/\//i.test(t),
+  );
   // RFC 4918 §9.10: a LOCK body is XML; validate it exactly like PROPFIND /
   // PROPPATCH. Without this a client could persist ill-formed markup as the
   // lock owner and break every other client's lockdiscovery PROPFIND 207.
   if (body.trim()) {
     const xmlError = validateXml(body);
     if (xmlError) return errorResponse(`Invalid XML: ${xmlError}`, 400);
+    // RFC 4918 §9.10.1: a LOCK that creates a lock carries a lockinfo body.
+    // Defaulting a missing scope to "exclusive" grants a lock the client
+    // never asked for; a refresh (signalled by If) may omit it.
+    const scopeBlock = body.match(
+      /<(?:[A-Za-z_][\w.-]*:)?lockscope(?:\s[^>]*)?>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?lockscope\s*>/,
+    );
+    if (!scopeBlock && presentedLocks.length === 0) {
+      return errorResponse('lockscope missing', 400);
+    }
+  } else if (presentedLocks.length === 0) {
+    return errorResponse('lockinfo body required', 400);
   }
   const resource = await statResource(client, absPath);
 
@@ -1258,9 +1873,12 @@ async function handleLock(
     : 3600;
 
   const scopeBlock = body.match(
-    /<(?:[A-Za-z0-9_]+:)?lockscope(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?lockscope\s*>/,
+    /<(?:[A-Za-z_][\w.-]*:)?lockscope(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?lockscope\s*>/,
   );
-  const shared = /(?:^|<)[A-Za-z0-9_]*:?shared[\s/>]/.test(scopeBlock?.[1] ?? '');
+  // Prefixes may contain '-' and '.' (XML NameChar), which the old
+  // `[A-Za-z0-9_]*` class missed — such a shared request was granted as
+  // EXCLUSIVE, wedging every other client's shared lock.
+  const shared = /<(?:[A-Za-z_][\w.-]*:)?shared(?:\s[^>]*)?\/?>/.test(scopeBlock?.[1] ?? '');
   const ownerBlock = body.match(
     /<(?:[A-Za-z0-9_]+:)?owner(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?owner\s*>/,
   );
@@ -1277,16 +1895,28 @@ async function handleLock(
     owner,
     presented: collectTokens(request.headers.get('If')),
     seconds,
+    rootHref: encodeHref(mount.href(absPath), resource?.isDir ?? false),
   });
-  if (!outcome.ok) return errorResponse('Locked', 423);
+  if (!outcome.ok) {
+    // §9.10.6: an If naming a lock that does not cover this URI is a failed
+    // precondition (412); an actual lock conflict is 423. Preconditions are
+    // evaluated first, exactly as on PUT.
+    if (outcome.precondition) return errorResponse('Precondition Failed', 412);
+    return errorResponse('Locked', 423);
+  }
+  if (!outcome.record) return errorResponse('Internal Server Error', 500);
 
-  return lockResponse(outcome.record, outcome.refreshed || resource ? 200 : 201);
+  return lockResponse(
+    outcome.record,
+    outcome.refreshed || resource ? 200 : 201,
+    encodeHref(mount.href(absPath), resource?.isDir ?? false),
+  );
 }
 
-function lockResponse(rec: LockRecord, status: number): Response {
+function lockResponse(rec: LockRecord, status: number, href: string): Response {
   const xml =
     `<?xml version="1.0" encoding="utf-8"?>` +
-    `<D:prop xmlns:D="${DAV_NS}"><D:lockdiscovery>${activelockXml(rec)}</D:lockdiscovery></D:prop>`;
+    `<D:prop xmlns:D="${DAV_NS}"><D:lockdiscovery>${activelockXml(rec, href)}</D:lockdiscovery></D:prop>`;
   return new Response(xml, {
     status,
     headers: {
@@ -1338,20 +1968,30 @@ async function handleProppatch(
   const scope = collectXmlScope(body);
   const ops: PropPatchOp[] = [];
   const propstats: string[] = [];
-  const opRe = /<(?:[A-Za-z_][\w.-]*:)?(set|remove)(?:\s[^>]*)?>/g;
+  // Capture the operation element's own namespace prefix: a dead property
+  // named `set`/`remove` in ANOTHER namespace (`<X:set>…</X:set>` inside
+  // <D:prop>) must not terminate the <D:set> block — the old prefix-agnostic
+  // close match cut the stored markup in half (ill-formed markup surviving
+  // as a dead prop). An operation's own close tag always shares its prefix.
+  const opRe = /<(?:([A-Za-z_][\w.-]*):)?(set|remove)(?:\s[^>]*)?>/g;
   let om: RegExpExecArray | null;
   while ((om = opRe.exec(body)) !== null) {
-    const op = om[1];
+    const prefix = (om[1] ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const op = om[2]!;
     const rest = body.slice(opRe.lastIndex);
-    const closeRe = new RegExp(`</(?:[A-Za-z_][\\w.-]*:)?${op}\\s*>`);
+    const closeRe = new RegExp(`</${prefix ? `${prefix}:` : ''}${op}\\s*>`);
     const cm = rest.match(closeRe);
     if (!cm || cm.index === undefined) continue;
     const inner = rest.slice(0, cm.index);
     opRe.lastIndex += cm.index + cm[0].length;
-    const propOpen = inner.match(/<(?:[A-Za-z_][\w.-]*:)?prop(?:\s[^>]*)?>/);
+    const propOpen = inner.match(/<([A-Za-z_][\w.-]*:)?prop(?:\s[^>]*)?>/);
     if (!propOpen || propOpen.index === undefined) continue;
     const after = inner.slice(propOpen.index + propOpen[0].length);
-    const propClose = after.match(/<\/(?:[A-Za-z_][\w.-]*:)?prop\s*>/);
+    // Same prefix binding as parsePropfindBody: a property named `prop` in
+    // another namespace must not cut the <D:prop> block short (the truncated
+    // fragment is what gets STORED as the dead property).
+    const propPfx = (propOpen[1] ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const propClose = after.match(new RegExp(`</${propPfx}prop\\s*>`));
     const fragment =
       propClose && propClose.index !== undefined ? after.slice(0, propClose.index) : after;
     const elements = parsePropElements(fragment, scope);

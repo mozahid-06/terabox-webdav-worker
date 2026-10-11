@@ -1,6 +1,13 @@
-import { SELF } from 'cloudflare:test';
+import { env, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+	createDavStore,
+	MemoryDavStore,
+	UPLOAD_FINALIZED_GRACE_MS,
+	UPLOAD_SESSION_TTL_MS,
+} from '../src/davstate';
 import { resetDavVolatileState } from '../src/webdav';
+import { resetTeraboxCaches } from '../src/terabox';
 import { AUTH, MockTerabox, ORIGIN, installMock } from './helpers';
 
 // This vitest project binds DAV_STATE to the DavState Durable Object (see
@@ -26,8 +33,9 @@ const LOCK_BODY =
 
 beforeEach(() => {
 	// Clears the per-isolate metaCache; DO storage is isolated per test by
-	// the pool's storage snapshots.
+	// the pool's storage snapshots. Terabox module caches are isolate-global.
 	resetDavVolatileState();
+	resetTeraboxCaches();
 	tb = new MockTerabox();
 	// Fresh paths per test: the DavState DO caches locks/props in memory
 	// (storage is only read at construction), so unique names keep cases
@@ -135,6 +143,32 @@ describe('DAV_STATE Durable Object', () => {
 		expect(freed.status).toBe(201);
 	});
 
+	it('serializes concurrent finalize POSTs through the DO: one create, both 201', async () => {
+		// RemoteDavStore.claimFinalize → DavState `/upload-claim` is the
+		// production path for the atomic claim; a wrong route name or a
+		// non-atomic read-modify-write would show up here as a second create.
+		const racePath = `/do-race-${crypto.randomUUID().slice(0, 8)}.txt`;
+		const data = new Uint8Array(64).fill(5);
+		const begin = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: racePath, size: data.byteLength }),
+		});
+		expect(begin.status).toBe(200);
+		const { uploadId } = (await begin.json()) as { uploadId: string };
+		const put = await request(`/.resumable/${uploadId}/0`, { method: 'PUT', body: data });
+		expect(put.status).toBe(200);
+
+		const before = tb.createCalls;
+		const [first, second] = await Promise.all([
+			request(`/.resumable/${uploadId}/finalize`, { method: 'POST' }),
+			request(`/.resumable/${uploadId}/finalize`, { method: 'POST' }),
+		]);
+		expect(first.status).toBe(201);
+		expect(second.status).toBe(201);
+		expect(tb.createCalls - before).toBe(1);
+	}, 30000);
+
 	it('rejects a foreign lock token with 423 through the DO', async () => {
 		const lock = await request(srcPath, {
 			method: 'LOCK',
@@ -149,5 +183,98 @@ describe('DAV_STATE Durable Object', () => {
 			body: 'forged',
 		});
 		expect(res.status).toBe(423);
+	});
+});
+
+describe('upload session retention', () => {
+	// Unit-level: MemoryDavStore owns the expiry rules, and time is seeded by
+	// writing past timestamps into the session rather than faking timers
+	// (fake timers do not run inside the workerd test pool).
+	const baseSession = {
+		path: '/x.bin',
+		size: 4,
+		mtimeMs: 0,
+		uploadId: 'u1',
+		uploadSign: 's',
+		chunkSize: 4,
+		chunkCount: 1,
+		chunkMd5s: ['a'] as Array<string | null>,
+		hosts: ['h'],
+		overwriteMode: 0,
+	};
+
+	it('keeps a finalized session for the retry grace window', async () => {
+		const store = new MemoryDavStore();
+		await store.init({ ...baseSession, createdAt: Date.now(), finalized: 201, finalizedAt: Date.now() - 60_000 });
+		const got = await store.get('u1');
+		expect(got?.finalized).toBe(201);
+	});
+
+	it('drops a finalized session once the grace window lapses', async () => {
+		const store = new MemoryDavStore();
+		await store.init({
+			...baseSession,
+			createdAt: Date.now() - 60 * 60_000,
+			finalized: 201,
+			finalizedAt: Date.now() - UPLOAD_FINALIZED_GRACE_MS - 1000,
+		});
+		expect(await store.get('u1')).toBeUndefined();
+	});
+
+	it('claims finalize once, replays after marking, and rejects a rival claim', async () => {
+		const store = new MemoryDavStore();
+		await store.init({ ...baseSession, createdAt: Date.now() });
+		expect(await store.claimFinalize('u1')).toEqual({ kind: 'owned' });
+		expect(await store.claimFinalize('u1')).toEqual({ kind: 'busy' });
+		expect(await store.claimFinalize('missing')).toEqual({ kind: 'unknown' });
+		await store.markFinalized('u1', 201);
+		expect(await store.claimFinalize('u1')).toEqual({ kind: 'replay', status: 201 });
+	});
+
+	it('releases a failed claim so the next attempt can take it', async () => {
+		const store = new MemoryDavStore();
+		await store.init({ ...baseSession, createdAt: Date.now() });
+		expect(await store.claimFinalize('u1')).toEqual({ kind: 'owned' });
+		await store.releaseFinalize('u1');
+		expect(await store.claimFinalize('u1')).toEqual({ kind: 'owned' });
+	});
+
+	it('keeps an unfinished session up to the full TTL', async () => {
+		const store = new MemoryDavStore();
+		await store.init({ ...baseSession, createdAt: Date.now() - UPLOAD_SESSION_TTL_MS + 60_000 });
+		expect(await store.get('u1')).toBeDefined();
+		await store.init({ ...baseSession, uploadId: 'u2', createdAt: Date.now() - UPLOAD_SESSION_TTL_MS - 1000 });
+		expect(await store.get('u2')).toBeUndefined();
+	});
+});
+
+describe('metadata generation (cross-isolate cache invalidation)', () => {
+	it('bumps the shared generation on every write', async () => {
+		// The read-side metadata cache lives per isolate; without this shared
+		// counter a write in one isolate would leave the others serving stale
+		// size/etag/dlink for the full TTL.
+		const store = createDavStore(env);
+		const before = await store.metaGeneration(false);
+		const res = await request(`/gen-${crypto.randomUUID().slice(0, 8)}.txt`, {
+			method: 'PUT',
+			body: 'fresh',
+		});
+		expect(res.status).toBe(201);
+		const after = await store.metaGeneration(false);
+		expect(after).toBeGreaterThan(before);
+	});
+
+	it('reads the current generation without bumping it', async () => {
+		const store = createDavStore(env);
+		const first = await store.metaGeneration(false);
+		const second = await store.metaGeneration(false);
+		expect(second).toBe(first);
+	});
+
+	it('tracks a generation in the per-isolate memory fallback', async () => {
+		const store = new MemoryDavStore();
+		expect(await store.metaGeneration(false)).toBe(0);
+		expect(await store.metaGeneration(true)).toBe(1);
+		expect(await store.metaGeneration(false)).toBe(1);
 	});
 });
