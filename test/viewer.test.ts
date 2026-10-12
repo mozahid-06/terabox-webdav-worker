@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetDavVolatileState } from '../src/webdav';
+import { contentTypeFor, resetDavVolatileState } from '../src/webdav';
 import { resetTeraboxCaches } from '../src/terabox';
 import { VIEWER_HTML, VIEWER_MARKER } from '../src/viewer';
 import { AUTH, MockTerabox, ORIGIN, installMock } from './helpers';
@@ -140,8 +140,26 @@ describe('preview MIME types match what the viewer previews', () => {
 	it('serves image/video types the page will render (nosniff refuses octet-stream)', async () => {
 		tb.seed('/docs/icon.svg', { content: '<svg xmlns="http://www.w3.org/2000/svg"/>' });
 		tb.seed('/docs/clip.ogv', { content: 'ogg-video-bytes' });
+		tb.seed('/docs/movie.mkv', { content: 'mkv-bytes' });
+		tb.seed('/docs/track.aac', { content: 'aac-bytes' });
 		expect((await request('/docs/icon.svg')).headers.get('Content-Type')).toBe('image/svg+xml');
 		expect((await request('/docs/clip.ogv')).headers.get('Content-Type')).toBe('video/ogg');
+		expect((await request('/docs/movie.mkv')).headers.get('Content-Type')).toBe('video/x-matroska');
+		expect((await request('/docs/track.aac')).headers.get('Content-Type')).toBe('audio/aac');
+	});
+
+	it('every client preview extension resolves to a matching server media type', () => {
+		// VID/IMG/AUD in the page must stay a subset of the server MIME map —
+		// a previewable-but-octet-stream file breaks under nosniff.
+		const grab = (name: string): string[] => {
+			const m = new RegExp(`var ${name} = \\[([^\\]]+)\\]`).exec(VIEWER_HTML);
+			expect(m).not.toBeNull();
+			return m![1]!.split(',').map((e) => e.trim().replace(/^'|'$/g, ''));
+		};
+		for (const ext of grab('VID')) expect(contentTypeFor(`/x.${ext}`)).toMatch(/^video\//);
+		for (const ext of grab('AUD')) expect(contentTypeFor(`/x.${ext}`)).toMatch(/^audio\//);
+		for (const ext of grab('IMG')) expect(contentTypeFor(`/x.${ext}`)).toMatch(/^image\//);
+		for (const ext of grab('TXT').slice(0, 6)) expect(contentTypeFor(`/x.${ext}`)).toMatch(/^(text\/|application\/)/);
 	});
 });
 

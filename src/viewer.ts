@@ -211,6 +211,14 @@ tbody tr { cursor: default; }
 }
 .name a:hover { text-decoration: underline; }
 .chev { color: var(--muted); flex: none; }
+.badge.k-img { color: #7BC96F; border-color: #2f5333; }
+.badge.k-vid { color: #C7A9F5; border-color: #4b3d6b; }
+.badge.k-aud { color: #F0B37E; border-color: #5b4634; }
+.badge.k-txt { color: #8CB8F0; border-color: #33465e; }
+.ic-dir { color: #D9A441; }
+.ic-file { color: #93A7C6; }
+.ic-up { color: var(--muted); }
+tr.up .name a { color: var(--muted); font-weight: 600; }
 .badge {
   flex: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -310,6 +318,27 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .uploads:empty { display: none; }
 .uploads .ok { color: #7BC96F; }
 .uploads .bad { color: var(--accent); }
+/* Upload progress lines: the bar sits behind the status text. */
+.pline {
+  position: relative;
+  overflow: hidden;
+  border-radius: 3px;
+  padding: 2px 6px;
+  margin: 2px -6px;
+}
+.pline i {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: rgba(123, 201, 111, 0.18);
+  transition: width 160ms var(--ease-out);
+}
+.pline.indet i { width: 30%; animation: pline-slide 900ms ease-in-out infinite alternate; }
+.pline span { position: relative; }
+.pline.ok { color: #7BC96F; }
+.pline.bad { color: var(--accent); }
+@keyframes pline-slide { from { transform: translateX(-100%); } to { transform: translateX(320%); } }
+.drawer-body audio { width: min(440px, 100%); display: block; margin: 0 auto; }
 
 @media (max-width: 640px) {
   th:nth-child(3), td:nth-child(3) { display: none; }
@@ -317,6 +346,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   td, th { padding-left: 14px; padding-right: 14px; }
 }
 @media (prefers-reduced-motion: reduce) {
+  .pline.indet i { animation: none; }
   /* Keep the show/hide (it carries state), drop the movement. */
   .drawer { transition: opacity 150ms linear, visibility 0s linear 150ms; transform: none; }
   .drawer.open { transition: opacity 150ms linear, visibility 0s; transform: none; }
@@ -370,8 +400,9 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     '<D:displayname/><D:resourcetype/><D:getcontentlength/><D:getlastmodified/>' +
     '</D:prop></D:propfind>';
 
-  var IMG = ['png','jpg','jpeg','gif','webp','svg','avif','bmp','ico'];
-  var VID = ['mp4','webm','ogv','m4v'];
+  var IMG = ['png','jpg','jpeg','gif','webp','svg','avif','bmp','ico','heic'];
+  var VID = ['mp4','webm','ogv','m4v','mkv','mov','avi','ts','mts','m2ts','flv','wmv','mpg','mpeg','3gp'];
+  var AUD = ['mp3','m4a','aac','wav','flac','ogg','oga','opus','wma','aiff','aif'];
   var TXT = ['txt','md','markdown','json','js','mjs','cjs','ts','tsx','jsx','css','scss','less','html','htm','xml','yml','yaml','toml','ini','conf','cfg','sh','bash','zsh','py','rb','php','go','rs','java','c','h','cpp','hpp','cs','sql','log','csv','env','lock','properties','srt','vtt','tex','r','swift','kt','lua','pl','diff','patch'];
 
   var crumbs = document.getElementById('crumbs');
@@ -453,6 +484,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     var ext = extOf(name);
     if (IMG.indexOf(ext) >= 0) return 'img';
     if (VID.indexOf(ext) >= 0) return 'vid';
+    if (AUD.indexOf(ext) >= 0) return 'aud';
     if (TXT.indexOf(ext) >= 0) return 'txt';
     if (ext === '' && BARE.indexOf(name.toLowerCase()) >= 0) return 'txt';
     return 'other';
@@ -479,27 +511,37 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
   }
 
-  function svg(paths) {
+  function icon(paths, cls, fill) {
     var NS = 'http://www.w3.org/2000/svg';
     var s = document.createElementNS(NS, 'svg');
     s.setAttribute('viewBox', '0 0 16 16');
     s.setAttribute('width', '14');
     s.setAttribute('height', '14');
-    s.setAttribute('fill', 'none');
-    s.setAttribute('stroke', 'currentColor');
-    s.setAttribute('stroke-width', '1.5');
-    s.setAttribute('stroke-linecap', 'round');
-    s.setAttribute('stroke-linejoin', 'round');
+    if (fill) {
+      s.setAttribute('fill', 'currentColor');
+      s.setAttribute('stroke', 'none');
+    } else {
+      s.setAttribute('fill', 'none');
+      s.setAttribute('stroke', 'currentColor');
+      s.setAttribute('stroke-width', '1.5');
+      s.setAttribute('stroke-linecap', 'round');
+      s.setAttribute('stroke-linejoin', 'round');
+    }
+    if (cls) s.setAttribute('class', cls);
     s.setAttribute('aria-hidden', 'true');
     var p = document.createElementNS(NS, 'path');
     p.setAttribute('d', paths);
     s.appendChild(p);
     return s;
   }
-  var ICON_DLO = 'M8 2v8m0 0 3-3m-3 3L5 5M3 12v1a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1';
-  var ICON_DIR = 'M6 3l1.5 1.5L6 6M2.5 4.5h4M2.5 8h11M2.5 11.5h11';
-  var ICON_EDT = 'M11 3l2 2-7.5 7.5L3 13l.5-2.5L11 3z';
-  var ICON_DEL = 'M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.7 8a1 1 0 0 0 1 1h3.6a1 1 0 0 0 1-1l.7-8';
+  function svg(paths, cls) { return icon(paths, cls, false); }
+  function svgF(paths, cls) { return icon(paths, cls, true); }
+  var ICON_DLO = 'M8 2.5V10m0 0 3-3m-3 3-3-3M3 12v1.2c0 .44.36.8.8.8h8.4c.44 0 .8-.36.8-.8V12';
+  var ICON_DIR = 'M1.75 4.5c0-.97.78-1.75 1.75-1.75h2.6c.47 0 .92.19 1.26.53l.8.8h4.34c.97 0 1.75.78 1.75 1.75v5.42c0 .97-.78 1.75-1.75 1.75H3.5a1.75 1.75 0 0 1-1.75-1.75z';
+  var ICON_FL = 'M4.5 2.25h4.4l3.1 3.1v8.4h-7.5zM8.9 2.25v3.1h3.1';
+  var ICON_UP = 'M8 13V3.5M8 3.5 4.75 6.75M8 3.5l3.25 3.25';
+  var ICON_EDT = 'm11 2.6 2.4 2.4-7.4 7.4-3.2.8.8-3.2zM9.9 3.7l2.4 2.4';
+  var ICON_DEL = 'M2.75 4.5h10.5M6.25 4.5v-.9a.9.9 0 0 1 .9-.9h1.7a.9.9 0 0 1 .9.9v.9M4.4 4.5l.55 8.2A1.15 1.15 0 0 0 6.09 13.75h3.82a1.15 1.15 0 0 0 1.14-1.05l.55-8.2M6.6 7v4.4M9.4 7v4.4';
 
   function childHrefs(doc) {
     var out = [];
@@ -538,6 +580,33 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     return out;
   }
 
+  function mountHome() {
+    var home = document.body.getAttribute('data-base') || '/';
+    if (home.charAt(home.length - 1) !== '/') home += '/';
+    return home;
+  }
+
+  function upRow() {
+    // Classic FTP-style parent entry — one row above the listing.
+    var tr = document.createElement('tr');
+    tr.className = 'up';
+    var tdName = document.createElement('td');
+    var wrap = el('div', 'name');
+    var link = document.createElement('a');
+    link.href = base.slice(0, base.lastIndexOf('/', base.length - 2) + 1);
+    link.textContent = '..';
+    link.title = 'Go to parent folder';
+    link.setAttribute('aria-label', 'Parent folder');
+    wrap.appendChild(svg(ICON_UP, 'ic-up'));
+    wrap.appendChild(link);
+    tdName.appendChild(wrap);
+    tr.appendChild(tdName);
+    tr.appendChild(el('td', 'num size mono', '—'));
+    tr.appendChild(el('td', 'when mono', ''));
+    tr.appendChild(el('td', '', ''));
+    return tr;
+  }
+
   function renderRows(list) {
     entries = list;
     rows.textContent = '';
@@ -545,6 +614,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
       return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
     });
+    if (base !== mountHome()) rows.appendChild(upRow());
     for (var i = 0; i < list.length; i++) {
       rows.appendChild(rowFor(list[i]));
     }
@@ -567,12 +637,13 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     link.textContent = entry.name;
     link.title = entry.name;
     if (entry.isDir) {
-      wrap.appendChild(svg(ICON_DIR));
+      wrap.appendChild(svgF(ICON_DIR, 'ic-dir'));
       wrap.appendChild(link);
     } else {
-      var ext = extOf(entry.name);
-      if (ext) wrap.appendChild(el('span', 'badge', ext));
+      wrap.appendChild(svg(ICON_FL, 'ic-file'));
       wrap.appendChild(link);
+      var ext = extOf(entry.name);
+      if (ext) wrap.appendChild(el('span', 'badge k-' + kindOf(entry.name), ext));
       link.addEventListener('click', function (ev) {
         ev.preventDefault();
         openDrawer(entry, link);
@@ -617,6 +688,15 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     return tr;
   }
 
+  function mediaPlay(node) {
+    // Direct watch: the row click is a user gesture, so start now; a refused
+    // play() (policy/codec) is non-fatal — controls stay visible.
+    try {
+      var p = node.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+
   function openDrawer(entry, source) {
     returnFocus = source || null;
     drawerName.textContent = entry.name;
@@ -635,7 +715,26 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       video.src = entry.href;
       video.controls = true;
       video.playsInline = true;
+      video.preload = 'metadata';
+      video.addEventListener('error', function () {
+        drawerBody.textContent = '';
+        drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
+        drawerBody.appendChild(el('div', 'placeholder', 'This video cannot play in this browser — use Download.'));
+      });
       drawerBody.appendChild(video);
+      mediaPlay(video);
+    } else if (kind === 'aud') {
+      var audio = document.createElement('audio');
+      audio.src = entry.href;
+      audio.controls = true;
+      audio.preload = 'metadata';
+      audio.addEventListener('error', function () {
+        drawerBody.textContent = '';
+        drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
+        drawerBody.appendChild(el('div', 'placeholder', 'This audio cannot play in this browser — use Download.'));
+      });
+      drawerBody.appendChild(audio);
+      mediaPlay(audio);
     } else if (kind === 'txt' && entry.size <= 1048576) {
       drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
       fetch(entry.href).then(function (res) {
@@ -712,42 +811,83 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     return line;
   }
 
+  function progLine(name, text) {
+    var line = el('div', 'pline indet');
+    var bar = el('i');
+    var span = el('span', '', name + ' — ' + text);
+    line.appendChild(bar);
+    line.appendChild(span);
+    uploads.appendChild(line);
+    return {
+      pct: function (p) {
+        line.classList.remove('indet');
+        bar.style.width = p + '%';
+        span.textContent = name + ' — ' + p + '%';
+      },
+      restart: function (text) {
+        line.className = 'pline indet';
+        bar.style.width = '';
+        span.textContent = name + ' — ' + text;
+      },
+      finish: function (cls, text) {
+        line.className = 'pline ' + cls;
+        bar.style.width = '100%';
+        span.textContent = name + ' — ' + text;
+        if (cls === 'ok') {
+          setTimeout(function () {
+            if (line.parentNode) line.parentNode.removeChild(line);
+          }, 4000);
+        }
+      },
+    };
+  }
+
+  // XHR, not fetch: fetch gives no upload progress events, and the bar IS
+  // the indicator people wait on for big files.
+  function putXhr(url, opts) {
+    return new Promise(function (resolve) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('PUT', url);
+      if (opts.ifNoneMatch) xhr.setRequestHeader('If-None-Match', '*');
+      xhr.upload.onprogress = function (e) {
+        if (opts.onProgress && e.lengthComputable && e.total) {
+          opts.onProgress(Math.min(100, Math.round((e.loaded / e.total) * 100)));
+        }
+      };
+      xhr.onload = function () { resolve({ status: xhr.status }); };
+      xhr.onerror = function () { resolve({ status: 0 }); };
+      xhr.onabort = function () { resolve({ status: 0 }); };
+      xhr.send(opts.body);
+    });
+  }
+
   function putFile(file) {
-    var line = statusLine(file.name, '', 'uploading…');
+    var prog = progLine(file.name, 'uploading…');
     var url = base + encodeURIComponent(file.name);
     // Create-only first: a bare PUT over an existing file is a silent
     // overwrite server-side (WebDAV PUT default). If-None-Match: * asks for
     // 412 instead, and only an explicit confirm replaces the existing file.
     var send = function (ifNoneMatch) {
-      return fetch(url, {
-        method: 'PUT',
-        headers: ifNoneMatch ? { 'If-None-Match': '*' } : {},
-        body: file,
-      });
+      return putXhr(url, { ifNoneMatch: ifNoneMatch, body: file, onProgress: prog.pct });
     };
     var replacing = false;
     return send(true).then(function (res) {
       if (res.status !== 412) return res;
       if (!window.confirm(file.name + ' already exists. Replace it?')) {
-        line.className = 'bad';
-        line.textContent = file.name + ' — cancelled (existing file kept)';
+        prog.finish('bad', 'cancelled (existing file kept)');
         return null;
       }
       replacing = true;
-      line.textContent = file.name + ' — replacing…';
+      prog.restart('replacing…');
       return send(false);
     }).then(function (res) {
       if (!res) return;
+      if (res.status === 0) throw new Error('network error');
       if (res.status === 413) throw new Error('too large (100 MB per-request edge limit)');
-      if (!res.ok) throw new Error('failed with HTTP ' + res.status);
-      line.className = 'ok';
-      line.textContent = file.name + (replacing ? ' — replaced' : ' — uploaded');
-      setTimeout(function () {
-        if (line.parentNode) line.parentNode.removeChild(line);
-      }, 4000);
+      if (res.status < 200 || res.status >= 300) throw new Error('failed with HTTP ' + res.status);
+      prog.finish('ok', replacing ? 'replaced' : 'uploaded');
     }).catch(function (err) {
-      line.className = 'bad';
-      line.textContent = file.name + ' — ' + (err && err.message ? err.message : 'failed');
+      prog.finish('bad', err && err.message ? err.message : 'failed');
     });
   }
 
