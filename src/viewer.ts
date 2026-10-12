@@ -224,17 +224,23 @@ tbody tr { cursor: default; }
 td.when { color: var(--muted); font-size: 12px; white-space: nowrap; }
 td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .row-actions { display: flex; gap: 4px; justify-content: flex-end; opacity: 0; }
+.row-actions { opacity: 1; }
 @media (hover: hover) and (pointer: fine) {
+  .row-actions { opacity: 0; }
   tbody tr:hover .row-actions, tbody tr:focus-within .row-actions { opacity: 1; transition: opacity 120ms var(--ease-out); }
 }
-.row-actions a {
+.row-actions a, .row-actions button {
   display: grid; place-items: center;
   width: 28px; height: 28px;
+  padding: 0;
   color: var(--muted);
+  background: none;
+  border: none;
   border-radius: 4px;
   text-decoration: none;
+  cursor: pointer;
 }
-.row-actions a:hover { color: var(--accent); background: var(--bg); }
+.row-actions a:hover, .row-actions button:hover { color: var(--accent); background: var(--bg); }
 
 #empty, #error {
   margin: 48px auto;
@@ -321,6 +327,8 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 <header class="top">
   <nav id="crumbs" class="mono" aria-label="Path"></nav>
   <button id="upload" class="primary">Upload files</button>
+  <button id="mkdir">New folder</button>
+  <button id="refresh" aria-label="Refresh listing">Refresh</button>
   <input id="picker" type="file" multiple hidden>
 </header>
 <main>
@@ -490,6 +498,8 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   }
   var ICON_DLO = 'M8 2v8m0 0 3-3m-3 3L5 5M3 12v1a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1';
   var ICON_DIR = 'M6 3l1.5 1.5L6 6M2.5 4.5h4M2.5 8h11M2.5 11.5h11';
+  var ICON_EDT = 'M11 3l2 2-7.5 7.5L3 13l.5-2.5L11 3z';
+  var ICON_DEL = 'M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.7 8a1 1 0 0 0 1 1h3.6a1 1 0 0 0 1-1l.7-8';
 
   function childHrefs(doc) {
     var out = [];
@@ -585,6 +595,23 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     dl.appendChild(svg(ICON_DLO));
     dl.addEventListener('click', function (ev) { ev.stopPropagation(); });
     acts.appendChild(dl);
+
+    var ren = document.createElement('button');
+    ren.type = 'button';
+    ren.title = 'Rename ' + entry.name;
+    ren.setAttribute('aria-label', 'Rename ' + entry.name);
+    ren.appendChild(svg(ICON_EDT));
+    ren.addEventListener('click', function (ev) { ev.stopPropagation(); renameEntry(entry); });
+    acts.appendChild(ren);
+
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.title = 'Delete ' + entry.name;
+    del.setAttribute('aria-label', 'Delete ' + entry.name);
+    del.appendChild(svg(ICON_DEL));
+    del.addEventListener('click', function (ev) { ev.stopPropagation(); deleteEntry(entry); });
+    acts.appendChild(del);
+
     tdAct.appendChild(acts);
     tr.appendChild(tdAct);
     return tr;
@@ -724,6 +751,71 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     });
   }
 
+  function renameEntry(entry) {
+    var next = window.prompt('Rename to:', entry.name);
+    if (next === null) return;
+    next = next.trim();
+    if (!next || next === entry.name) return;
+    if (next.indexOf('/') >= 0) {
+      statusLine(entry.name, 'bad', 'not renamed — names cannot contain "/"');
+      return;
+    }
+    var line = statusLine(entry.name, '', 'renaming…');
+    var dest = new URL(base + encodeURIComponent(next), location.origin).toString();
+    fetch(entry.href, {
+      method: 'MOVE',
+      headers: { Destination: dest, Overwrite: 'F' },
+    }).then(function (res) {
+      if (res.status === 412) throw new Error('a file with that name already exists');
+      if (res.status === 409) throw new Error('folder missing or conflict');
+      if (!res.ok) throw new Error('failed with HTTP ' + res.status);
+      line.className = 'ok';
+      line.textContent = entry.name + ' — renamed to ' + next;
+      load();
+    }).catch(function (err) {
+      line.className = 'bad';
+      line.textContent = entry.name + ' — ' + (err && err.message ? err.message : 'rename failed');
+    });
+  }
+
+  function deleteEntry(entry) {
+    if (!window.confirm('Delete ' + entry.name + (entry.isDir ? ' and everything inside it' : '') + '?')) return;
+    var line = statusLine(entry.name, '', 'deleting…');
+    fetch(entry.href, { method: 'DELETE' }).then(function (res) {
+      if (res.status === 409) throw new Error('locked or not empty — check LOCKs');
+      if (!res.ok && res.status !== 204) throw new Error('failed with HTTP ' + res.status);
+      line.className = 'ok';
+      line.textContent = entry.name + ' — deleted';
+      load();
+    }).catch(function (err) {
+      line.className = 'bad';
+      line.textContent = entry.name + ' — ' + (err && err.message ? err.message : 'delete failed');
+    });
+  }
+
+  function mkdir() {
+    var name = window.prompt('Folder name:');
+    if (name === null) return;
+    name = name.trim();
+    if (!name) return;
+    if (name.indexOf('/') >= 0) {
+      statusLine(name, 'bad', 'not created — names cannot contain "/"');
+      return;
+    }
+    var line = statusLine(name, '', 'creating…');
+    fetch(base + encodeURIComponent(name), { method: 'MKCOL' }).then(function (res) {
+      if (res.status === 405) throw new Error('that name is taken (405)');
+      if (res.status === 409) throw new Error('parent folder missing (409)');
+      if (!res.ok && res.status !== 201) throw new Error('failed with HTTP ' + res.status);
+      line.className = 'ok';
+      line.textContent = name + ' — folder created';
+      load();
+    }).catch(function (err) {
+      line.className = 'bad';
+      line.textContent = name + ' — ' + (err && err.message ? err.message : 'create failed');
+    });
+  }
+
   function uploadFiles(fileList) {
     var files = [];
     for (var i = 0; i < fileList.length; i++) files.push(fileList[i]);
@@ -733,6 +825,8 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   }
 
   document.getElementById('upload').addEventListener('click', function () { picker.click(); });
+  document.getElementById('mkdir').addEventListener('click', mkdir);
+  document.getElementById('refresh').addEventListener('click', function () { load(); });
   picker.addEventListener('change', function () {
     uploadFiles(picker.files);
     picker.value = '';
