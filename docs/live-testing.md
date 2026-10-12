@@ -718,7 +718,7 @@ production; deploys are **manual** `wrangler deploy` after `npm run review`
 (the optional dashboard Git integration is documented in README — do not
 assume a push deploys). Current verification: **litmus 138/138** (basic,
 copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
-**388 unit tests**. Latest shipped work: browser chunked upload for >64 MiB files (`4b79810`, live `eabbf04e`), session sign-in form + attachment downloads + preview removal (`4b1ef7e`), download-URL cache (repeat-open TTFB
+**388 unit tests**. Latest shipped work: viewer/sign-in UI retheme + fixed table layout + login username prefill (`e42c6f0`, live `da0faade`), browser chunked upload for >64 MiB files (`4b79810`, live `eabbf04e`), session sign-in form + attachment downloads + preview removal (`4b1ef7e`), download-URL cache (repeat-open TTFB
 0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
 (`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
 cap is TeraBox free-tier, colo-independent), review rounds 14–17 (rounds 14–15 = the session-cookie boundary work below; 16–17 = test/doc/script hardening, findings in `scripts/live-litmus.sh` + quota discipline in AGENTS.md; session
