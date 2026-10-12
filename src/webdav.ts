@@ -1,4 +1,5 @@
 import { TeraboxClient, TeraboxError, errIsNum, type ResolvedFetchOpts } from './terabox';
+import { viewerRedirect, viewerResponse, wantsViewer } from './viewer';
 import { joinPath, splitPath } from './sign';
 import {
   collectXmlScope,
@@ -1749,9 +1750,20 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     if (errIsNum(error, -9)) return errorResponse('Not Found', 404);
     throw error;
   }
-  // RFC 7231 §6.5.5: every405 carries Allow — the collection root is the
-  // most-probed405 on this surface.
-  if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
+  // RFC 7231 §6.5.5: every 405 carries Allow — the collection root is the
+  // most-probed 405 on this surface. A *browser* navigation (Accept
+  // text/html) gets the viewer page instead — canonical slash form first,
+  // because the page resolves child hrefs relative to its own URL. Every
+  // WebDAV client (Accept */* or XML) keeps the 405, pinned in
+  // test/viewer.test.ts and covered by litmus.
+  if ((item.isdir || 0) > 0) {
+    if (!isHead && wantsViewer(request)) {
+      const pathname = new URL(request.url).pathname;
+      if (!pathname.endsWith('/')) return viewerRedirect(request);
+      return viewerResponse();
+    }
+    return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
+  }
 
   const lastModifiedMs = safeMtimeSeconds(item) * 1000;
   const headers = new Headers({
