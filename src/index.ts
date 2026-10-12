@@ -378,7 +378,7 @@ async function handleSessionEndpoint(
   }
   // Same branchless compare as Basic, plus a floor on guessing speed.
   await new Promise((resolve) => setTimeout(resolve, 400));
-  return loginPageResponse(next, 'Wrong user or password.');
+  return loginPageResponse(next, 'Wrong user or password.', username);
 }
 
 // RFC 7235 §3.1: a 401 must carry the challenge on EVERY code path.

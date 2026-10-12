@@ -178,7 +178,7 @@ const LOGIN_CSP = [
  * The sign-in card. Pure HTML form — works with JavaScript disabled; the
  * POST answers with a 303 back to `next` on success.
  */
-export function loginPageResponse(next: string, error?: string): Response {
+export function loginPageResponse(next: string, error?: string, user = ''): Response {
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -270,7 +270,7 @@ button:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
   ${error ? `<p class="err" role="alert">${escapeHtml(error)}</p>` : ''}
   <form method="post" action="/.dav-login" autocomplete="on">
     <input type="hidden" name="next" value="${escapeHtml(next)}">
-    <label>User <input name="user" autocomplete="username" required autofocus></label>
+    <label>User <input name="user" autocomplete="username" required autofocus value="${escapeHtml(user)}"></label>
     <label>Password <input name="pass" type="password" autocomplete="current-password" required></label>
     <button type="submit">Sign in</button>
   </form>

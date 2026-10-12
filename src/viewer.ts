@@ -141,7 +141,7 @@ body {
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 /* Sign-out is a real form (no JS); it only shows for cookie sessions —
    a Basic-authenticated script user has nothing to sign out of. */
-#signout { display: flex; margin: 0; }
+#signout { display: flex; margin: 0; margin-left: auto; }
 body:not([data-session="1"]) #signout { display: none; }
 
 /* Path line — the signature: the current location, brass, in mono. */
@@ -232,7 +232,11 @@ tbody tr {
   }
 }
 .name { display: flex; align-items: center; gap: 11px; min-width: 0; }
+/* Name column absorbs the slack; the anchor needs min-width: 0 or long
+   names push the actions column off-screen on narrow viewports. */
+td:first-child, th:first-child { width: 99%; }
 .name a {
+  min-width: 0;
   color: var(--paper);
   text-decoration: none;
   overflow: hidden;
