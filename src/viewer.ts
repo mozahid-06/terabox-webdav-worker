@@ -304,18 +304,58 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .drawer-body .meta { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
 .drawer-body .placeholder { color: var(--muted); text-align: center; padding: 40px 0; }
 
-/* Upload status lines — feedback, not layout: they append and never move rows. */
-.uploads {
-  border-top: 1px solid var(--line);
-  background: var(--panel);
-  padding: 8px 20px;
+/* Toolbar progress chip — right where the eye already is. */
+.upchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
-  color: var(--muted);
-  max-height: 96px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 12px;
+  white-space: nowrap;
+}
+.upchip[hidden] { display: none; }
+.upchip em {
+  position: relative;
+  display: block;
+  width: 56px;
+  height: 5px;
+  background: var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+  flex: none;
+}
+.upchip em i {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: #7BC96F;
+  transition: width 160ms var(--ease-out);
+}
+.upchip.done { border-color: #2f5333; color: #7BC96F; }
+
+/* Upload status lines — fixed to the viewport bottom so they can never be
+   missed while a transfer is running; they append and never move rows. */
+.uploads {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 30;
+  border-top: 1px solid var(--line);
+  background: rgba(24, 28, 38, 0.94);
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.4);
+  padding: 10px 20px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--text);
+  max-height: 120px;
   overflow: auto;
 }
 .uploads:empty { display: none; }
+body.uploading main { padding-bottom: 68px; }
 .uploads .ok { color: #7BC96F; }
 .uploads .bad { color: var(--accent); }
 /* Upload progress lines: the bar sits behind the status text. */
@@ -330,7 +370,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   position: absolute;
   left: 0; top: 0; bottom: 0;
   width: 0;
-  background: rgba(123, 201, 111, 0.18);
+  background: rgba(123, 201, 111, 0.35);
   transition: width 160ms var(--ease-out);
 }
 .pline.indet i { width: 30%; animation: pline-slide 900ms ease-in-out infinite alternate; }
@@ -357,6 +397,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 <header class="top">
   <nav id="crumbs" class="mono" aria-label="Path"></nav>
   <button id="upload" class="primary">Upload files</button>
+  <span id="upchip" class="upchip" hidden><em><i></i></em><span class="pct"></span></span>
   <button id="mkdir">New folder</button>
   <button id="refresh" aria-label="Refresh listing">Refresh</button>
   <input id="picker" type="file" multiple hidden>
@@ -404,6 +445,57 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   var VID = ['mp4','webm','ogv','m4v','mkv','mov','avi','ts','mts','m2ts','flv','wmv','mpg','mpeg','3gp'];
   var AUD = ['mp3','m4a','aac','wav','flac','ogg','oga','opus','wma','aiff','aif'];
   var TXT = ['txt','md','markdown','json','js','mjs','cjs','ts','tsx','jsx','css','scss','less','html','htm','xml','yml','yaml','toml','ini','conf','cfg','sh','bash','zsh','py','rb','php','go','rs','java','c','h','cpp','hpp','cs','sql','log','csv','env','lock','properties','srt','vtt','tex','r','swift','kt','lua','pl','diff','patch'];
+
+  var upchip = document.getElementById('upchip');
+  var upchipPct = upchip.querySelector('.pct');
+  var upchipBar = upchip.querySelector('em i');
+  var ups = []; // in-flight uploads: { name, pct }
+  var roundFails = 0;
+
+  function upShow() {
+    if (ups.length === 0) return;
+    var sum = 0;
+    for (var i = 0; i < ups.length; i++) sum += ups[i].pct;
+    var pct = Math.round(sum / ups.length);
+    upchipBar.style.width = pct + '%';
+    if (ups.length > 1) {
+      upchipPct.textContent = ups.length + ' files · ' + pct + '%';
+    } else if (ups[0].pct >= 100) {
+      upchipPct.textContent = ups[0].name + ' · finishing…';
+    } else {
+      upchipPct.textContent = ups[0].name + ' · ' + pct + '%';
+    }
+    upchip.classList.remove('done');
+    upchip.hidden = false;
+  }
+
+  function upEnd(ok) {
+    if (!ok) roundFails++;
+    if (ups.length > 0) { upShow(); return; }
+    if (ok && roundFails === 0) {
+      upchipBar.style.width = '100%';
+      upchipPct.textContent = '✓ uploaded';
+      upchip.classList.add('done');
+      upchip.hidden = false;
+      setTimeout(function () {
+        if (ups.length === 0) {
+          upchip.hidden = true;
+          upchip.classList.remove('done');
+        }
+      }, 2200);
+    } else {
+      upchip.hidden = true;
+    }
+  }
+
+  // The strip is fixed to the viewport bottom; pad the page only while it
+  // has content so it can never cover the last row.
+  var upObs = document.getElementById('uploads');
+  if (window.MutationObserver) {
+    new MutationObserver(function () {
+      document.body.classList.toggle('uploading', upObs.childNodes.length > 0);
+    }).observe(upObs, { childList: true });
+  }
 
   var crumbs = document.getElementById('crumbs');
   var rows = document.getElementById('rows');
@@ -822,7 +914,9 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       pct: function (p) {
         line.classList.remove('indet');
         bar.style.width = p + '%';
-        span.textContent = name + ' — ' + p + '%';
+        // Client finished sending; the worker is still pushing the bytes to
+        // storage — say so, or 100% looks frozen.
+        span.textContent = name + ' — ' + (p >= 100 ? '100% · finishing…' : p + '%');
       },
       restart: function (text) {
         line.className = 'pline indet';
@@ -863,18 +957,31 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 
   function putFile(file) {
     var prog = progLine(file.name, 'uploading…');
+    var track = { name: file.name, pct: 0 };
+    ups.push(track);
+    upShow();
+    var endTrack = function (ok) {
+      var i = ups.indexOf(track);
+      if (i >= 0) ups.splice(i, 1);
+      upEnd(ok);
+    };
     var url = base + encodeURIComponent(file.name);
     // Create-only first: a bare PUT over an existing file is a silent
     // overwrite server-side (WebDAV PUT default). If-None-Match: * asks for
     // 412 instead, and only an explicit confirm replaces the existing file.
     var send = function (ifNoneMatch) {
-      return putXhr(url, { ifNoneMatch: ifNoneMatch, body: file, onProgress: prog.pct });
+      return putXhr(url, {
+        ifNoneMatch: ifNoneMatch,
+        body: file,
+        onProgress: function (p) { prog.pct(p); track.pct = p; upShow(); },
+      });
     };
     var replacing = false;
     return send(true).then(function (res) {
       if (res.status !== 412) return res;
       if (!window.confirm(file.name + ' already exists. Replace it?')) {
         prog.finish('bad', 'cancelled (existing file kept)');
+        endTrack(false);
         return null;
       }
       replacing = true;
@@ -886,8 +993,10 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       if (res.status === 413) throw new Error('too large (100 MB per-request edge limit)');
       if (res.status < 200 || res.status >= 300) throw new Error('failed with HTTP ' + res.status);
       prog.finish('ok', replacing ? 'replaced' : 'uploaded');
+      endTrack(true);
     }).catch(function (err) {
       prog.finish('bad', err && err.message ? err.message : 'failed');
+      endTrack(false);
     });
   }
 
@@ -961,6 +1070,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     for (var i = 0; i < fileList.length; i++) files.push(fileList[i]);
     if (files.length === 0) return;
     clearError();
+    roundFails = 0;
     Promise.all(files.map(putFile)).then(function () { load(); });
   }
 
