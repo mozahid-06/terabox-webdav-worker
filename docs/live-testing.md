@@ -5,8 +5,12 @@ after every campaign so future sessions (human or AI) start with context.
 
 ## Target
 
-- Worker: `https://davbox.crazy-gooner-mf.workers.dev/` (auto-deploys from `main`)
-- Credentials: **not stored in this repo** — pass via `WEBDAV_USER` / `WEBDAV_PASS`
+- Worker: `https://davbox.crazy-gooner-mf.workers.dev/` (deploys are **manual**
+  `wrangler deploy` — the dashboard Git integration exists but is not enabled)
+- Credentials: the WebDAV basic-auth test pair ships as a default in
+  `scripts/live-smoke.sh` / `scripts/live-litmus.sh` (local throwaway auth);
+  the **Terabox session cookie + jsToken are env-only and never committed** —
+  pass via `COOKIE`/`JSTOKEN` (and `USER_CRED` to override the test pair)
 - Test account content: folders `BackupFolder/ mern/ hacking/ omacom/ tools/ …`,
   sample file `BackupFolder/screenshot-2026-07-21_12-58-20.png`
 
@@ -326,8 +330,8 @@ clients are never harmed by the hopping: an empty store *allows* writes
 
 ### Verification tooling
 
-- litmus built from source (binaries in `/tmp/opencode/litmus/`, credentials
-  via env/`USER_CRED`, never committed). Use the repo runner — it targets the
+- litmus built from source (binaries in `/tmp/opencode/litmus/`). Use the
+  repo runner — it targets the
   **`/dav/litmus/`** collection (a root-level `/litmus/` 404s; the suites
   MKCOL `/dav/litmus/litmus/` and need the parent) and pre-flights the worker
   instead of hammering a dead quota:
@@ -336,9 +340,12 @@ clients are never harmed by the hopping: an empty store *allows* writes
   ./scripts/live-litmus.sh        # SUITES="basic copymove locks http props protected lockbomb"
   ```
 
-  **Quota:** one full run has exhausted the DO rows-written quota inside a
-  minute (every request 500s until the 00:00 UTC reset) — at most one litmus
-  run per quota window, smoke first.
+  **Quota:** quota death was observed within minutes of a litmus-heavy
+  window (accumulated same-window traffic may also contribute) — every
+  request then 500s with `Exceeded allowed rows written…`. 00:00 UTC is the
+  guaranteed reset; one 2026-10-12 window recovered mid-window (500 → 207
+  within 25 min), so probe ONCE before declaring it dead, never retry-loop.
+  At most one litmus run per quota window, smoke first.
 - probe habit: to check which build is live, PUT to a path whose parent does
   **not** exist — `409` = new build, `201`/`204` = old build still serving.
 
@@ -600,7 +607,7 @@ account-wide; the isolate floor is the backstop).
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-11, post review rounds 4–15 + perf work): `main` =
+Branch state (2026-10-12, post review rounds 4–17 + perf work): `main` =
 production; deploys are **manual** `wrangler deploy` after `npm run review`
 (the optional dashboard Git integration is documented in README — do not
 assume a push deploys). Current verification: **litmus 138/138** (basic,
@@ -608,7 +615,7 @@ copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
 **353 unit tests**. Latest shipped work: download-URL cache (repeat-open TTFB
 0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
 (`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
-cap is TeraBox free-tier, colo-independent), review rounds 14–15 (session
+cap is TeraBox free-tier, colo-independent), review rounds 14–17 (rounds 14–15 = the session-cookie boundary work below; 16–17 = test/doc/script hardening, findings in `scripts/live-litmus.sh` + quota discipline in AGENTS.md; session
 cookie never replays to a CDN host: the cookieless boundary is recorded when a
 URL hops and replayed from the cache — pinned end-to-end by asserting the mock
 `/dl/` handler never observes a Cookie on a `via=pcs` replay, with both halves

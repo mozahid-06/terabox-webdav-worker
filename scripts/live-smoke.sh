@@ -2,7 +2,7 @@
 # Full live WebDAV smoke against the deployed worker.
 # STANDING RULE: run this after every `git push` (and after every deploy)
 # and do not consider the change done until it passes.
-#   BASE=https://davbox.crazy-gooner-mf.workers.dev/dav USER=taxin:404 ./scripts/live-smoke.sh
+#   BASE=https://davbox.crazy-gooner-mf.workers.dev/dav USER_CRED=taxin:404 ./scripts/live-smoke.sh
 set -u
 B="${BASE:-https://davbox.crazy-gooner-mf.workers.dev/dav}"
 A="${USER_CRED:-taxin:404}"

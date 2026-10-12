@@ -29,15 +29,20 @@
 - **Free-tier quota discipline (learned the hard way, 2026-10-11):**
   - `500 {"error":"Internal Server Error"}` on EVERY path with wrangler tail
     showing `Exceeded allowed rows written in Durable Objects free tier`
-    means the daily quota died — it resets at **00:00 UTC**, not on retry.
-    One probe confirms it; never loop probes or re-runs against a dead
-    worker. While it is dead: work locally (`npm run review`, docs, review
-    rounds) and push; run the deferred live smoke once after the reset.
-  - **litmus is quota-heavy** (locks/props/upload DO writes): a full 138-test
-    run has exhausted the rows-written quota within a minute. Run it at most
-    **once per quota window**, only after smoke is green. Use
-    `./scripts/live-litmus.sh` (correct `/dav/litmus/` base, pre-flight probe
-    that aborts instead of hammering a dead worker).
+    means the quota died — 00:00 UTC is the guaranteed reset (one window
+    recovered mid-window, so probe ONCE and re-check later before declaring
+    it dead). One probe confirms state; never *retry*-loop probes or re-runs
+    against a dead worker within a working session. Deliberate wait-for-reset
+    scripts are fine when they poll at long intervals (≥10 min) and stop at
+    the window. While dead: work locally (`npm run review`, docs, review
+    rounds) and push; run the deferred live smoke once the worker answers.
+  - **litmus is quota-heavy** (locks/props/upload DO writes): quota death has
+    been observed within minutes of a litmus-heavy window (same-window
+    traffic may also contribute). Run it at most **once per quota window**,
+    only after smoke is green. Use `./scripts/live-litmus.sh` (correct
+    `/dav/litmus/` base, `TEST_NODEBUG=1` so neon's debug.log cannot grow,
+    pre-flight + per-suite re-checks that abort instead of hammering a dead
+    worker).
   - The live smoke stays the standing post-push rule, but when the quota is
     dead the smoke is *deferred, not skipped*: record it, verify at reset.
 

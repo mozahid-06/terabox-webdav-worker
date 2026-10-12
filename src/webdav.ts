@@ -528,8 +528,9 @@ function dlUrlCacheGet(absPath: string, item: TeraboxItem): { url: string; cooki
  *  warm URL across repeated opens instead of re-laddering every 30 min.
  *  Touches only `expires` (mutate-only: it can never resurrect an entry an
  *  invalidation/gate-drop/FIFO eviction removed): the URL and the mint-time
- *  cookieless boundary stay exactly as written. At DLURL_MAX_ENTRIES the
- *  hot entry is still the first FIFO victim — unchanged, pre-existing. */
+ *  cookieless boundary stay exactly as written. Touch never moves the key
+ *  forward in FIFO order, so at DLURL_MAX_ENTRIES an entry that has become
+ *  the oldest key is still evicted — unchanged, pre-existing. */
 function dlUrlCacheTouch(absPath: string): void {
   const entry = dlUrlCache.get(absPath);
   if (entry) entry.expires = Date.now() + DLURL_TTL_MS;
