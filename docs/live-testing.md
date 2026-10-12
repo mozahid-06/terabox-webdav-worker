@@ -670,6 +670,22 @@ page stays put, a brand-new tab after closing the first is still signed
 in, sign-out → form again + cookie gone. Screenshots:
 `/tmp/opencode/up/login-{page,viewer,upload-mid,upload-done,newtab,after-logout}.png`.
 
+**Big files in the browser (`8635196` + `4b79810`, live `eabbf04e`):**
+the page's single XHR PUT could never exceed Cloudflare's ~100 MB
+per-request body cap (a platform 413, not a Terabox limit), so uploads
+over 64 MiB now switch to the worker's resumable control plane —
+`POST /.resumable` begin (mount-relative JSON path — sending the URL path
+409s on a bogus upstream parent — plus `If-None-Match: *` for the same
+create-only/confirm-to-replace handshake as PUT) → 17 × 4 MiB chunk PUTs
+with per-byte chip progress (capped at 99% until finalize) → finalize
+201/204, `DELETE` of the session on any failure. Real-browser proof
+(`/tmp/opencode/big-upload-e2e.tmp.mjs`, **5/5**): 68 MB file, create →
+412 → confirm → replace → chunks → finalize → listing, HEAD
+byte-exact 68,000,000. Two harness traps fixed en route: `body.textContent`
+matches the page's own script source (the `'✓ uploaded'` literal lives in
+the inline script — poll the chip *element* instead), and a faulty
+test-file generator that wrote 69,048,576 bytes while asserting 68,000,000.
+
 Harness gotchas discovered (live-only, invisible to unit tests): workers'
 `fetch` has no cookie jar — tests asserting `Set-Cookie` on a `303` must
 send `redirect: 'manual'` or they chase the redirect unauthenticated;
@@ -685,7 +701,7 @@ production; deploys are **manual** `wrangler deploy` after `npm run review`
 (the optional dashboard Git integration is documented in README — do not
 assume a push deploys). Current verification: **litmus 138/138** (basic,
 copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
-**387 unit tests**. Latest shipped work: session sign-in form + attachment downloads + preview removal (`4b1ef7e`, live `b5fcb71a`), download-URL cache (repeat-open TTFB
+**388 unit tests**. Latest shipped work: browser chunked upload for >64 MiB files (`4b79810`, live `eabbf04e`), session sign-in form + attachment downloads + preview removal (`4b1ef7e`), download-URL cache (repeat-open TTFB
 0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
 (`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
 cap is TeraBox free-tier, colo-independent), review rounds 14–17 (rounds 14–15 = the session-cookie boundary work below; 16–17 = test/doc/script hardening, findings in `scripts/live-litmus.sh` + quota discipline in AGENTS.md; session
@@ -708,9 +724,9 @@ litmus via `scripts/live-litmus.sh`; results land in
 `/tmp/opencode/postreset/`). **Verified 2026-10-12** on `v4708a473`
 (`538963e`): live smoke **34/34** + litmus **138/138** (basic 16,
 copymove 13, locks 40, http 3, props 33, protected 30, lockbomb 3) after
-the 00:00 UTC quota reset; then re-verified the Campaign 7 deploy
-(`b5fcb71a`): smoke **34/34** + gate 387/387 + real-Chromium login flow
-18/18. The branch also
+the 00:00 UTC quota reset; then re-verified the Campaign 7 deploys
+(`b5fcb71a`, then `eabbf04e`): smoke **34/34** + gate 388/388 +
+real-Chromium login flow 18/18 + big-file chunked upload 5/5. The branch also
 includes the RFC 7233 GET/ETag conformance hardening (merged `d065d53`,
 deployed) and the full-repo audit hardening (merged `4d87f47`: traversal
 containment, metaCache cap, errno→status maps, DO-backed lock/prop tests,
