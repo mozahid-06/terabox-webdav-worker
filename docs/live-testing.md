@@ -686,6 +686,23 @@ matches the page's own script source (the `'✓ uploaded'` literal lives in
 the inline script — poll the chip *element* instead), and a faulty
 test-file generator that wrote 69,048,576 bytes while asserting 68,000,000.
 
+**UI retheme + layout polish (`2d1071d` + `c6c5115` + `e42c6f0`, live `da0faade`):**
+the near-black + vermilion palette read as an AI template, so the viewer
+and sign-in page were rethemed to petrol/brass (void `#0C1617`, brass
+`#E3A857`, jade/coral accents): brass mono path segment and Upload button,
+brass folder icon and login card top edge, borderless lowercase kind
+badges, dashed empty-state tray, and guarded hover states
+(`(hover: hover) and (pointer: fine)` — row wash, name-link brass
+underline, actions reveal; touch keeps actions visible). Three bugs
+surfaced in screenshot review and were fixed: auto table layout let long
+names min-content-expand past the viewport, pushing the actions column
+off-screen on narrow screens (fixed → `table-layout: fixed` with sized
+Size/Modified/Actions columns so names ellipsize); lone wrapped Sign out
+left-aligned oddly (`margin-left: auto`); and a failed login cleared the
+username field (the error re-render now prefills it, HTML-escaped).
+Verified live in headless Chromium at 390 px: longest name truncates,
+actions column fully on-screen, sign-out right-aligned, prefill holds.
+
 Harness gotchas discovered (live-only, invisible to unit tests): workers'
 `fetch` has no cookie jar — tests asserting `Set-Cookie` on a `303` must
 send `redirect: 'manual'` or they chase the redirect unauthenticated;
