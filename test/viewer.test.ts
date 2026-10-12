@@ -185,6 +185,24 @@ describe('download MIME types stay precise (nosniff refuses octet-stream)', () =
 	});
 });
 
+describe('large uploads route through the resumable control plane', () => {
+	it('branches to chunked upload past the ~100 MB edge body cap', () => {
+		// A single PUT of a >100 MB file can only ever 413 at the Cloudflare
+		// edge — the page must switch to begin/chunk/finalize above 64 MiB.
+		expect(VIEWER_HTML).toContain('RESUMABLE_LIMIT = 64 * 1024 * 1024');
+		expect(VIEWER_HTML).toMatch(/if \(file\.size > RESUMABLE_LIMIT\) return putResumable\(/);
+		expect(VIEWER_HTML).toContain("base + '.resumable'");
+		// create-only handshake identical to PUT: If-None-Match on begin,
+		// confirm, then a second begin without it
+		expect(VIEWER_HTML).toMatch(/begin\(true\)[\s\S]{0,600}begin\(false\)/);
+		// chunk PUTs report byte progress; finalize completes; failures
+		// cancel the session instead of orphaning chunks
+		expect(VIEWER_HTML).toContain("'.resumable/' + id + '/' + index");
+		expect(VIEWER_HTML).toContain('/finalize');
+		expect(VIEWER_HTML).toContain(".resumable/' + id, { method: 'DELETE'");
+	});
+});
+
 describe('the embedded page script parses', () => {
 	it('compiles the viewer page JS (a syntax error would ship untested)', () => {
 		// The page lives inside a template literal: tsc never parses it as

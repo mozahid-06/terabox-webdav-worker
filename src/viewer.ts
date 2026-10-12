@@ -769,18 +769,131 @@ body.uploading main { padding-bottom: 68px; }
   function putXhr(url, opts) {
     return new Promise(function (resolve) {
       var xhr = new XMLHttpRequest();
-      xhr.open('PUT', url);
+      xhr.open(opts.method || 'PUT', url);
+      if (opts.headers) {
+        for (var key in opts.headers) {
+          if (Object.prototype.hasOwnProperty.call(opts.headers, key)) {
+            xhr.setRequestHeader(key, opts.headers[key]);
+          }
+        }
+      }
       if (opts.ifNoneMatch) xhr.setRequestHeader('If-None-Match', '*');
       xhr.upload.onprogress = function (e) {
         if (opts.onProgress && e.lengthComputable && e.total) {
           opts.onProgress(Math.min(100, Math.round((e.loaded / e.total) * 100)));
         }
       };
-      xhr.onload = function () { resolve({ status: xhr.status }); };
-      xhr.onerror = function () { resolve({ status: 0 }); };
-      xhr.onabort = function () { resolve({ status: 0 }); };
+      xhr.onload = function () { resolve({ status: xhr.status, text: xhr.responseText }); };
+      xhr.onerror = function () { resolve({ status: 0, text: '' }); };
+      xhr.onabort = function () { resolve({ status: 0, text: '' }); };
       xhr.send(opts.body);
     });
+  }
+
+  // Cloudflare's edge refuses any request body over ~100 MB before it ever
+  // reaches this worker (413), so a single PUT can never carry a bigger
+  // file — that is the platform cap users hit, not a Terabox limit. Above
+  // RESUMABLE_LIMIT the page switches to the worker's resumable control
+  // plane (begin -> chunk PUTs -> finalize): every body stays tiny, the
+  // create-only/overwrite handshake is identical, and the same progress
+  // chip reports per-chunk bytes. Mirrors the tbbig script that pushed
+  // 4 GB through the same route.
+  var RESUMABLE_LIMIT = 64 * 1024 * 1024;
+
+  function putResumable(file, prog, track, endTrack) {
+    var beginUrl = base + '.resumable';
+    var sessionId = null;
+    var replacing = false;
+    var abortSession = function () {
+      // best-effort cancel: an orphaned session would hold its chunks
+      if (!sessionId) return;
+      var id = sessionId;
+      sessionId = null;
+      putXhr(base + '.resumable/' + id, { method: 'DELETE' });
+    };
+    var begin = function (ifNoneMatch) {
+      return putXhr(beginUrl, {
+        method: 'POST',
+        ifNoneMatch: ifNoneMatch,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: base + file.name, size: file.size, mtimeMs: file.lastModified || Date.now() }),
+      });
+    };
+    var fail = function (err) {
+      abortSession();
+      prog.finish('bad', err && err.message ? err.message : 'failed');
+      endTrack(false);
+    };
+    var sendChunks = function (info) {
+      var id = info && info.uploadId;
+      var chunkSize = info && info.chunkSize;
+      var chunkCount = info && info.chunkCount;
+      if (!id || !chunkSize || !chunkCount) throw new Error('bad begin response');
+      sessionId = id;
+      var index = 0;
+      var done = 0;
+      var next = function () {
+        if (index >= chunkCount) {
+          prog.pct(100);
+          track.pct = 100;
+          upShow();
+          return putXhr(base + '.resumable/' + id + '/finalize', { method: 'POST' }).then(function (res) {
+            if (res.status === 0) throw new Error('network error at finalize');
+            if (res.status < 200 || res.status >= 300) {
+              throw new Error('finalize failed with HTTP ' + res.status);
+            }
+            sessionId = null;
+            prog.finish('ok', replacing ? 'replaced' : 'uploaded');
+            endTrack(true);
+          });
+        }
+        var start = index * chunkSize;
+        var end = Math.min(start + chunkSize, file.size);
+        return putXhr(base + '.resumable/' + id + '/' + index, {
+          method: 'PUT',
+          body: file.slice(start, end),
+          onProgress: function (p) {
+            var pct = Math.floor(((done + (end - start) * (p / 100)) * 100) / file.size);
+            if (pct > 99) pct = 99; // 100% means "finalizing" everywhere else too
+            prog.pct(pct);
+            track.pct = pct;
+            upShow();
+          },
+        }).then(function (res) {
+          if (res.status === 0) throw new Error('network error on chunk ' + (index + 1) + '/' + chunkCount);
+          if (res.status < 200 || res.status >= 300) {
+            throw new Error('chunk ' + (index + 1) + '/' + chunkCount + ' failed with HTTP ' + res.status);
+          }
+          done += end - start;
+          index += 1;
+          return next();
+        });
+      };
+      return next();
+    };
+    // Same handshake as single PUT: create-only first, confirm to replace.
+    return begin(true).then(function (res) {
+      if (res.status !== 412) return res;
+      if (!window.confirm(file.name + ' already exists. Replace it?')) {
+        prog.finish('bad', 'cancelled (existing file kept)');
+        endTrack(false);
+        return null;
+      }
+      replacing = true;
+      prog.restart('replacing…');
+      return begin(false);
+    }).then(function (res) {
+      if (!res) return;
+      if (res.status === 0) throw new Error('network error');
+      if (res.status < 200 || res.status >= 300) throw new Error('begin failed with HTTP ' + res.status);
+      var info;
+      try {
+        info = JSON.parse(res.text);
+      } catch (e) {
+        throw new Error('bad begin response');
+      }
+      return sendChunks(info);
+    }).catch(fail);
   }
 
   function putFile(file) {
@@ -794,6 +907,9 @@ body.uploading main { padding-bottom: 68px; }
       upEnd(ok);
     };
     var url = base + encodeURIComponent(file.name);
+    // Over the edge's ~100 MB per-request cap a single PUT can only ever
+    // 413 — hand the file to the chunked control plane instead.
+    if (file.size > RESUMABLE_LIMIT) return putResumable(file, prog, track, endTrack);
     // Create-only first: a bare PUT over an existing file is a silent
     // overwrite server-side (WebDAV PUT default). If-None-Match: * asks for
     // 412 instead, and only an explicit confirm replaces the existing file.
