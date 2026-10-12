@@ -326,10 +326,19 @@ clients are never harmed by the hopping: an empty store *allows* writes
 
 ### Verification tooling
 
-- litmus built from source (credentials via env, never committed):
-  `TESTS="basic copymove props locks http"
-  WEBDAV_USER=… WEBDAV_PASS=…; /tmp/opencode/litmus/install/bin/litmus -k -n
-  https://davbox.crazy-gooner-mf.workers.dev/litmus/ "$WEBDAV_USER" "$WEBDAV_PASS"`
+- litmus built from source (binaries in `/tmp/opencode/litmus/`, credentials
+  via env/`USER_CRED`, never committed). Use the repo runner — it targets the
+  **`/dav/litmus/`** collection (a root-level `/litmus/` 404s; the suites
+  MKCOL `/dav/litmus/litmus/` and need the parent) and pre-flights the worker
+  instead of hammering a dead quota:
+
+  ```sh
+  ./scripts/live-litmus.sh        # SUITES="basic copymove locks http props protected lockbomb"
+  ```
+
+  **Quota:** one full run has exhausted the DO rows-written quota inside a
+  minute (every request 500s until the 00:00 UTC reset) — at most one litmus
+  run per quota window, smoke first.
 - probe habit: to check which build is live, PUT to a path whose parent does
   **not** exist — `409` = new build, `201`/`204` = old build still serving.
 
@@ -614,8 +623,12 @@ free tier daily quota (`Exceeded allowed rows written in Durable Objects
 free tier`) 500s EVERY request until the 00:00 UTC reset — this is
 environmental, not a code regression; wait for the reset rather than
 debugging. Post-verification of these deploys runs from
-`/tmp/opencode/postreset-verify.sh` (auto-probes for 207, then smoke + the
-138-test litmus; results land in `/tmp/opencode/postreset/`). The branch also
+`/tmp/opencode/postreset-verify.sh` (auto-probes for 207, then smoke +
+litmus via `scripts/live-litmus.sh`; results land in
+`/tmp/opencode/postreset/`). **Verified 2026-10-12** on `v4708a473`
+(`538963e`): live smoke **34/34** + litmus **138/138** (basic 16,
+copymove 13, locks 40, http 3, props 33, protected 30, lockbomb 3) after
+the 00:00 UTC quota reset. The branch also
 includes the RFC 7233 GET/ETag conformance hardening (merged `d065d53`,
 deployed) and the full-repo audit hardening (merged `4d87f47`: traversal
 containment, metaCache cap, errno→status maps, DO-backed lock/prop tests,
