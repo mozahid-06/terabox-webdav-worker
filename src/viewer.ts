@@ -202,7 +202,7 @@ body.dropping main::after {
   pointer-events: none;
 }
 
-table { width: 100%; border-collapse: collapse; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th {
   text-align: left;
   font-weight: 500;
@@ -232,9 +232,12 @@ tbody tr {
   }
 }
 .name { display: flex; align-items: center; gap: 11px; min-width: 0; }
-/* Name column absorbs the slack; the anchor needs min-width: 0 or long
-   names push the actions column off-screen on narrow viewports. */
-td:first-child, th:first-child { width: 99%; }
+/* Fixed layout: Size/Modified/Actions take set widths, Name absorbs the
+   rest — auto layout lets long names min-content-expand past the viewport,
+   pushing the actions column off-screen. */
+th:nth-child(2), td.num { width: 76px; }
+th:nth-child(3) { width: 160px; }
+th:nth-child(4) { width: 132px; }
 .name a {
   min-width: 0;
   color: var(--paper);
