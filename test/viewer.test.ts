@@ -192,6 +192,9 @@ describe('large uploads route through the resumable control plane', () => {
 		expect(VIEWER_HTML).toContain('RESUMABLE_LIMIT = 64 * 1024 * 1024');
 		expect(VIEWER_HTML).toMatch(/if \(file\.size > RESUMABLE_LIMIT\) return putResumable\(/);
 		expect(VIEWER_HTML).toContain("base + '.resumable'");
+		// begin's JSON path is mount-relative (davPath space): the mount
+		// prefix must be stripped or toTera stats a bogus upstream parent
+		expect(VIEWER_HTML).toContain("base.slice(mountHome().length)");
 		// create-only handshake identical to PUT: If-None-Match on begin,
 		// confirm, then a second begin without it
 		expect(VIEWER_HTML).toMatch(/begin\(true\)[\s\S]{0,600}begin\(false\)/);

@@ -812,11 +812,16 @@ body.uploading main { padding-bottom: 68px; }
       putXhr(base + '.resumable/' + id, { method: 'DELETE' });
     };
     var begin = function (ifNoneMatch) {
+      // The JSON path lives in davPath space (like the /.resumable route
+      // itself): mount-relative, leading slash, NO mount prefix — sending
+      // the URL path here makes toTera look for an upstream parent folder
+      // named after the mount (e.g. root + /dav/...) and begin 409s.
+      var rel = base.slice(mountHome().length);
       return putXhr(beginUrl, {
         method: 'POST',
         ifNoneMatch: ifNoneMatch,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: base + file.name, size: file.size, mtimeMs: file.lastModified || Date.now() }),
+        body: JSON.stringify({ path: '/' + rel + file.name, size: file.size, mtimeMs: file.lastModified || Date.now() }),
       });
     };
     var fail = function (err) {
