@@ -9,14 +9,17 @@
  * discriminator.
  *
  * Security posture:
- *   - Same Basic auth gate as every other method (fail-closed upstream in
- *     the fetch handler — nothing here re-implements auth).
+ *   - Basic auth or the signed session cookie (both fail-closed upstream
+ *     in the fetch handler — nothing here re-implements auth). Browsers
+ *     sign in through /.dav-login; the HttpOnly cookie then rides every
+ *     XHR/PUT automatically, so closing the tab never orphans a transfer.
  *   - The page carries its own CSP: inline script/style for itself,
- *     `connect/img/media-src 'self'` for same-origin XHR and previews,
- *     `frame-ancestors 'none'`. File GETs keep their `sandbox;
- *     default-src 'none'` policy — uploaded HTML still cannot run script
- *     with the browser-cached credentials; the two policies never mix
- *     because a viewer response only ever comes from a *collection* GET.
+ *     `connect-src 'self'` for same-origin XHR, `form-action 'self'` for
+ *     the sign-out form, `frame-ancestors 'none'`. No img/media-src: the
+ *     page has no previews (uploads and downloads only). File GETs keep
+ *     their `sandbox; default-src 'none'` policy — uploaded HTML still
+ *     cannot run script; the two policies never mix because a viewer
+ *     response only ever comes from a *collection* GET.
  *   - The page builds every DOM node with textContent/createElement —
  *     listing data (display names, hrefs) is never concatenated into
  *     markup, so a hostile filename cannot inject script.
@@ -31,10 +34,8 @@ const VIEWER_CSP = [
   "default-src 'none'",
   "style-src 'unsafe-inline'",
   "script-src 'unsafe-inline'",
-  "img-src 'self'",
-  "media-src 'self'",
   "connect-src 'self'",
-  "form-action 'none'",
+  "form-action 'self'",
   "base-uri 'none'",
   "frame-ancestors 'none'",
 ].join('; ');
@@ -74,9 +75,13 @@ export function wantsViewer(request: Request): boolean {
  * root; it cannot derive that from location.pathname alone (the first
  * segment is the base only when a base exists).
  */
-export function viewerResponse(basePath: string): Response {
+export function viewerResponse(basePath: string, viaSession = false): Response {
   const escaped = basePath.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
-  return new Response(VIEWER_HTML.replace('data-base=""', `data-base="${escaped}"`), {
+  const html = VIEWER_HTML.replace('data-base=""', `data-base="${escaped}"`).replace(
+    'data-session=""',
+    viaSession ? 'data-session="1"' : 'data-session=""',
+  );
+  return new Response(html, {
     status: 200,
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
@@ -132,6 +137,10 @@ body {
   flex-direction: column;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+/* Sign-out is a real form (no JS); it only shows for cookie sessions —
+   a Basic-authenticated script user has nothing to sign out of. */
+#signout { display: flex; margin: 0; }
+body:not([data-session="1"]) #signout { display: none; }
 
 /* Path line — the hero: the current location as a real path. */
 .top {
@@ -210,7 +219,6 @@ tbody tr { cursor: default; }
   white-space: nowrap;
 }
 .name a:hover { text-decoration: underline; }
-.chev { color: var(--muted); flex: none; }
 .badge.k-img { color: #7BC96F; border-color: #2f5333; }
 .badge.k-vid { color: #C7A9F5; border-color: #4b3d6b; }
 .badge.k-aud { color: #F0B37E; border-color: #5b4634; }
@@ -258,51 +266,6 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 }
 #error { color: var(--accent); }
 #empty .btn, #empty button { margin-top: 14px; }
-
-/* Preview drawer — slides in from the right; the row you clicked stays
-   visible behind it, so you always see where the preview came from. */
-.drawer {
-  position: fixed;
-  top: 0; right: 0; bottom: 0;
-  width: min(440px, 100vw);
-  background: var(--panel);
-  border-left: 1px solid var(--line);
-  box-shadow: -16px 0 40px rgba(0, 0, 0, 0.45);
-  display: flex;
-  flex-direction: column;
-  transform: translateX(24px);
-  opacity: 0;
-  visibility: hidden;
-  transition: transform 200ms var(--ease-out), opacity 200ms var(--ease-out), visibility 0s linear 200ms;
-  z-index: 10;
-}
-.drawer.open {
-  transform: none;
-  opacity: 1;
-  visibility: visible;
-  transition: transform 200ms var(--ease-out), opacity 200ms var(--ease-out), visibility 0s;
-}
-.drawer-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line);
-}
-#drawer-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-#drawer-close { padding: 2px 10px; font-size: 16px; line-height: 1.4; }
-.drawer-body { flex: 1; overflow: auto; padding: 16px; }
-.drawer-body img, .drawer-body video { max-width: 100%; max-height: 100%; display: block; margin: 0 auto; background: var(--bg); }
-.drawer-body pre {
-  margin: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--text);
-}
-.drawer-body .meta { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
-.drawer-body .placeholder { color: var(--muted); text-align: center; padding: 40px 0; }
 
 /* Toolbar progress chip — right where the eye already is. */
 .upchip {
@@ -378,7 +341,6 @@ body.uploading main { padding-bottom: 68px; }
 .pline.ok { color: #7BC96F; }
 .pline.bad { color: var(--accent); }
 @keyframes pline-slide { from { transform: translateX(-100%); } to { transform: translateX(320%); } }
-.drawer-body audio { width: min(440px, 100%); display: block; margin: 0 auto; }
 
 @media (max-width: 640px) {
   th:nth-child(3), td:nth-child(3) { display: none; }
@@ -387,19 +349,20 @@ body.uploading main { padding-bottom: 68px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .pline.indet i { animation: none; }
-  /* Keep the show/hide (it carries state), drop the movement. */
-  .drawer { transition: opacity 150ms linear, visibility 0s linear 150ms; transform: none; }
-  .drawer.open { transition: opacity 150ms linear, visibility 0s; transform: none; }
 }
 </style>
 </head>
-<body data-viewer="1" data-base="">
+<body data-viewer="1" data-base="" data-session="">
 <header class="top">
   <nav id="crumbs" class="mono" aria-label="Path"></nav>
   <button id="upload" class="primary">Upload files</button>
   <span id="upchip" class="upchip" hidden><em><i></i></em><span class="pct"></span></span>
   <button id="mkdir">New folder</button>
   <button id="refresh" aria-label="Refresh listing">Refresh</button>
+  <form id="signout" method="post" action="/.dav-logout">
+    <input type="hidden" name="next" value="">
+    <button type="submit">Sign out</button>
+  </form>
   <input id="picker" type="file" multiple hidden>
 </header>
 <main>
@@ -417,14 +380,6 @@ body.uploading main { padding-bottom: 68px; }
   <p id="empty" hidden></p>
   <p id="error" role="alert" hidden></p>
 </main>
-<aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Preview" aria-hidden="true">
-  <div class="drawer-head">
-    <span id="drawer-name" class="mono"></span>
-    <a id="drawer-dl" class="btn" download>Download</a>
-    <button id="drawer-close" aria-label="Close preview">&times;</button>
-  </div>
-  <div id="drawer-body" class="drawer-body"></div>
-</aside>
 <div id="uploads" class="uploads" aria-live="polite"></div>
 <script>
 (function () {
@@ -503,12 +458,6 @@ body.uploading main { padding-bottom: 68px; }
   var errorEl = document.getElementById('error');
   var picker = document.getElementById('picker');
   var uploads = document.getElementById('uploads');
-  var drawer = document.getElementById('drawer');
-  var drawerName = document.getElementById('drawer-name');
-  var drawerDl = document.getElementById('drawer-dl');
-  var drawerBody = document.getElementById('drawer-body');
-  var drawerClose = document.getElementById('drawer-close');
-  var returnFocus = null;
   var entries = [];
 
   function el(tag, cls, text) {
@@ -736,10 +685,6 @@ body.uploading main { padding-bottom: 68px; }
       wrap.appendChild(link);
       var ext = extOf(entry.name);
       if (ext) wrap.appendChild(el('span', 'badge k-' + kindOf(entry.name), ext));
-      link.addEventListener('click', function (ev) {
-        ev.preventDefault();
-        openDrawer(entry, link);
-      });
     }
     tdName.appendChild(wrap);
     tr.appendChild(tdName);
@@ -779,123 +724,6 @@ body.uploading main { padding-bottom: 68px; }
     tr.appendChild(tdAct);
     return tr;
   }
-
-  function mediaPlay(node) {
-    // Direct watch: the row click is a user gesture, so start now; a refused
-    // play() (policy/codec) is non-fatal — controls stay visible.
-    try {
-      var p = node.play();
-      if (p && p.catch) p.catch(function () {});
-    } catch (e) {}
-  }
-
-  function openDrawer(entry, source) {
-    returnFocus = source || null;
-    drawerName.textContent = entry.name;
-    drawerName.title = entry.name;
-    drawerDl.href = entry.href;
-    drawerBody.textContent = '';
-    var kind = kindOf(entry.name);
-
-    if (kind === 'img') {
-      var img = document.createElement('img');
-      img.src = entry.href;
-      img.alt = entry.name;
-      drawerBody.appendChild(img);
-    } else if (kind === 'vid') {
-      var video = document.createElement('video');
-      video.src = entry.href;
-      video.controls = true;
-      video.playsInline = true;
-      video.preload = 'metadata';
-      video.addEventListener('error', function () {
-        drawerBody.textContent = '';
-        drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
-        drawerBody.appendChild(el('div', 'placeholder', 'This video cannot play in this browser — use Download.'));
-      });
-      drawerBody.appendChild(video);
-      mediaPlay(video);
-    } else if (kind === 'aud') {
-      var audio = document.createElement('audio');
-      audio.src = entry.href;
-      audio.controls = true;
-      audio.preload = 'metadata';
-      audio.addEventListener('error', function () {
-        drawerBody.textContent = '';
-        drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
-        drawerBody.appendChild(el('div', 'placeholder', 'This audio cannot play in this browser — use Download.'));
-      });
-      drawerBody.appendChild(audio);
-      mediaPlay(audio);
-    } else if (kind === 'txt' && entry.size <= 1048576) {
-      drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
-      fetch(entry.href).then(function (res) {
-        if (!res.ok) throw new Error(String(res.status));
-        // The listing's size is metadata, not a bound — read through a
-        // reader with a hard byte cap so a lying 0-byte entry cannot buffer
-        // a huge body into the tab.
-        if (!res.body || !res.body.getReader) return res.text();
-        var reader = res.body.getReader();
-        var decoder = new TextDecoder();
-        var out = '';
-        var total = 0;
-        var pump = function () {
-          return reader.read().then(function (r) {
-            if (r.done) return out;
-            total += r.value.byteLength;
-            out += decoder.decode(r.value, { stream: true });
-            if (total >= 1048576) {
-              reader.cancel();
-              return out + '\\n… (stopped at 1 MB preview cap)';
-            }
-            return pump();
-          });
-        };
-        return pump();
-      }).then(function (text) {
-        drawerBody.appendChild(el('pre', '', text.length > 200000 ? text.slice(0, 200000) + '\\n… (truncated)' : text));
-      }).catch(function () {
-        drawerBody.textContent = '';
-        drawerBody.appendChild(el('div', 'placeholder', 'Could not load the file.'));
-      });
-    } else {
-      drawerBody.appendChild(el('div', 'meta', (entry.isDir ? '' : fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : ''))));
-      drawerBody.appendChild(el('div', 'placeholder', kind === 'txt' ? 'Too large to preview — use Download.' : 'No preview for this type — use Download.'));
-    }
-
-    drawer.classList.add('open');
-    drawer.setAttribute('aria-hidden', 'false');
-    drawerClose.focus();
-  }
-
-  function closeDrawer() {
-    drawer.classList.remove('open');
-    drawer.setAttribute('aria-hidden', 'true');
-    // Stop a playing preview when it leaves.
-    drawerBody.textContent = '';
-    if (returnFocus && document.contains(returnFocus)) returnFocus.focus();
-    returnFocus = null;
-  }
-  drawerClose.addEventListener('click', closeDrawer);
-  document.addEventListener('keydown', function (ev) {
-    if (ev.key === 'Escape' && drawer.classList.contains('open')) closeDrawer();
-  });
-  // role=dialog aria-modal is set in the markup; keep Tab inside it while
-  // open (focus starts on the close button — see openDrawer).
-  drawer.addEventListener('keydown', function (ev) {
-    if (ev.key !== 'Tab' || !drawer.classList.contains('open')) return;
-    var focusables = drawer.querySelectorAll('a[href], button:not([disabled])');
-    if (!focusables.length) return;
-    var first = focusables[0];
-    var last = focusables[focusables.length - 1];
-    if (ev.shiftKey && document.activeElement === first) {
-      ev.preventDefault();
-      last.focus();
-    } else if (!ev.shiftKey && document.activeElement === last) {
-      ev.preventDefault();
-      first.focus();
-    }
-  });
 
   function statusLine(name, cls, text) {
     var line = el('div', cls, name + ' — ' + text);

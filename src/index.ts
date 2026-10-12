@@ -1,6 +1,17 @@
 import { TeraboxClient, TeraboxError, errIsNum } from './terabox';
 import { errorResponse, handleWebDav } from './webdav';
 import { createDavStore, DavState } from './davstate';
+import { wantsViewer } from './viewer';
+import {
+  crossSitePost,
+  createSessionToken,
+  loginPageResponse,
+  sanitizeNext,
+  sessionClearCookie,
+  sessionCookieValue,
+  sessionSetCookie,
+  sessionUsername,
+} from './login';
 import type { Env } from './types';
 
 // The Durable Object holding advisory WebDAV state (locks + dead props).
@@ -8,7 +19,7 @@ import type { Env } from './types';
 // `DAV_STATE` binding's class_name.
 export { DavState };
 
-interface Credential {
+export interface Credential {
   username: string;
   password: string;
 }
@@ -75,16 +86,20 @@ function validBasicAuth(request: Request, env: Env): boolean {
   }
   const sep = decoded.indexOf(':');
   if (sep === -1) return false;
-  const username = decoded.slice(0, sep);
-  const password = decoded.slice(sep + 1);
+  return credsMatch(creds, decoded.slice(0, sep), decoded.slice(sep + 1));
+}
 
-  // Branchless full-list comparison: every entry gets BOTH compares on every
-  // attempt and the loop never exits early, so total work depends only on the
-  // configured credential count — never on whether a presented username
-  // exists (the `.some(a && b)` composition short-circuited the password
-  // compare for unknown usernames: a credential-existence oracle). Residual:
-  // constantTimeEquals still early-returns on length mismatch (node's
-  // timingSafeEqual does too); length is not treated as a secret here.
+/**
+ * Branchless full-list comparison: every entry gets BOTH compares on every
+ * attempt and the loop never exits early, so total work depends only on the
+ * configured credential count — never on whether a presented username
+ * exists (the `.some(a && b)` composition short-circuited the password
+ * compare for unknown usernames: a credential-existence oracle). Residual:
+ * constantTimeEquals still early-returns on length mismatch (node's
+ * timingSafeEqual does too); length is not treated as a secret here.
+ * Shared by the Basic gate and the login form.
+ */
+function credsMatch(creds: Credential[], username: string, password: string): boolean {
   let matched = 0;
   for (const c of creds) {
     const userOk = Number(constantTimeEquals(c.username, username));
@@ -176,12 +191,35 @@ const worker: ExportedHandler<Env> = {
       log('error', 'WebDAV server disabled: COOKIE is unset');
       return withSecurityHeaders(errorResponse('WebDAV server not configured', 500));
     }
-    if (!validBasicAuth(request, env)) {
-      // Fail closed for every method, CORS preflight included: a preflight
-      // branch that answered 204 without credentials was both an auth bypass
-      // on an otherwise airtight surface and a config-state oracle — and it
-      // emitted no Access-Control-Allow-* headers anyway, so it never enabled
-      // cross-origin use in the first place.
+    // The session endpoints ARE the auth path — they run before the gate.
+    if (url.pathname === '/.dav-login' || url.pathname === '/.dav-logout') {
+      return withSecurityHeaders(await handleSessionEndpoint(request, url.pathname, env, configuredCreds));
+    }
+
+    // Basic first (WebDAV clients and scripts send it on every request),
+    // then the browser session cookie. Fail closed for every method,
+    // CORS preflight included: a preflight branch that answered 204
+    // without credentials was both an auth bypass on an otherwise
+    // airtight surface and a config-state oracle — and it emitted no
+    // Access-Control-Allow-* headers anyway, so it never enabled
+    // cross-origin use in the first place.
+    const basicOk = validBasicAuth(request, env);
+    let sessionUser: string | null = null;
+    if (!basicOk) {
+      const token = sessionCookieValue(request);
+      if (token) sessionUser = await sessionUsername(token, env.USERS as string, configuredCreds);
+    }
+    if (!basicOk && sessionUser === null) {
+      // A browser page navigation with no credentials at all gets the
+      // sign-in form: Basic prompts aren't reliably cached (close the tab,
+      // the prompt returns — and a PUT without credentials fails as a bare
+      // network error). Anything that *presented* Basic keeps the RFC 7235
+      // challenge; so does every non-browser method.
+      const presentedBasic =
+        (request.headers.get('Authorization') || '').slice(0, 6).toLowerCase() === 'basic ';
+      if (!presentedBasic && wantsViewer(request)) {
+        return withSecurityHeaders(loginPageResponse(url.pathname));
+      }
       return withSecurityHeaders(errorResponse('Unauthorized', 401, undefined, WWW_AUTHENTICATE));
     }
 
@@ -200,7 +238,7 @@ const worker: ExportedHandler<Env> = {
       const response = await handleWebDav(
         request,
         client,
-        { basePath: env.PATH, rootId: env.ROOT_ID },
+        { basePath: env.PATH, rootId: env.ROOT_ID, sessionAuthed: sessionUser !== null },
         createDavStore(env),
       );
       const elapsed = Date.now() - started;
@@ -252,6 +290,95 @@ function withSecurityHeaders(response: Response): Response {
     // immutable headers — leave as-is
   }
   return response;
+}
+
+/** POST body for the login/logout forms; >8 KB is not a form. */
+async function readFormBody(request: Request): Promise<string | null> {
+  const reader = request.body?.getReader();
+  if (!reader) return '';
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const result = await reader.read();
+    if (result.done) break;
+    total += result.value.byteLength;
+    if (total > 8192) {
+      try {
+        await reader.cancel();
+      } catch {
+        // already gone — the 413 still stands
+      }
+      return null;
+    }
+    chunks.push(result.value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+/**
+ * `POST /.dav-login` validates the form and answers 303 + session cookie;
+ * `POST /.dav-logout` clears it (idempotent — an absent cookie still
+ * gets a clean redirect). Both are POST-only and cross-site-post
+ * resistant; neither ever touches Terabox.
+ */
+async function handleSessionEndpoint(
+  request: Request,
+  pathname: string,
+  env: Env,
+  creds: Credential[],
+): Promise<Response> {
+  if (request.method !== 'POST') {
+    return errorResponse('Method Not Allowed', 405, undefined, { Allow: 'POST' });
+  }
+  if (crossSitePost(request)) {
+    return errorResponse('Cross-site request rejected', 403);
+  }
+  const body = await readFormBody(request);
+  if (body === null) return errorResponse('Payload Too Large', 413);
+  const params = new URLSearchParams(body);
+  let next = sanitizeNext(params.get('next'));
+
+  if (pathname === '/.dav-logout') {
+    // The sign-out form ships an empty next on purpose (the page URL is
+    // dynamic): fall back to the same-origin Referer so the redirect
+    // lands back on the collection the user was viewing.
+    if (!next) {
+      const referer = request.headers.get('Referer');
+      if (referer) {
+        try {
+          const ref = new URL(referer);
+          if (ref.origin === new URL(request.url).origin) next = ref.pathname + ref.search;
+        } catch {
+          // malformed referer — use the root below
+        }
+      }
+    }
+    next = next || '/';
+    return new Response(null, {
+      status: 303,
+      headers: { Location: next, 'Set-Cookie': sessionClearCookie(), 'Cache-Control': 'no-store' },
+    });
+  }
+
+  next = next || '/';
+  const username = params.get('user') ?? '';
+  const password = params.get('pass') ?? '';
+  if (credsMatch(creds, username, password)) {
+    const token = await createSessionToken(username, env.USERS as string);
+    return new Response(null, {
+      status: 303,
+      headers: { Location: next, 'Set-Cookie': sessionSetCookie(token), 'Cache-Control': 'no-store' },
+    });
+  }
+  // Same branchless compare as Basic, plus a floor on guessing speed.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  return loginPageResponse(next, 'Wrong user or password.');
 }
 
 // RFC 7235 §3.1: a 401 must carry the challenge on EVERY code path.

@@ -1213,7 +1213,7 @@ function multistatus(
 export async function handleWebDav(
   request: Request,
   client: TeraboxClient,
-  opts?: { basePath?: string; rootId?: string },
+  opts?: { basePath?: string; rootId?: string; sessionAuthed?: boolean },
   store: DavStore & UploadStore = createDavStore({}),
 ): Promise<Response> {
   const mount = makeMount(opts);
@@ -1324,7 +1324,7 @@ export async function handleWebDav(
 
     case 'GET':
     case 'HEAD':
-      return handleGet(request, client, absPath, method === 'HEAD', mountBasePath(mount.base));
+      return handleGet(request, client, absPath, method === 'HEAD', mountBasePath(mount.base), opts?.sessionAuthed === true);
 
     case 'PUT':
       return handlePut(request, client, store, absPath, mount);
@@ -1763,12 +1763,25 @@ function unrequestedPartialIsFull(upstream: Response, size: number): number | nu
   return Number.isFinite(length) && length > 0 && length === size ? length : null;
 }
 
+/**
+ * RFC 6266 attachment header with an ASCII fallback and the RFC 5987
+ * UTF-8 form (`filename*`), so `résumé notes.txt` downloads under its
+ * real name in every browser.
+ */
+export function contentDispositionAttachment(fileName: string): string {
+  const ascii = fileName.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(fileName)
+    .replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
 async function handleGet(
   request: Request,
   client: TeraboxClient,
   absPath: string,
   isHead: boolean,
   basePath = '',
+  sessionAuthed = false,
 ): Promise<Response> {
   let item;
   try {
@@ -1787,14 +1800,19 @@ async function handleGet(
     if (!isHead && wantsViewer(request)) {
       const pathname = new URL(request.url).pathname;
       if (!pathname.endsWith('/')) return viewerRedirect(request);
-      return viewerResponse(basePath);
+      return viewerResponse(basePath, sessionAuthed);
     }
     return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
   }
 
   const lastModifiedMs = safeMtimeSeconds(item) * 1000;
+  // Backup semantics: a browser GET of a file always *downloads* it —
+  // there is no in-page preview anymore, and opening a raw URL in a tab
+  // would just show the bytes. WebDAV clients ignore the header.
+  const downloadName = item.server_filename || absPath.split('/').pop() || 'download';
   const headers = new Headers({
     'Content-Type': contentTypeFor(item.server_filename || ''),
+    'Content-Disposition': contentDispositionAttachment(downloadName),
     'Last-Modified': rfc1123(lastModifiedMs),
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
