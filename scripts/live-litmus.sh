@@ -16,7 +16,10 @@ set -u
 B="${BASE:-https://davbox.crazy-gooner-mf.workers.dev/dav}"
 A="${USER_CRED:-taxin:404}"
 LITMUS_SRC="${LITMUS_SRC:-/tmp/opencode/litmus}"
-SUITES="${SUITES:-basic copymove locks http props protected lockbomb}"
+# Note `-` not `:-` for SUITES: an explicitly empty SUITES must reach the
+# empty-guard below and refuse (exit 2) instead of silently meaning
+# "default suites" (`:-` swallows empty and made the guard dead code).
+SUITES="${SUITES-basic copymove locks http props protected lockbomb}"
 
 # neon's harness appends every byte to debug.log in cwd unless TEST_NODEBUG —
 # that file has grown past 1 GB on this tmpfs; never let it grow again.
