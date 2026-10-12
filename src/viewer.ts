@@ -113,26 +113,28 @@ export const VIEWER_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Files</title>
+<title>davbox</title>
 <style>
 :root {
-  --bg: #12151C;
-  --panel: #181C26;
-  --row: #1D2230;
-  --line: #242A38;
-  --text: #DDE3EE;
-  --muted: #8A93A8;
-  --accent: #FF6A3D;
-  --accent-ink: #1A0E08;
+  --void: #0C1617;
+  --petrol: #122123;
+  --ridge: #173130;
+  --line: #1E3638;
+  --paper: #E6F0EE;
+  --fog: #8CA5A2;
+  --brass: #E3A857;
+  --brass-ink: #171104;
+  --jade: #6FBF8B;
+  --coral: #E8705A;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font: 14px/1.45 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  background: var(--void);
+  color: var(--paper);
+  font: 13px/1.5 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
   display: flex;
   flex-direction: column;
 }
@@ -142,49 +144,60 @@ body {
 #signout { display: flex; margin: 0; }
 body:not([data-session="1"]) #signout { display: none; }
 
-/* Path line — the hero: the current location as a real path. */
+/* Path line — the signature: the current location, brass, in mono. */
 .top {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 14px 20px;
+  gap: 10px;
+  padding: 12px 20px;
   border-bottom: 1px solid var(--line);
-  background: var(--panel);
+  background: var(--petrol);
 }
-#crumbs { flex: 1; min-width: 0; font-size: 15px; overflow-x: auto; white-space: nowrap; scrollbar-width: thin; }
-#crumbs a { color: var(--muted); text-decoration: none; }
-#crumbs a:hover { color: var(--text); text-decoration: underline; }
-#crumbs .sep { color: var(--line); padding: 0 6px; }
-#crumbs .here { color: var(--text); font-weight: 600; }
+#crumbs {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: thin;
+  padding-bottom: 2px;
+}
+#crumbs a { color: var(--fog); text-decoration: none; transition: color 120ms var(--ease-out); }
+#crumbs a:hover { color: var(--paper); text-decoration: underline; text-underline-offset: 3px; }
+#crumbs .sep { color: #3A5654; padding: 0 7px; }
+#crumbs .here { color: var(--brass); font-weight: 600; }
 button, .btn {
   font: inherit;
   border: 1px solid var(--line);
-  background: var(--row);
-  color: var(--text);
-  border-radius: 6px;
+  background: transparent;
+  color: var(--paper);
+  border-radius: 8px;
   padding: 7px 14px;
   cursor: pointer;
+  transition: background-color 120ms var(--ease-out), border-color 120ms var(--ease-out), filter 120ms var(--ease-out);
 }
+button:hover, .btn:hover { background: var(--ridge); border-color: #35555A; }
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-ink);
+  background: var(--brass);
+  border-color: var(--brass);
+  color: var(--brass-ink);
   font-weight: 600;
+  padding: 7px 16px;
 }
-button:hover, .btn:hover { border-color: var(--muted); }
-button.primary:hover { filter: brightness(1.08); border-color: var(--accent); }
-button:active { filter: brightness(0.94); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary:hover { background: var(--brass); filter: brightness(1.07); border-color: var(--brass); }
+button:active { filter: brightness(0.93); }
+:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
 
 main { flex: 1; overflow: auto; position: relative; }
 body.dropping main::after {
   content: "Drop files to upload";
   position: absolute; inset: 0;
   display: grid; place-items: center;
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
-  border: 2px dashed var(--accent);
-  font-size: 16px;
-  color: var(--text);
+  background: color-mix(in srgb, var(--void) 86%, transparent);
+  border: 2px dashed var(--brass);
+  font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--brass);
   z-index: 5;
   pointer-events: none;
 }
@@ -193,78 +206,99 @@ table { width: 100%; border-collapse: collapse; }
 th {
   text-align: left;
   font-weight: 500;
-  font-size: 12px;
-  color: var(--muted);
-  padding: 10px 20px 8px;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--fog);
+  padding: 12px 20px 9px;
   border-bottom: 1px solid var(--line);
   position: sticky; top: 0;
-  background: var(--bg);
+  background: var(--void);
+  z-index: 1;
 }
 th.num, td.num { text-align: right; }
 td {
-  padding: 9px 20px;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
 }
-@media (hover: hover) and (pointer: fine) {
-  tbody tr:hover { background: var(--row); transition: background-color 120ms var(--ease-out); }
+tbody tr {
+  cursor: default;
+  transition: background-color 140ms var(--ease-out);
 }
-tbody tr { cursor: default; }
-.name { display: flex; align-items: center; gap: 10px; min-width: 0; }
+@media (hover: hover) and (pointer: fine) {
+  tbody tr:hover,
+  tbody tr:focus-within {
+    background: color-mix(in srgb, var(--brass) 7%, var(--void));
+  }
+}
+.name { display: flex; align-items: center; gap: 11px; min-width: 0; }
 .name a {
-  color: var(--text);
+  color: var(--paper);
   text-decoration: none;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: color 120ms var(--ease-out);
 }
-.name a:hover { text-decoration: underline; }
-.badge.k-img { color: #7BC96F; border-color: #2f5333; }
-.badge.k-vid { color: #C7A9F5; border-color: #4b3d6b; }
-.badge.k-aud { color: #F0B37E; border-color: #5b4634; }
-.badge.k-txt { color: #8CB8F0; border-color: #33465e; }
-.ic-dir { color: #D9A441; }
-.ic-file { color: #93A7C6; }
-.ic-up { color: var(--muted); }
-tr.up .name a { color: var(--muted); font-weight: 600; }
+@media (hover: hover) and (pointer: fine) {
+  .name a:hover { color: var(--brass); text-decoration: underline; text-underline-offset: 3px; }
+}
+/* Extension tags: plain mono text in the kind color — no pill boxes. */
 .badge {
   flex: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10px;
-  color: var(--muted);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 1px 5px;
-  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
 }
-td.when { color: var(--muted); font-size: 12px; white-space: nowrap; }
-td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
-.row-actions { display: flex; gap: 4px; justify-content: flex-end; opacity: 0; }
-.row-actions { opacity: 1; }
+.badge.k-img { color: #7FC9A2; }
+.badge.k-vid { color: #B9A6F0; }
+.badge.k-aud { color: #E8A87C; }
+.badge.k-txt { color: #86B6E8; }
+.ic-dir { color: var(--brass); }
+.ic-file { color: var(--fog); }
+.ic-up { color: #5E7A78; }
+tr.up .name a { color: var(--fog); font-weight: 600; }
+td.when { color: var(--fog); font-size: 12px; white-space: nowrap; }
+td.size { color: var(--fog); font-size: 12px; white-space: nowrap; }
+.row-actions { display: flex; gap: 4px; justify-content: flex-end; opacity: 1; }
 @media (hover: hover) and (pointer: fine) {
-  .row-actions { opacity: 0; }
-  tbody tr:hover .row-actions, tbody tr:focus-within .row-actions { opacity: 1; transition: opacity 120ms var(--ease-out); }
+  .row-actions { opacity: 0; transition: opacity 140ms var(--ease-out); }
+  tbody tr:hover .row-actions, tbody tr:focus-within .row-actions { opacity: 1; }
 }
 .row-actions a, .row-actions button {
   display: grid; place-items: center;
   width: 28px; height: 28px;
   padding: 0;
-  color: var(--muted);
-  background: none;
-  border: none;
-  border-radius: 4px;
+  color: var(--fog);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
   text-decoration: none;
   cursor: pointer;
+  transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out), border-color 120ms var(--ease-out);
 }
-.row-actions a:hover, .row-actions button:hover { color: var(--accent); background: var(--bg); }
+.row-actions a:hover, .row-actions button:hover {
+  color: var(--brass);
+  background: var(--petrol);
+  border-color: var(--line);
+}
 
-#empty, #error {
-  margin: 48px auto;
-  max-width: 46ch;
+#empty {
+  margin: 56px auto;
+  max-width: 44ch;
   text-align: center;
-  color: var(--muted);
+  color: var(--fog);
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 30px 26px;
 }
-#error { color: var(--accent); }
+#error {
+  margin: 40px auto;
+  max-width: 52ch;
+  text-align: center;
+  color: var(--coral);
+}
 #empty .btn, #empty button { margin-top: 14px; }
 
 /* Toolbar progress chip — right where the eye already is. */
@@ -274,8 +308,8 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   gap: 9px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
-  color: var(--text);
-  background: var(--bg);
+  color: var(--paper);
+  background: var(--void);
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 5px 12px;
@@ -287,7 +321,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   display: block;
   width: 56px;
   height: 5px;
-  background: var(--line);
+  background: #23413F;
   border-radius: 3px;
   overflow: hidden;
   flex: none;
@@ -296,10 +330,11 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   position: absolute;
   left: 0; top: 0; bottom: 0;
   width: 0;
-  background: #7BC96F;
-  transition: width 160ms var(--ease-out);
+  background: var(--brass);
+  transition: width 160ms var(--ease-out), background-color 200ms var(--ease-out);
 }
-.upchip.done { border-color: #2f5333; color: #7BC96F; }
+.upchip.done { border-color: #33563F; color: var(--jade); }
+.upchip.done em i { background: var(--jade); }
 
 /* Upload status lines — fixed to the viewport bottom so they can never be
    missed while a transfer is running; they append and never move rows. */
@@ -308,24 +343,24 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   left: 0; right: 0; bottom: 0;
   z-index: 30;
   border-top: 1px solid var(--line);
-  background: rgba(24, 28, 38, 0.94);
-  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.4);
+  background: rgba(12, 22, 23, 0.96);
+  box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.45);
   padding: 10px 20px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
-  color: var(--text);
+  color: var(--paper);
   max-height: 120px;
   overflow: auto;
 }
 .uploads:empty { display: none; }
 body.uploading main { padding-bottom: 68px; }
-.uploads .ok { color: #7BC96F; }
-.uploads .bad { color: var(--accent); }
+.uploads .ok { color: var(--jade); }
+.uploads .bad { color: var(--coral); }
 /* Upload progress lines: the bar sits behind the status text. */
 .pline {
   position: relative;
   overflow: hidden;
-  border-radius: 3px;
+  border-radius: 4px;
   padding: 2px 6px;
   margin: 2px -6px;
 }
@@ -333,18 +368,20 @@ body.uploading main { padding-bottom: 68px; }
   position: absolute;
   left: 0; top: 0; bottom: 0;
   width: 0;
-  background: rgba(123, 201, 111, 0.35);
+  background: color-mix(in srgb, var(--brass) 35%, transparent);
   transition: width 160ms var(--ease-out);
 }
 .pline.indet i { width: 30%; animation: pline-slide 900ms ease-in-out infinite alternate; }
 .pline span { position: relative; }
-.pline.ok { color: #7BC96F; }
-.pline.bad { color: var(--accent); }
+.pline.ok { color: var(--jade); }
+.pline.ok i { background: color-mix(in srgb, var(--jade) 30%, transparent); }
+.pline.bad { color: var(--coral); }
 @keyframes pline-slide { from { transform: translateX(-100%); } to { transform: translateX(320%); } }
 
 @media (max-width: 640px) {
   th:nth-child(3), td:nth-child(3) { display: none; }
-  .top { padding: 12px 14px; gap: 10px; }
+  .top { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
+  #crumbs { flex-basis: 100%; order: -1; }
   td, th { padding-left: 14px; padding-right: 14px; }
 }
 @media (prefers-reduced-motion: reduce) {

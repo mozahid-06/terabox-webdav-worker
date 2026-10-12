@@ -187,13 +187,14 @@ export function loginPageResponse(next: string, error?: string): Response {
 <title>Sign in</title>
 <style>
 :root {
-  --bg: #12151C;
-  --panel: #181C26;
-  --line: #242A38;
-  --text: #DDE3EE;
-  --muted: #8A93A8;
-  --accent: #FF6A3D;
-  --accent-ink: #1A0E08;
+  --void: #0C1617;
+  --petrol: #122123;
+  --line: #1E3638;
+  --paper: #E6F0EE;
+  --fog: #8CA5A2;
+  --brass: #E3A857;
+  --brass-ink: #171104;
+  --coral: #E8705A;
 }
 * { box-sizing: border-box; }
 body {
@@ -201,58 +202,70 @@ body {
   min-height: 100vh;
   display: grid;
   place-items: center;
-  background: var(--bg);
-  color: var(--text);
-  font: 14px/1.45 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  background: var(--void);
+  color: var(--paper);
+  font: 13px/1.5 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
 }
 .card {
   width: min(360px, calc(100vw - 40px));
-  background: var(--panel);
+  background: var(--petrol);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 28px 26px 26px;
+  border-top: 3px solid var(--brass);
+  border-radius: 12px;
+  padding: 30px 28px 28px;
 }
-h1 { margin: 0 0 2px; font-size: 20px; letter-spacing: 0.2px; }
-.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+h1 {
+  margin: 0 0 3px;
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+h1 .dot { color: var(--brass); }
+.sub { margin: 0 0 22px; color: var(--fog); font-size: 13px; }
 .err {
   margin: 0 0 16px;
-  padding: 9px 12px;
-  border: 1px solid #5a2b22;
-  border-radius: 6px;
-  background: #241417;
-  color: #FF8C6E;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--coral) 45%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--coral) 10%, var(--void));
+  color: #F2A08D;
   font-size: 13px;
 }
-label { display: block; margin-bottom: 14px; font-size: 13px; color: var(--muted); }
+label { display: block; margin-bottom: 15px; font-size: 12.5px; color: var(--fog); }
 input {
   display: block;
   width: 100%;
   margin-top: 6px;
   padding: 9px 11px;
   border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--text);
+  border-radius: 8px;
+  background: var(--void);
+  color: var(--paper);
   font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  transition: border-color 120ms ease;
 }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+input:hover { border-color: #35555A; }
+input:focus { outline: 2px solid var(--brass); outline-offset: 1px; border-color: var(--brass); }
 button {
   width: 100%;
   margin-top: 4px;
   padding: 10px 12px;
-  border: none;
-  border-radius: 6px;
-  background: var(--accent);
-  color: var(--accent-ink);
+  border: 1px solid var(--brass);
+  border-radius: 8px;
+  background: var(--brass);
+  color: var(--brass-ink);
   font: 600 14px ui-sans-serif, system-ui, sans-serif;
   cursor: pointer;
+  transition: filter 120ms ease;
 }
-button:hover { filter: brightness(1.08); }
+button:hover { filter: brightness(1.07); }
+button:active { filter: brightness(0.93); }
+button:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
 </style>
 </head>
 <body>
 <main class="card">
-  <h1>davbox</h1>
+  <h1>davbox<span class="dot">.</span></h1>
   <p class="sub">Sign in to browse and back up files.</p>
   ${error ? `<p class="err" role="alert">${escapeHtml(error)}</p>` : ''}
   <form method="post" action="/.dav-login" autocomplete="on">
