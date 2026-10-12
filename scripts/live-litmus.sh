@@ -14,7 +14,7 @@
 # /dav/litmus/litmus/ work collection and needs the parent to exist).
 set -u
 B="${BASE:-https://davbox.crazy-gooner-mf.workers.dev/dav}"
-A="${USER_CRED:-taxin:404}"
+A="${USER_CRED:-test:911}"
 LITMUS_SRC="${LITMUS_SRC:-/tmp/opencode/litmus}"
 # Note `-` not `:-` for SUITES: an explicitly empty SUITES must reach the
 # empty-guard below and refuse (exit 2) instead of silently meaning

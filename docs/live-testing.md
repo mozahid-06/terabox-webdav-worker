@@ -7,8 +7,11 @@ after every campaign so future sessions (human or AI) start with context.
 
 - Worker: `https://davbox.crazy-gooner-mf.workers.dev/` (deploys are **manual**
   `wrangler deploy` — the dashboard Git integration exists but is not enabled)
-- Credentials: the WebDAV basic-auth test pair ships as a default in
-  `scripts/live-smoke.sh` / `scripts/live-litmus.sh` (local throwaway auth);
+- Credentials: WebDAV basic-auth test pair **`test:911`** (rotated from
+  `taxin:404` on 2026-10-12) ships as a default in
+  `scripts/live-smoke.sh` / `scripts/live-litmus.sh`. Test-only — it is
+  stored in the `USERS` secret, never changes again, and gets deleted
+  together with the project when all work is done;
   the **Terabox session cookie + jsToken are env-only and never committed** —
   pass via `COOKIE`/`JSTOKEN` (and `USER_CRED` to override the test pair)
 - Test account content: folders `BackupFolder/ mern/ hacking/ omacom/ tools/ …`,
@@ -600,8 +603,11 @@ body cap, so large files go through the script. No R2 anywhere: 4 MiB chunk
 requests + the DO already cover any size, and S3 staging would not help gvfs.
 
 Deferred (user decisions): taskid `async=1` confirmation (deliberate bclone
-parity), uploadId nonce (would break the `tbbig` client), account password
-rotation (`taxin:404` still live). ~~DO-backed cross-isolate pacing~~ shipped
+parity), uploadId nonce (would break the `tbbig` client).
+~~account password rotation~~ **done 2026-10-12**: rotated to `test:911`
+(test-only pair in the `USERS` secret; deleted together with the project
+when all work is done — no further rotation planned).
+~~DO-backed cross-isolate pacing~~ shipped
 2026-10-11 (the DAV_STATE DO `/api-slot` route serializes the reservation
 account-wide; the isolate floor is the backstop).
 
