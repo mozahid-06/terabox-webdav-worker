@@ -611,14 +611,81 @@ when all work is done — no further rotation planned).
 2026-10-11 (the DAV_STATE DO `/api-slot` route serializes the reservation
 account-wide; the isolate floor is the backstop).
 
+## Campaign 7 — the website: file manager, downloads-only, session sign-in (2026-10-12)
+
+The in-page file viewer grew into a small file manager and then got
+hardened as a **backup surface** (the user's framing: this is a serious
+backup option, so uploads/downloads must be bulletproof and credentials
+must never strand a transfer).
+
+**File manager (`3582d03` → `d24dcd25`):** new folder (MKCOL), rename
+(MOVE + `Overwrite: F`), delete (confirm), refresh, status-bar feedback,
+row actions on touch; upload via XHR with real progress — fixed bottom
+strip + toolbar chip (`name · 31%` → `100% · finishing…` → `✓ uploaded`),
+`body.uploading` padding via MutationObserver; `..` parent row (hidden at
+mount home); kind-colored badges; server MIME widened (+14 types) with a
+client/server list-alignment pin.
+
+**Downloads-only (`4b1ef7e`):** previews are gone — no drawer, no
+`img-src`/`media-src` in the viewer CSP. Every file GET answers
+`Content-Disposition: attachment` (ASCII fallback + RFC 5987
+`filename*=UTF-8''…`), so a browser click or raw URL always downloads;
+WebDAV clients ignore the header. Viewer CSP tightened to
+`form-action 'self'` (sign-out form) and the viewer carries
+`Cache-Control: no-store` + `Vary: Accept` as before. Litmus/smoke are
+unaffected (they never send `Accept: text/html`).
+
+**Session sign-in (`4b1ef7e` → live `b5fcb71a`):** closes the credential
+persistence hole — Basic auth prompts are not cached, so closing the tab
+orphaned in-flight PUTs as bare `network error`s. Now an unauthenticated
+browser navigation (GET, accepts HTML, no `Authorization` presented) gets
+a sign-in page instead of a 401:
+
+- `POST /.dav-login` (form-encoded `user`/`pass`/`next`) → `303` +
+  `Set-Cookie: davbox_session=…; HttpOnly; Secure; SameSite=Strict; Path=/;
+  Max-Age=2592000` (30 days). The token is HMAC-SHA256 over
+  `b64url(user)|exp` keyed by the **raw USERS string** (rotating USERS or
+  deleting a user kills sessions) and re-checks the user still exists.
+- Auth gate: Basic first (clients/scripts unchanged — wrong Basic still
+  gets `WWW-Authenticate`, every non-browser method still 401), then the
+  cookie. Only the browser-with-no-credentials path sees the form.
+- `POST /.dav-logout` clears the cookie (idempotent; `next` falls back to
+  the same-origin Referer for the no-JS form). Token is stateless — what
+  makes logout real is the browser dropping the cookie.
+- Abuse controls: `Sec-Fetch-Site: cross-site` (or other hostile value) →
+  403, 8 KB body cap → 413, 400 ms delay on failed login, `sanitizeNext`
+  kills `//evil` open redirects, endpoints are POST-only (405 + `Allow`).
+- The page shows the sign-out button only for cookie sessions
+  (`data-session="1"`); Basic-authenticated page views keep it hidden.
+
+**Verification:** gate **387/387** (+15: session-login describe,
+attachment pins, CSP pins; the unauth-401 pin became "form for browsers /
+401+challenge for WebDAV"), live smoke **34/34** on `b5fcb71a`, and a
+fresh-profile Chromium run (`/tmp/opencode/viewer-login-e2e.tmp.mjs`,
+**18/18**, no injected auth headers): login page deep-links `next`, wrong
+password → error + no cookie, sign-in → viewer + hardened cookie
+attributes, upload chip → `✓ uploaded` → row appears, fetch sees the
+attachment header, real download lands with matching bytes while the
+page stays put, a brand-new tab after closing the first is still signed
+in, sign-out → form again + cookie gone. Screenshots:
+`/tmp/opencode/up/login-{page,viewer,upload-mid,upload-done,newtab,after-logout}.png`.
+
+Harness gotchas discovered (live-only, invisible to unit tests): workers'
+`fetch` has no cookie jar — tests asserting `Set-Cookie` on a `303` must
+send `redirect: 'manual'` or they chase the redirect unauthenticated;
+headless Chromium **wedges the whole tab** on the page's overwrite
+`window.confirm` unless a `page.on('dialog')` handler answers it (the 412
+create-only PUT fires it whenever the artifact name already exists); and
+the live mount has no `docs` folder — harness paths go under `/dav/`.
+
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-12, post review rounds 4–17 + perf work): `main` =
+Branch state (2026-10-12, post review rounds 4–18 + perf work + the Campaign 7 website): `main` =
 production; deploys are **manual** `wrangler deploy` after `npm run review`
 (the optional dashboard Git integration is documented in README — do not
 assume a push deploys). Current verification: **litmus 138/138** (basic,
 copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
-**353 unit tests**. Latest shipped work: download-URL cache (repeat-open TTFB
+**387 unit tests**. Latest shipped work: session sign-in form + attachment downloads + preview removal (`4b1ef7e`, live `b5fcb71a`), download-URL cache (repeat-open TTFB
 0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
 (`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
 cap is TeraBox free-tier, colo-independent), review rounds 14–17 (rounds 14–15 = the session-cookie boundary work below; 16–17 = test/doc/script hardening, findings in `scripts/live-litmus.sh` + quota discipline in AGENTS.md; session
@@ -641,7 +708,9 @@ litmus via `scripts/live-litmus.sh`; results land in
 `/tmp/opencode/postreset/`). **Verified 2026-10-12** on `v4708a473`
 (`538963e`): live smoke **34/34** + litmus **138/138** (basic 16,
 copymove 13, locks 40, http 3, props 33, protected 30, lockbomb 3) after
-the 00:00 UTC quota reset. The branch also
+the 00:00 UTC quota reset; then re-verified the Campaign 7 deploy
+(`b5fcb71a`): smoke **34/34** + gate 387/387 + real-Chromium login flow
+18/18. The branch also
 includes the RFC 7233 GET/ETag conformance hardening (merged `d065d53`,
 deployed) and the full-repo audit hardening (merged `4d87f47`: traversal
 containment, metaCache cap, errno→status maps, DO-backed lock/prop tests,
