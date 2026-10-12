@@ -39,19 +39,52 @@ const VIEWER_CSP = [
   "frame-ancestors 'none'",
 ].join('; ');
 
-/** True when this request is a browser page navigation, not a WebDAV GET. */
+/**
+ * True when this request is a browser page navigation, not a WebDAV GET.
+ *
+ * The Accept header is negotiated, not substring-matched: `text/html;q=0`
+ * is an explicit refusal (RFC 9110 §12.5.1) and must keep the collection
+ * 405 — a `.includes()` here would happily serve the viewer to a client
+ * that said it never wants HTML. The first `text/html` range governs (the
+ * exact match's q wins over any later duplicate).
+ */
 export function wantsViewer(request: Request): boolean {
   if (request.method.toUpperCase() !== 'GET') return false;
   const accept = request.headers.get('Accept');
-  return accept !== null && accept.toLowerCase().includes('text/html');
+  if (!accept) return false;
+  for (const part of accept.split(',')) {
+    const fields = part.trim().split(';');
+    if ((fields[0] || '').trim().toLowerCase() !== 'text/html') continue;
+    let q = 1;
+    for (const param of fields.slice(1)) {
+      const eq = param.indexOf('=');
+      if (eq === -1) continue;
+      if (param.slice(0, eq).trim().toLowerCase() !== 'q') continue;
+      const value = Number(param.slice(eq + 1).trim());
+      q = Number.isNaN(value) ? 1 : value;
+    }
+    return q > 0;
+  }
+  return false;
 }
 
-export function viewerResponse(): Response {
-  return new Response(VIEWER_HTML, {
+/**
+ * @param basePath The mount base (encoded, '' at the domain root) — the
+ * page needs it to render a home crumb that always points at the WebDAV
+ * root; it cannot derive that from location.pathname alone (the first
+ * segment is the base only when a base exists).
+ */
+export function viewerResponse(basePath: string): Response {
+  const escaped = basePath.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+  return new Response(VIEWER_HTML.replace('data-base=""', `data-base="${escaped}"`), {
     status: 200,
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
+      // The 200/405 pair below differs only by Accept (both no-store — but
+      // state the dimension anyway so a cache that ignores no-store still
+      // cannot serve the wrong variant).
+      'Vary': 'Accept',
       'Content-Security-Policy': VIEWER_CSP,
     },
   });
@@ -70,7 +103,7 @@ export function viewerRedirect(request: Request): Response {
 
 // The page: one self-contained document, zero third-party requests (no
 // webfonts under CSP — system sans for UI, system mono for path/size/date).
-const VIEWER_HTML = `<!doctype html>
+export const VIEWER_HTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -284,7 +317,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 }
 </style>
 </head>
-<body data-viewer="1">
+<body data-viewer="1" data-base="">
 <header class="top">
   <nav id="crumbs" class="mono" aria-label="Path"></nav>
   <button id="upload" class="primary">Upload files</button>
@@ -305,7 +338,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   <p id="empty" hidden></p>
   <p id="error" role="alert" hidden></p>
 </main>
-<aside id="drawer" class="drawer" aria-label="Preview" aria-hidden="true">
+<aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Preview" aria-hidden="true">
   <div class="drawer-head">
     <span id="drawer-name" class="mono"></span>
     <a id="drawer-dl" class="btn" download>Download</a>
@@ -317,7 +350,10 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 <script>
 (function () {
   'use strict';
-  var base = location.pathname;
+  // Collapse any leading double slash first: a double-slash path still
+  // reaches the root collection, and a base of '//' would make every fetch
+  // a protocol-relative (cross-origin) URL.
+  var base = location.pathname.replace(/^\\/+/, '/');
   if (base.charAt(base.length - 1) !== '/') base += '/';
 
   var PROPFIND_BODY =
@@ -327,8 +363,8 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     '</D:prop></D:propfind>';
 
   var IMG = ['png','jpg','jpeg','gif','webp','svg','avif','bmp','ico'];
-  var VID = ['mp4','webm','ogv','ogg','m4v'];
-  var TXT = ['txt','md','markdown','json','js','mjs','cjs','ts','tsx','jsx','css','scss','less','html','htm','xml','yml','yaml','toml','ini','conf','cfg','sh','bash','zsh','py','rb','php','go','rs','java','c','h','cpp','hpp','cs','sql','log','csv','env','lock','properties','srt','vtt','tex','r','swift','kt','lua','pl','diff','patch','dockerfile','makefile'];
+  var VID = ['mp4','webm','ogv','m4v'];
+  var TXT = ['txt','md','markdown','json','js','mjs','cjs','ts','tsx','jsx','css','scss','less','html','htm','xml','yml','yaml','toml','ini','conf','cfg','sh','bash','zsh','py','rb','php','go','rs','java','c','h','cpp','hpp','cs','sql','log','csv','env','lock','properties','srt','vtt','tex','r','swift','kt','lua','pl','diff','patch'];
 
   var crumbs = document.getElementById('crumbs');
   var rows = document.getElementById('rows');
@@ -360,45 +396,57 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     errorEl.textContent = '';
   }
 
+  function decodeSeg(seg) {
+    try { return decodeURIComponent(seg); } catch (e) { return seg; }
+  }
+
   function renderCrumbs() {
     crumbs.textContent = '';
+    var home = document.body.getAttribute('data-base') || '/';
+    if (home.charAt(home.length - 1) !== '/') home += '/';
+    var homeParts = home.split('/').filter(Boolean);
     var parts = base.split('/').filter(Boolean);
-    if (parts.length === 0) {
-      crumbs.appendChild(el('span', 'here', '/'));
+    var under = parts.slice(homeParts.length); // segments below the mount root
+    var homeLabel = homeParts.length ? homeParts[homeParts.length - 1] : '/';
+    if (under.length === 0) {
+      crumbs.appendChild(el('span', 'here', homeLabel));
       return;
     }
-    var acc = '/';
-    for (var i = 0; i < parts.length; i++) {
-      acc += parts[i] + '/';
-      if (i > 0 || parts.length > 0) {
-        var sep = el('span', 'sep', '/');
-        if (i === 0 && parts.length === 1) {
-          crumbs.appendChild(sep);
-        } else if (i > 0) {
-          crumbs.appendChild(sep);
-        }
-      }
-      if (i === parts.length - 1) {
-        crumbs.appendChild(el('span', 'here', parts[i]));
+    var homeA = document.createElement('a');
+    homeA.href = home;
+    homeA.textContent = homeLabel;
+    crumbs.appendChild(homeA);
+    var acc = home;
+    for (var i = 0; i < under.length; i++) {
+      acc += under[i] + '/';
+      crumbs.appendChild(el('span', 'sep', '/'));
+      if (i === under.length - 1) {
+        crumbs.appendChild(el('span', 'here', decodeSeg(under[i])));
       } else {
         var a = document.createElement('a');
         a.href = acc;
-        a.textContent = parts[i];
+        a.textContent = decodeSeg(under[i]);
         crumbs.appendChild(a);
       }
     }
   }
 
   function extOf(name) {
+    // dot >= 0: a dotfile's extension is the part after its leading dot
+    // ('.env' -> 'env') — dotfiles were unpreviewable when the dot had to
+    // come after a prefix; no dot at all -> ''.
     var dot = name.lastIndexOf('.');
-    return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+    return dot === -1 ? '' : name.slice(dot + 1).toLowerCase();
   }
+
+  var BARE = ['dockerfile', 'makefile', 'rakefile', 'gemfile', 'procfile', 'license', 'readme'];
 
   function kindOf(name) {
     var ext = extOf(name);
     if (IMG.indexOf(ext) >= 0) return 'img';
     if (VID.indexOf(ext) >= 0) return 'vid';
     if (TXT.indexOf(ext) >= 0) return 'txt';
+    if (ext === '' && BARE.indexOf(name.toLowerCase()) >= 0) return 'txt';
     return 'other';
   }
 
@@ -455,7 +503,13 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       if (href.charAt(0) !== '/') continue;
       var decoded;
       try { decoded = decodeURIComponent(href); } catch (e) { continue; }
-      if (decoded === location.pathname) continue; // the collection itself
+      // The collection itself: compare BOTH forms — hrefs from the worker
+      // are percent-encoded like location.pathname, but a mixed raw/decoded
+      // comparison used to miss on every spaced/UTF-8 path and list the
+      // folder as its own child.
+      var selfDecoded;
+      try { selfDecoded = decodeURIComponent(location.pathname); } catch (e2) { selfDecoded = location.pathname; }
+      if (href === location.pathname || decoded === selfDecoded) continue;
       var props = {};
       var display = responses[i].getElementsByTagName('D:displayname');
       var lengths = responses[i].getElementsByTagName('D:getcontentlength');
@@ -559,7 +613,27 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
       drawerBody.appendChild(el('div', 'meta', fmtSize(entry.size) + (entry.when ? ' · ' + fmtWhen(entry.when) : '')));
       fetch(entry.href).then(function (res) {
         if (!res.ok) throw new Error(String(res.status));
-        return res.text();
+        // The listing's size is metadata, not a bound — read through a
+        // reader with a hard byte cap so a lying 0-byte entry cannot buffer
+        // a huge body into the tab.
+        if (!res.body || !res.body.getReader) return res.text();
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var out = '';
+        var total = 0;
+        var pump = function () {
+          return reader.read().then(function (r) {
+            if (r.done) return out;
+            total += r.value.byteLength;
+            out += decoder.decode(r.value, { stream: true });
+            if (total >= 1048576) {
+              reader.cancel();
+              return out + '\\n… (stopped at 1 MB preview cap)';
+            }
+            return pump();
+          });
+        };
+        return pump();
       }).then(function (text) {
         drawerBody.appendChild(el('pre', '', text.length > 200000 ? text.slice(0, 200000) + '\\n… (truncated)' : text));
       }).catch(function () {
@@ -588,6 +662,22 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape' && drawer.classList.contains('open')) closeDrawer();
   });
+  // role=dialog aria-modal is set in the markup; keep Tab inside it while
+  // open (focus starts on the close button — see openDrawer).
+  drawer.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Tab' || !drawer.classList.contains('open')) return;
+    var focusables = drawer.querySelectorAll('a[href], button:not([disabled])');
+    if (!focusables.length) return;
+    var first = focusables[0];
+    var last = focusables[focusables.length - 1];
+    if (ev.shiftKey && document.activeElement === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  });
 
   function statusLine(name, cls, text) {
     var line = el('div', cls, name + ' — ' + text);
@@ -598,11 +688,33 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   function putFile(file) {
     var line = statusLine(file.name, '', 'uploading…');
     var url = base + encodeURIComponent(file.name);
-    return fetch(url, { method: 'PUT', body: file }).then(function (res) {
+    // Create-only first: a bare PUT over an existing file is a silent
+    // overwrite server-side (WebDAV PUT default). If-None-Match: * asks for
+    // 412 instead, and only an explicit confirm replaces the existing file.
+    var send = function (ifNoneMatch) {
+      return fetch(url, {
+        method: 'PUT',
+        headers: ifNoneMatch ? { 'If-None-Match': '*' } : {},
+        body: file,
+      });
+    };
+    var replacing = false;
+    return send(true).then(function (res) {
+      if (res.status !== 412) return res;
+      if (!window.confirm(file.name + ' already exists. Replace it?')) {
+        line.className = 'bad';
+        line.textContent = file.name + ' — cancelled (existing file kept)';
+        return null;
+      }
+      replacing = true;
+      line.textContent = file.name + ' — replacing…';
+      return send(false);
+    }).then(function (res) {
+      if (!res) return;
       if (res.status === 413) throw new Error('too large (100 MB per-request edge limit)');
       if (!res.ok) throw new Error('failed with HTTP ' + res.status);
       line.className = 'ok';
-      line.textContent = file.name + ' — uploaded';
+      line.textContent = file.name + (replacing ? ' — replaced' : ' — uploaded');
       setTimeout(function () {
         if (line.parentNode) line.parentNode.removeChild(line);
       }, 4000);
@@ -627,8 +739,10 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
   });
 
   document.addEventListener('dragover', function (ev) {
+    // Always suppress the default: dropping selected text or a URL without
+    // preventDefault navigates the page and destroys the viewer state.
+    ev.preventDefault();
     if (ev.dataTransfer && Array.prototype.indexOf.call(ev.dataTransfer.types || [], 'Files') >= 0) {
-      ev.preventDefault();
       document.body.classList.add('dropping');
     }
   });
@@ -636,9 +750,9 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     if (ev.relatedTarget === null) document.body.classList.remove('dropping');
   });
   document.addEventListener('drop', function (ev) {
+    ev.preventDefault();
+    document.body.classList.remove('dropping');
     if (ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files.length) {
-      ev.preventDefault();
-      document.body.classList.remove('dropping');
       uploadFiles(ev.dataTransfer.files);
     }
   });
@@ -664,7 +778,7 @@ td.size { color: var(--muted); font-size: 12px; white-space: nowrap; }
     });
   }
 
-  document.title = base;
+  try { document.title = decodeURIComponent(base); } catch (e) { document.title = base; }
   load();
 })();
 </script>

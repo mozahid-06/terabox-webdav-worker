@@ -164,3 +164,29 @@ describe('mounted root (ROOT_ID=/sub)', () => {
 		expect(tb.nodes.has('/sub/c.txt')).toBe(true);
 	});
 });
+
+describe('viewer under the base path', () => {
+	const BROWSER_ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+
+	it('serves the viewer at /dav/ with data-base pointing at the mount', async () => {
+		const res = await request('/dav/', { headers: { Accept: BROWSER_ACCEPT } });
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+		const body = await res.text();
+		expect(body).toContain('data-viewer="1"');
+		expect(body).toContain('data-base="/dav"');
+	});
+
+	it('redirects a slash-less folder GET to the slash form under the base', async () => {
+		tb.seed('/sub/folder', { isdir: 1 });
+		const res = await request('/dav/folder', { headers: { Accept: BROWSER_ACCEPT } });
+		expect(res.status).toBe(301);
+		expect(res.headers.get('Location')).toBe(ORIGIN + '/dav/folder/');
+	});
+
+	it('keeps the collection 405 for wildcard Accept under the base', async () => {
+		const res = await request('/dav/', { headers: { Accept: '*/*' } });
+		expect(res.status).toBe(405);
+		expect(res.headers.get('Allow')).toContain('PROPFIND');
+	});
+});

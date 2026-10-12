@@ -71,6 +71,13 @@ const MIME: Record<string, string> = {
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.heic': 'image/heic',
+  '.svg': 'image/svg+xml',
+  '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
+  '.ico': 'image/x-icon',
+  '.ogv': 'video/ogg',
+  '.m4v': 'video/mp4',
+  '.m4a': 'audio/mp4',
   '.pdf': 'application/pdf',
   '.txt': 'text/plain',
   '.md': 'text/markdown',
@@ -1303,7 +1310,7 @@ export async function handleWebDav(
 
     case 'GET':
     case 'HEAD':
-      return handleGet(request, client, absPath, method === 'HEAD');
+      return handleGet(request, client, absPath, method === 'HEAD', mountBasePath(mount.base));
 
     case 'PUT':
       return handlePut(request, client, store, absPath, mount);
@@ -1742,7 +1749,13 @@ function unrequestedPartialIsFull(upstream: Response, size: number): number | nu
   return Number.isFinite(length) && length > 0 && length === size ? length : null;
 }
 
-async function handleGet(request: Request, client: TeraboxClient, absPath: string, isHead: boolean): Promise<Response> {
+async function handleGet(
+  request: Request,
+  client: TeraboxClient,
+  absPath: string,
+  isHead: boolean,
+  basePath = '',
+): Promise<Response> {
   let item;
   try {
     item = await itemInfoCached(client, absPath);
@@ -1760,7 +1773,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     if (!isHead && wantsViewer(request)) {
       const pathname = new URL(request.url).pathname;
       if (!pathname.endsWith('/')) return viewerRedirect(request);
-      return viewerResponse();
+      return viewerResponse(basePath);
     }
     return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
   }

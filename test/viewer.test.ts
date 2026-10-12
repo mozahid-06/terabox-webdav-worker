@@ -2,6 +2,7 @@ import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetDavVolatileState } from '../src/webdav';
 import { resetTeraboxCaches } from '../src/terabox';
+import { VIEWER_HTML, VIEWER_MARKER } from '../src/viewer';
 import { AUTH, MockTerabox, ORIGIN, installMock } from './helpers';
 
 let tb: MockTerabox;
@@ -37,7 +38,8 @@ describe('viewer on collection GET (browser) vs 405 (WebDAV clients)', () => {
 		expect(res.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
 		expect(res.headers.get('Cache-Control')).toBe('no-store');
 		const body = await res.text();
-		expect(body).toContain('data-viewer="1"');
+		expect(body).toContain(VIEWER_MARKER);
+		expect(res.headers.get('Vary')).toBe('Accept');
 	});
 
 	it('keeps the 405 + Allow contract for WebDAV clients (no text/html Accept)', async () => {
@@ -89,5 +91,66 @@ describe('viewer on collection GET (browser) vs 405 (WebDAV clients)', () => {
 	it('still 404s a slash-less browser GET of a missing path', async () => {
 		const res = await request('/gone/', { headers: { Accept: BROWSER_ACCEPT } });
 		expect(res.status).toBe(404);
+	});
+});
+
+describe('accept negotiation (round-18 pins)', () => {
+	it('refuses the viewer when text/html has q=0 and keeps the 405', async () => {
+		// `.includes('text/html')` (the naive check this replaced) served the
+		// viewer to a client explicitly refusing HTML.
+		const res = await request('/docs/', { headers: { Accept: 'text/html;q=0, */*' } });
+		expect(res.status).toBe(405);
+		expect(res.headers.get('Allow')).toContain('PROPFIND');
+	});
+
+	it('serves the viewer for q>0 and for partial text/html quality', async () => {
+		for (const accept of ['text/html;q=0.9, */*', 'text/html']) {
+			const res = await request('/docs/', { headers: { Accept: accept } });
+			expect(res.status).toBe(200);
+			expect(res.headers.get('Cache-Control')).toBe('no-store');
+			expect(res.headers.get('Vary')).toBe('Accept');
+		}
+	});
+
+	it('405s a client that only accepts xhtml+xml', async () => {
+		const res = await request('/docs/', { headers: { Accept: 'application/xhtml+xml' } });
+		expect(res.status).toBe(405);
+	});
+
+	it('keeps both variants no-store', async () => {
+		const viewer = await request('/docs/', { headers: { Accept: BROWSER_ACCEPT } });
+		expect(viewer.headers.get('Cache-Control')).toBe('no-store');
+		const notFound = await request('/docs/', { headers: { Accept: '*/*' } });
+		expect(notFound.headers.get('Cache-Control')).toBe('no-store');
+	});
+});
+
+describe('file GETs stay sandboxed for browsers (the security split)', () => {
+	it('serves a file under the sandbox CSP + nosniff even with a browser Accept', async () => {
+		// The viewer's permissive CSP is collection-only; file content (which
+		// an attacker can upload) must keep the sandbox on every navigation.
+		const res = await request('/a.txt', { headers: { Accept: BROWSER_ACCEPT } });
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Security-Policy')).toBe("sandbox; default-src 'none'");
+		expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+	});
+});
+
+describe('preview MIME types match what the viewer previews', () => {
+	it('serves image/video types the page will render (nosniff refuses octet-stream)', async () => {
+		tb.seed('/docs/icon.svg', { content: '<svg xmlns="http://www.w3.org/2000/svg"/>' });
+		tb.seed('/docs/clip.ogv', { content: 'ogg-video-bytes' });
+		expect((await request('/docs/icon.svg')).headers.get('Content-Type')).toBe('image/svg+xml');
+		expect((await request('/docs/clip.ogv')).headers.get('Content-Type')).toBe('video/ogg');
+	});
+});
+
+describe('the embedded page script parses', () => {
+	it('compiles the viewer page JS (a syntax error would ship untested)', () => {
+		// The page lives inside a template literal: tsc never parses it as
+		// JavaScript, so the gate would stay green on a broken script.
+		const match = /<script>([\s\S]*)<\/script>\s*<\/body>/.exec(VIEWER_HTML);
+		expect(match).not.toBeNull();
+		expect(() => new Function(match![1]!)).not.toThrow();
 	});
 });
