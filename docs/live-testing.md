@@ -780,11 +780,59 @@ answers `chunkSize: 4194304, chunkCount: 1025` (4 MiB, premium account).
 
 **Still open:** the >4 GiB end-to-end byte-proof itself — the 4 GiB free-tier
 proof (Campaign 6) stands, premium *acceptance* of >4 GiB is live-verified,
-but a full premium byte pass needs either a Workers paid plan or
-MAX_CHUNK_BYTES lowered below 4 MiB to fit the free-plan CPU budget
-comfortably. The Playbook: stage a 4 GiB+1 MiB random file, `begin` at that
+but a full premium byte pass needs a Workers paid plan (see the 31299
+finding below: it cannot be dodged by shrinking chunks).
+The Playbook: stage a 4 GiB+1 MiB random file, `begin` at that
 size, PUT the chunks (the 4 MiB recipe above), finalize, HEAD size match.
 Session was canceled (204) and staging cleaned after the 1102 wall.
+
+### The 31299 discovery: TeraBox floors the first full part at 4 MiB
+
+Afternoon follow-up (user brief: free-plan deployments must have a workable
+default; paid ones the bigger buckets). Hypothesis: shrink chunks to 2 MiB
+to halve per-request CPU and survive the 1102 wall. Shipped `baef326`
+(default 2 MiB), deployed, smoke 34/34, and the >4 GiB begin negotiated the
+new default live — but **every upload cluster (kul/dm1/dm2) refused chunk 0
+with upstream `error_code 31299`**: `"Size of superfile2 first part should
+not be smaller than slice size"`. Discriminating probes (all live, all at
+2 MiB parts, this account):
+
+- >4 GiB premium-stage file, full 2 MiB part → **31299** (502 through the
+  worker; the host ladder exhausts).
+- 5 MiB **free-class** file, full 2 MiB first part → **31299** — so the rule
+  is not premium-class-only.
+- 64 KB single-part PUT and Campaign 8's 1 MiB control → **accepted** — the
+  one part of a single-part upload is the short *last* part, which the rule
+  does not cover.
+- This morning's 4 MiB first parts (1025-chunk run) → accepted through
+  chunk ~195 — the same 2-entry placeholder `block_list`; the slice floor
+  comes from upstream per the file class, not from our block list.
+
+Conclusion: **no full-size first part below 4 MiB is legal for any
+splitting upload**; shrinking chunks cannot rescue the free-plan CPU wall.
+`MAX_CHUNK_BYTES` below 4 MiB can only (legally) apply to single-part
+files, where it is pointless. Shipped the correction (`027a366`):
+
+- `DEFAULT_MAX_CHUNK_BYTES` back to 4 MiB (Campaign-6-proven).
+- `getChunkSize` floors any file that actually splits at 4 MiB even when
+  `MAX_CHUNK_BYTES` shrinks below it — a tiny cap cannot steer a real
+  upload into the 31299 trap; single-part files keep the small size.
+- Tests: pins for the floor (`5 MiB @ cap 2 MiB → 4 MiB`,
+  `1 KB @ cap 1 MiB → 1 MiB`) plus the restored tier pins; review 388/388,
+  dry-run green, smoke 34/34 after the deploy.
+- Live closing proof (free-class, default build): 9 MiB file through the
+  resumable plane — begin answered `chunkSize 4194304 / chunkCount 3`, all
+  three parts (4 MiB, 4 MiB, 1 MiB tail) accepted with upstream md5s,
+  finalize 201, size exact, **full-file md5 round-trip MATCH**; probe file
+  deleted.
+
+**Final verdict for the user's use case (>4 GiB backups through this
+worker):** on the Workers free plan, ≤ 4 GiB files are fully workable
+(4 MiB parts; Campaign 6 proved a complete 1024-chunk session), but > 4 GiB
+sessions die late in the 1102 wall — twice reproduced — and can NOT be
+made legal at smaller chunks (31299). That class needs a Workers paid
+plan; the paid recipe is `MAX_CHUNK_BYTES=8` (or 16/32) to restore the
+tier's larger premium buckets: fewer, larger parts, and CPU headroom.
 
 ### Housekeeping in this campaign
 
