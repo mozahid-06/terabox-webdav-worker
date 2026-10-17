@@ -80,16 +80,22 @@ service from Cloudflare.
   verifies `block_list` (per-chunk md5 + upload md5).
   The worker re-computes the control md5 itself and raises `-5` (→ 502) on
   mismatch; upstream `-32` is "space insufficient" (→ 507).
-- **Chunk-cap (2026-10-17, live-measured)**: the tier's bucket table
-  (4/8/16/32/64/128 MiB) is clamped by `MAX_CHUNK_BYTES` (default
-  2 MiB = free-plan workable). Reason: on the Workers **free** plan the
-  chunk-PUT request cost sits near the per-request CPU budget — 8 MiB
-  chunk PUTs (premium bucket for >4 GiB) hit the wall ~90 chunks in, and
-  even 4 MiB walked into a persistent `503 error code: 1102` wall late in a
-  1000+-chunk session. Restore the tier's larger buckets only on Workers
-  paid (or a deployment with a higher CPU budget) by setting
-  `MAX_CHUNK_BYTES` (edge/memory ceiling still 32 MiB); the cap never
-  exceeds the tier's own bucket.
+- **Chunk-size floor + ceiling (2026-10-17, live-measured both ways)**: a
+  splitting upload's FIRST full part must be ≥ 4 MiB — TeraBox rejects
+  smaller with `error_code 31299` ("Size of superfile2 first part should
+  not be smaller than slice size"), tried at 2 MiB on both a >4 GiB
+  premium-class file and a 5 MiB free-class file across all upload
+  clusters. Single-part uploads are exempt (the one part is the short last
+  part). So `getChunkSize` floors any truly-splitting session at 4 MiB
+  even when `MAX_CHUNK_BYTES` would shrink it, and the default cap IS
+  4 MiB — the smallest legal slice and the Campaign-6-proven setting.
+  Above it, `MAX_CHUNK_BYTES` restores the tier's larger premium buckets
+  (8-32 MiB) — the paid-plan recipe: fewer, larger part requests.
+  Practical verdict for the Workers **free** plan: ≤ 4 GiB files upload
+  fine at 4 MiB parts; > 4 GiB premium-class sessions hit the free-plan
+  per-request CPU budget (`503 error code: 1102`) late in the session —
+  smaller parts are protocol-impossible, so that class needs a paid
+  deployment.
 - **`rtype` semantics** (filemanager): `0` = wait for sync, `1` = adaptive
   (returns before completion — the worker passes `rtype=1` and polling
   reconciles), `2` = pure async.

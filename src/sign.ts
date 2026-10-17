@@ -98,19 +98,29 @@ export function decodeMD5(md5: string): string {
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
 
-/** Live-proven 2026-10-17 (davbox.tes1ing, bytes 89-100): chunk PUTs at the
- * 8 MiB premium bucket (the tier's own size for >4 GiB files) sporadically
- * exceed the Workers free-plan per-request CPU budget and answer Cloudflare
- * `503 error code: 1102` ("Worker exceeded resource limits"), and even 4 MiB
- * chunks walked into a persistent 1102 wall late in a 1000+-chunk session.
- * 2 MiB is the default targeted at completing the same sessions at roughly
- * half the per-request cost; deployments with a higher per-request budget
- * (Workers paid) may raise MAX_CHUNK_BYTES back up to the 32 MiB ceiling to
- * restore the tier's larger premium buckets. */
-export const DEFAULT_MAX_CHUNK_BYTES = 2 * MiB;
+/** Upstream floor for a session that actually splits: TeraBox rejects a
+ * FULL-size first part below 4 MiB with `error_code 31299` ("Size of
+ * superfile2 first part should not be smaller than slice size") — proven
+ * live 2026-10-17 on both a >4 GiB premium-class file and a 5 MiB free-class
+ * file, from every upload cluster (kul/dm1/dm2). Single-part files are
+ * exempt (the one part is the short last part — 1 MiB and 64 KB uploads
+ * both passed). Smaller full parts are therefore not a legal way to dodge
+ * the free-plan CPU budget; the smallest legal slice is 4 MiB itself. */
+const MIN_FULL_PART_MIB = 4;
 
-/** Chunk size for slotted uploads (4 MiB free; buckets scale with tier but
- * are clamped to the deployment's CPU budget). */
+/** Live-proven 2026-10-17 (davbox.tes1ing): the free-plan CPU wall stands at
+ * 4-8 MiB parts (1102 late in long premium-class sessions), and TeraBox
+ * rejects anything smaller than 4 MiB outright (31299) — so 4 MiB is both
+ * the smallest LEGAL slice and the Campaign-6-proven free-tier setting.
+ * Paid deployments may raise MAX_CHUNK_BYTES to restore the tier's larger
+ * premium buckets (8-32 MiB: fewer, larger parts — the better way). */
+export const DEFAULT_MAX_CHUNK_BYTES = 4 * MiB;
+
+/** Chunk size for slotted uploads: the tier's bucket (4 MiB free; larger
+ * for premium classes) clamped to the deployment's CPU budget. A cap below
+ * 4 MiB is harmless only for single-part files; any session that truly
+ * splits is floored back UP to 4 MiB because upstream refuses smaller
+ * first parts (31299) — shrinking chunks cannot rescue an upload. */
 export function getChunkSize(fileSize: number, isVIP: boolean, capBytes?: number): number {
   const limitSizes = [4, 8, 16, 32, 64, 128];
   // Hard 32 MiB ceiling even for VIP: the Free plan rejects request bodies
@@ -123,7 +133,12 @@ export function getChunkSize(fileSize: number, isVIP: boolean, capBytes?: number
   const tiered = isVIP
     ? (limitSizes.find((size) => fileSize <= size * GiB) ?? limitSizes[limitSizes.length - 1]!)
     : limitSizes[0]!;
-  return Math.min(tiered, cap) * MiB;
+  let chosen = Math.min(tiered, cap);
+  // A file that splits into several parts must ride at least 4 MiB full
+  // parts (upstream 31299 below that). Only single-part files — where the
+  // one part is the short LAST part — may go smaller.
+  if (fileSize > chosen * MiB) chosen = Math.max(chosen, MIN_FULL_PART_MIB);
+  return chosen * MiB;
 }
 
 export const MAX_FREE_FILE_BYTES = 4 * GiB;
