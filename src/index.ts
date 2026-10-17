@@ -226,6 +226,7 @@ const worker: ExportedHandler<Env> = {
     const client = new TeraboxClient(env.COOKIE, env.TERABOX_DOMAIN, {
       jsToken: env.JSTOKEN,
       minGapMs: env.MIN_GAP_MS !== undefined ? Number(env.MIN_GAP_MS) : undefined,
+      maxChunkBytes: env.MAX_CHUNK_BYTES !== undefined ? Number(env.MAX_CHUNK_BYTES) : undefined,
     });
 
     const started = Date.now();

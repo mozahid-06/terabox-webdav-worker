@@ -356,16 +356,19 @@ export class TeraboxClient {
   /** Pre-minted token from env JSTOKEN (Alist/CLI users paste window.jsToken). */
   private readonly configuredJsToken: string;
   private readonly minGapMs: number;
+  private readonly maxChunkBytes: number | undefined;
   /** Account-wide slot reserver — wired per request by handleWebDav to the
    *  DAV_STATE DO (advisory: left unset for the memory fallback, and any
    *  failure falls back to the isolate-local floor). */
   apiSlotReserver: ((minGapMs: number) => Promise<number>) | undefined;
 
-  constructor(cookie: string, domain = DEFAULT_BASE_URL, opts: { jsToken?: string; minGapMs?: number } = {}) {
+  constructor(cookie: string, domain = DEFAULT_BASE_URL, opts: { jsToken?: string; minGapMs?: number; maxChunkBytes?: number } = {}) {
     this.cookie = valuedCookie(cookie);
     this.baseUrl = /^https?:\/\//.test(domain) ? domain : 'https://' + domain;
     this.configuredJsToken = (opts.jsToken || '').trim();
     this.minGapMs = typeof opts.minGapMs === 'number' && opts.minGapMs >= 0 ? opts.minGapMs : DEFAULT_MIN_GAP_MS;
+    this.maxChunkBytes =
+      typeof opts.maxChunkBytes === 'number' && opts.maxChunkBytes > 0 ? opts.maxChunkBytes : undefined;
   }
 
   /**
@@ -1170,7 +1173,7 @@ export class TeraboxClient {
     size: number,
     mtimeMs: number,
   ): Promise<{ uploadId: string; returnType: number; uploadSign: string }> {
-    const chunkSize = getChunkSize(size, this.isPremium);
+    const chunkSize = getChunkSize(size, this.isPremium, this.maxChunkBytes);
     const dir = splitPath(absPath).dir;
     const { json } = await this.request<{
       errno?: number;
@@ -1314,7 +1317,7 @@ export class TeraboxClient {
     );
     if (returnType === 2) throw es(-8);
 
-    const chunkSize = getChunkSize(size, this.isPremium);
+    const chunkSize = getChunkSize(size, this.isPremium, this.maxChunkBytes);
     // Views, not copies: subarray windows share the single arrayBuffer so the
     // file is held once. Chunk md5s come from the server (below) — no local
     // hashing, which is what used to blow the Workers 10 ms CPU budget.
@@ -1408,7 +1411,7 @@ export class TeraboxClient {
     );
     if (returnType === 2) throw es(-8);
 
-    const chunkSize = getChunkSize(size, this.isPremium);
+    const chunkSize = getChunkSize(size, this.isPremium, this.maxChunkBytes);
     const chunkCount = size === 0 ? 1 : Math.ceil(size / chunkSize);
     const chunkMd5s: string[] = [];
     let hostIndex = 0;
@@ -1482,7 +1485,7 @@ export class TeraboxClient {
     // An empty uploadid would store a session under `""`; the chunk route
     // requires a non-empty id, so every follow-up would 404 with no clue why.
     if (!uploadId) throw new TeraboxError(-5, 'precreate returned no uploadid');
-    const chunkSize = getChunkSize(size, this.isPremium);
+    const chunkSize = getChunkSize(size, this.isPremium, this.maxChunkBytes);
     const chunkCount = size === 0 ? 1 : Math.ceil(size / chunkSize);
     return { uploadId, uploadSign, chunkSize, chunkCount, hosts };
   }

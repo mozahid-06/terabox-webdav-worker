@@ -98,19 +98,30 @@ export function decodeMD5(md5: string): string {
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
 
-/** Chunk size for slotted uploads (4 MiB free, up to 128 MiB premium). */
-export function getChunkSize(fileSize: number, isVIP: boolean): number {
+/** Live-proven 2026-10-17 (davbox.tes1ing, bytes 89-100): chunk PUTs at the
+ * 8 MiB premium bucket (the tier's own size for >4 GiB files) sporadically
+ * exceed the Workers free-plan per-request CPU budget and answer Cloudflare
+ * `503 error code: 1102` ("Worker exceeded resource limits"), while 4 MiB
+ * chunks served the 1024-chunk 4 GiB free-tier proof and every premium
+ * chunk up to the first 1102. Deployments with a higher per-request budget
+ * (Workers paid) may raise MAX_CHUNK_BYTES above this default. */
+export const DEFAULT_MAX_CHUNK_BYTES = 4 * MiB;
+
+/** Chunk size for slotted uploads (4 MiB free; buckets scale with tier but
+ * are clamped to the deployment's CPU budget). */
+export function getChunkSize(fileSize: number, isVIP: boolean, capBytes?: number): number {
   const limitSizes = [4, 8, 16, 32, 64, 128];
   // Hard 32 MiB ceiling even for VIP: the Free plan rejects request bodies
   // over ~100 MB at the edge (413 before this Worker runs), and a 64 MiB
   // chunk would hold chunk + multipart envelope in memory at once (~128 MB —
   // the whole isolate limit). VIP buys more requests, not unsafe ones.
-  const cap = 32;
-  if (!isVIP) return limitSizes[0]! * MiB;
-  for (const limit of limitSizes) {
-    if (fileSize <= limit * GiB) return Math.min(limit, cap) * MiB;
-  }
-  return Math.min(limitSizes[limitSizes.length - 1]!, cap) * MiB;
+  const request = typeof capBytes === 'number' && capBytes > 0 ? capBytes : DEFAULT_MAX_CHUNK_BYTES;
+  // A cap under 1 MiB would produce zero-length chunks; clamp to the floor.
+  const cap = Math.max(1, Math.min(Math.floor(request / MiB), 32));
+  const tiered = isVIP
+    ? (limitSizes.find((size) => fileSize <= size * GiB) ?? limitSizes[limitSizes.length - 1]!)
+    : limitSizes[0]!;
+  return Math.min(tiered, cap) * MiB;
 }
 
 export const MAX_FREE_FILE_BYTES = 4 * GiB;

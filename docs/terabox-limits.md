@@ -75,10 +75,20 @@ service from Cloudflare.
   worker falls back to base-host upload URLs (alist parity).
 - **Signed params**: chunk upload needs `uploadsign` generated with the page's
   `bdstoken` + WEB UA/APP ID (web-app parity).
-- **Chunks**: files split by `getChunkSize()`; each chunk POSTs to the chosen
-  cluster, then `create` verifies `block_list` (per-chunk md5 + upload md5).
+- **Chunks**: files split by
+  `getChunkSize()`; each chunk POSTs to the chosen cluster, then `create`
+  verifies `block_list` (per-chunk md5 + upload md5).
   The worker re-computes the control md5 itself and raises `-5` (→ 502) on
   mismatch; upstream `-32` is "space insufficient" (→ 507).
+- **Chunk-cap (2026-10-17, live-measured)**: the tier's bucket table
+  (4/8/16/32/64/128 MiB) is clamped by `MAX_CHUNK_BYTES` (default 4 MiB).
+  Reason: on the Workers **free** plan, 8 MiB chunk PUTs — the premium
+  bucket for >4 GiB files — sporadically exceed the per-request CPU budget
+  and the edge answers `503 error code: 1102` (Worker exceeded resource
+  limits); today's byte-proof hit the wall ~90 chunks in, while 4 MiB
+  chunks carried the old 1024-chunk 4 GiB proof with no such failures.
+  Paid-plan deployments may set `MAX_CHUNK_BYTES` higher (edge/memory
+  ceiling 32 MiB unchanged); the cap never raises the tier's own limit.
 - **`rtype` semantics** (filemanager): `0` = wait for sync, `1` = adaptive
   (returns before completion — the worker passes `rtype=1` and polling
   reconciles), `2` = pure async.

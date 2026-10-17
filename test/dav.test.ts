@@ -1091,9 +1091,14 @@ describe('resumable upload', () => {
 		// its multipart envelope stay under both the edge body limit and the
 		// isolate's memory ceiling.
 		expect(getChunkSize(1024, false)).toBe(4 * MiB);
-		expect(getChunkSize(8 * GiB, true)).toBe(8 * MiB);
-		expect(getChunkSize(64 * GiB, true)).toBe(32 * MiB);
-		expect(getChunkSize(128 * GiB, true)).toBe(32 * MiB);
+		// Default cap = Workers free-plan CPU budget (4 MiB): premium buckets
+		// above it are unreachable unless MAX_CHUNK_BYTES raises the ceiling.
+		expect(getChunkSize(8 * GiB, true)).toBe(4 * MiB);
+		expect(getChunkSize(64 * GiB, true)).toBe(4 * MiB);
+		// Explicit cap (Workers paid / MAX_CHUNK_BYTES) restores the buckets.
+		expect(getChunkSize(8 * GiB, true, 32 * MiB)).toBe(8 * MiB);
+		expect(getChunkSize(64 * GiB, true, 32 * MiB)).toBe(32 * MiB);
+		expect(getChunkSize(128 * GiB, true, 32 * MiB)).toBe(32 * MiB);
 	});
 });
 

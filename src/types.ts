@@ -12,6 +12,9 @@ export interface Env {
   JSTOKEN?: string;
   // Minimum gap in ms between outbound Terabox calls (default 400).
   MIN_GAP_MS?: string;
+  // Chunk-size cap override, in bytes, for slotted uploads (free-plan default
+  // 4 MiB; raise on Workers paid to use the tier's larger premium buckets).
+  MAX_CHUNK_BYTES?: string;
   // Optional base path the WebDAV surface is served under (gdrive parity),
   // e.g. "/dav/": requests outside it 404, the bare base 301s to its slash
   // form, and every emitted href includes it.
