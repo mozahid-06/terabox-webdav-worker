@@ -81,14 +81,15 @@ service from Cloudflare.
   The worker re-computes the control md5 itself and raises `-5` (→ 502) on
   mismatch; upstream `-32` is "space insufficient" (→ 507).
 - **Chunk-cap (2026-10-17, live-measured)**: the tier's bucket table
-  (4/8/16/32/64/128 MiB) is clamped by `MAX_CHUNK_BYTES` (default 4 MiB).
-  Reason: on the Workers **free** plan, 8 MiB chunk PUTs — the premium
-  bucket for >4 GiB files — sporadically exceed the per-request CPU budget
-  and the edge answers `503 error code: 1102` (Worker exceeded resource
-  limits); today's byte-proof hit the wall ~90 chunks in, while 4 MiB
-  chunks carried the old 1024-chunk 4 GiB proof with no such failures.
-  Paid-plan deployments may set `MAX_CHUNK_BYTES` higher (edge/memory
-  ceiling 32 MiB unchanged); the cap never raises the tier's own limit.
+  (4/8/16/32/64/128 MiB) is clamped by `MAX_CHUNK_BYTES` (default
+  2 MiB = free-plan workable). Reason: on the Workers **free** plan the
+  chunk-PUT request cost sits near the per-request CPU budget — 8 MiB
+  chunk PUTs (premium bucket for >4 GiB) hit the wall ~90 chunks in, and
+  even 4 MiB walked into a persistent `503 error code: 1102` wall late in a
+  1000+-chunk session. Restore the tier's larger buckets only on Workers
+  paid (or a deployment with a higher CPU budget) by setting
+  `MAX_CHUNK_BYTES` (edge/memory ceiling still 32 MiB); the cap never
+  exceeds the tier's own bucket.
 - **`rtype` semantics** (filemanager): `0` = wait for sync, `1` = adaptive
   (returns before completion — the worker passes `rtype=1` and polling
   reconciles), `2` = pure async.

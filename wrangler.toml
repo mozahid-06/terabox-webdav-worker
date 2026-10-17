@@ -35,10 +35,11 @@ enabled = true
 #                             the cookie is rejected (errno -6)
 #             MIN_GAP_MS      pacing between Terabox calls (default 400)
 #             MAX_CHUNK_BYTES chunk-size cap in bytes for slotted uploads
-#                             (default 4194304 = Workers free-plan CPU
-#                             budget; raise only on Workers paid to unlock
-#                             the tier's larger premium buckets — free-plan
-#                             8 MiB chunks hit 1102 CPU-limit 503s)
+#                             (default 2097152 = the size that survives the
+#                             Workers free-plan CPU budget; raise only on
+#                             Workers paid to unlock the tier's larger
+#                             premium buckets — 4/8 MiB both hit 1102
+#                             CPU-limit 503s late in long upload sessions)
 #             PATH            base path the WebDAV lives under (e.g. /dav/)
 #             ROOT_ID         Terabox folder mounted as the WebDAV root
 #             LOG_PREFIX      optional log tag

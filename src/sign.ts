@@ -101,11 +101,13 @@ const GiB = 1024 * MiB;
 /** Live-proven 2026-10-17 (davbox.tes1ing, bytes 89-100): chunk PUTs at the
  * 8 MiB premium bucket (the tier's own size for >4 GiB files) sporadically
  * exceed the Workers free-plan per-request CPU budget and answer Cloudflare
- * `503 error code: 1102` ("Worker exceeded resource limits"), while 4 MiB
- * chunks served the 1024-chunk 4 GiB free-tier proof and every premium
- * chunk up to the first 1102. Deployments with a higher per-request budget
- * (Workers paid) may raise MAX_CHUNK_BYTES above this default. */
-export const DEFAULT_MAX_CHUNK_BYTES = 4 * MiB;
+ * `503 error code: 1102` ("Worker exceeded resource limits"), and even 4 MiB
+ * chunks walked into a persistent 1102 wall late in a 1000+-chunk session.
+ * 2 MiB is the default targeted at completing the same sessions at roughly
+ * half the per-request cost; deployments with a higher per-request budget
+ * (Workers paid) may raise MAX_CHUNK_BYTES back up to the 32 MiB ceiling to
+ * restore the tier's larger premium buckets. */
+export const DEFAULT_MAX_CHUNK_BYTES = 2 * MiB;
 
 /** Chunk size for slotted uploads (4 MiB free; buckets scale with tier but
  * are clamped to the deployment's CPU budget). */

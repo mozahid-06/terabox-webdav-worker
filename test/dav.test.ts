@@ -792,8 +792,11 @@ describe('resumable upload', () => {
 	it('uploads a multi-chunk file across separate requests', async () => {
 		// A file larger than one chunk exercises the multipart path end-to-end:
 		// begin → per-chunk PUTs → finalize, each a distinct HTTP request.
-		const chunkSize = 4 * 1024 * 1024; // free-tier chunk size
-		const total = chunkSize + 1000; // 2 chunks: full + short tail
+		// The size spans ≥2 chunks under both the 4 MiB (older) and 2 MiB
+		// (free-plan workable) defaults; the loop slices by the chunk size
+		// the worker actually negotiated, not an assumed one.
+		const MiB = 1024 * 1024;
+		const total = 4 * MiB + 1000;
 		const data = new Uint8Array(total);
 		for (let i = 0; i < total; i += 1) data[i] = i % 251;
 
@@ -804,12 +807,12 @@ describe('resumable upload', () => {
 		});
 		expect(begin.status).toBe(200);
 		const begun = (await begin.json()) as { uploadId: string; chunkSize: number; chunkCount: number };
-		expect(begun.chunkSize).toBe(chunkSize);
-		expect(begun.chunkCount).toBe(2);
+		expect(begun.chunkSize).toBe(2 * MiB); // free-plan workable default
+		expect(begun.chunkCount).toBe(Math.ceil(total / begun.chunkSize));
 
 		for (let index = 0; index < begun.chunkCount; index += 1) {
-			const start = index * chunkSize;
-			const end = Math.min(start + chunkSize, total);
+			const start = index * begun.chunkSize;
+			const end = Math.min(start + begun.chunkSize, total);
 			const chunk = data.subarray(start, end);
 			const put = await request(`/.resumable/${begun.uploadId}/${index}`, {
 				method: 'PUT',
@@ -888,17 +891,20 @@ describe('resumable upload', () => {
 	}, 30000);
 
 	it('rejects finalize when a chunk is missing', async () => {
+		const MiB = 1024 * 1024;
 		const begin = await request('/.resumable', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ path: '/missing.bin', size: 8 * 1024 * 1024 }),
+			body: JSON.stringify({ path: '/missing.bin', size: 4 * MiB }),
 		});
 		const { uploadId, chunkCount } = (await begin.json()) as { uploadId: string; chunkCount: number };
+		// Two chunks under the free-plan default (2 MiB); chunk size itself is
+		// only incidental here — the point is that finalize is missing a part.
 		expect(chunkCount).toBe(2);
 		// Upload only chunk 0; chunk 1 stays missing.
 		const put = await request(`/.resumable/${uploadId}/0`, {
 			method: 'PUT',
-			body: new Uint8Array(4 * 1024 * 1024),
+			body: new Uint8Array(2 * MiB),
 		});
 		expect(put.status).toBe(200);
 		const fin = await request(`/.resumable/${uploadId}/finalize`, { method: 'POST' });
@@ -1090,11 +1096,11 @@ describe('resumable upload', () => {
 		// Free tier keeps Terabox's 4 MiB; VIP tiers are capped so the chunk +
 		// its multipart envelope stay under both the edge body limit and the
 		// isolate's memory ceiling.
-		expect(getChunkSize(1024, false)).toBe(4 * MiB);
-		// Default cap = Workers free-plan CPU budget (4 MiB): premium buckets
+		expect(getChunkSize(1024, false)).toBe(2 * MiB);
+		// Default cap = Workers free-plan CPU budget (2 MiB): premium buckets
 		// above it are unreachable unless MAX_CHUNK_BYTES raises the ceiling.
-		expect(getChunkSize(8 * GiB, true)).toBe(4 * MiB);
-		expect(getChunkSize(64 * GiB, true)).toBe(4 * MiB);
+		expect(getChunkSize(8 * GiB, true)).toBe(2 * MiB);
+		expect(getChunkSize(64 * GiB, true)).toBe(2 * MiB);
 		// Explicit cap (Workers paid / MAX_CHUNK_BYTES) restores the buckets.
 		expect(getChunkSize(8 * GiB, true, 32 * MiB)).toBe(8 * MiB);
 		expect(getChunkSize(64 * GiB, true, 32 * MiB)).toBe(32 * MiB);
@@ -2803,19 +2809,20 @@ describe('audit hardening (Phase 2 regressions)', () => {
 
 	describe('multi-chunk upload (subarray views, no body copies)', () => {
 		it('PUTs a >4 MiB file as multiple chunks and round-trips intact', async () => {
-			// Free-tier chunk size is 4 MiB; 5 MiB exercises two superfile2
-			// uploads. The rewrite passes subarray VIEWS to md5/Blob instead
-			// of slice() copies — behavior must be byte-identical.
+			// Chunk size defaults to 2 MiB (free-plan CPU cap); 5 MiB exercises
+			// three superfile2 uploads (seams at 2 MiB and 4 MiB). The rewrite
+			// passes subarray VIEWS to md5/Blob instead of slice() copies —
+			// behavior must be byte-identical.
 			const size = 5 * 1024 * 1024 + 12345;
 			const bytes = new Uint8Array(size);
 			for (let i = 0; i < size; i += 1) bytes[i] = i & 0xff;
 			const res = await request('/big.bin', { method: 'PUT', body: bytes });
 			expect(res.status).toBe(201);
-			expect(tb.superfile2Calls).toBe(2);
+			expect(tb.superfile2Calls).toBe(3);
 			const stored = tb.find('/big.bin')!;
 			expect(stored.size).toBe(size);
 			// Spot-check the reassembled bytes at chunk boundaries (3 MiB and
-			// the 4 MiB seam where the second chunk starts) plus the tail —
+			// the 4 MiB seam where the third chunk starts) plus the tail —
 			// full toEqual on 5 MiB is needlessly slow.
 			expect(stored.content![3 * 1024 * 1024]).toBe((3 * 1024 * 1024) & 0xff);
 			expect(stored.content![4 * 1024 * 1024]).toBe(0);
@@ -3771,8 +3778,8 @@ describe('PUT body paths: streaming above the threshold, capped buffer without C
 		expect(res.status).toBe(201);
 		expect(streamSpy).toHaveBeenCalledTimes(1);
 		expect(bufferSpy).not.toHaveBeenCalled();
-		// 5 MiB + 7 at a 4 MiB chunk size is exactly two superfile2 parts.
-		expect(tb.superfile2Calls).toBe(2);
+		// 5 MiB + 7 at the 2 MiB(+) default chunk size is three superfile2 parts.
+		expect(tb.superfile2Calls).toBe(3);
 
 		const got = await request('/big-stream.bin');
 		expect(got.status).toBe(200);
