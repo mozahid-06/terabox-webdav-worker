@@ -711,14 +711,105 @@ headless Chromium **wedges the whole tab** on the page's overwrite
 create-only PUT fires it whenever the artifact name already exists); and
 the live mount has no `docs` folder — harness paths go under `/dav/`.
 
+## Campaign 8 — premium-tier limits: what changed at upgrade (2026-10-17)
+
+The account behind the worker's `COOKIE` became **premium** (`member_info.is_vip`
+live-verified today through `checkPremium()`), so the plan-tier catalog that
+only existed as code and bclone citations faced its live test — on a *new*
+deployment: the worker now also runs via **Cloudflare Workers Builds** (git
+integration, deploy target `davbox` in the `tes1ing` account,
+`https://davbox.tes1ing.workers.dev/dav/`, credentials `test:test`). Every push
+to `main` now builds and deploys automatically; the `review` gate before push
+and the live smoke after still apply. A repo-root `.npmrc`
+(`legacy-peer-deps=true`) was shipped first to make CI's strict
+`npm clean-install` resolve the same tree local sessions have always used
+(wrangler 4.146 wants workers-types ^5; vitest-pool-workers bundles wrangler
+4.105, which wants ^4).
+
+### Upload side: the size-cap catalog is live (zero-byte probes)
+
+Via `POST /.resumable begin` — each accepted session canceled (`204`) before
+any chunk was sent, so nothing was ever created upstream:
+
+| Probe | Size | Result |
+|---|---|---|
+| 1 MiB control | 1 MiB | 200 · 4 MiB chunks (both tiers) |
+| just over free cap | 4 GiB + 1 MiB | **200 · accepted** → free 4 GiB check bypassed (premium detected). Pre-fix premium bucket: 8 MiB × 513 |
+| headroom | 40 GiB | 200 · accepted, 32 MiB × 1280 (top bucket) |
+| over premium cap | 129 GiB | **507 · `errno 58` "File is too large for your plan"** — the 128 GiB ceiling |
+
+Live recipe: `bash scripts/premium-limits.sh` (campaign 8's probe battery,
+zero bytes uploaded).
+
+### Download side: the free-tier speed cap lifts, shape unchanged
+
+Range GETs (206, exact slices) against two movie files (~380–514 MiB):
+
+| Metric | Free era (2026-10-11) | Premium (today) |
+|---|---|---|
+| single stream (200 MiB) | ~1.5–2.0 MB/s | **11.2 MB/s** (file A) / **3.7 MB/s** (file B) |
+| 4 × 50 MiB parallel | ~same as single (no gain) | 10.5 MiB/s aggregate — **still no parallel gain** |
+| cold TTFB | ~2.7 s | 0.4–7.7 s (per-path/cluster variance persists) |
+| cached reopen TTFB | 0.12–0.24 s | 0.24 s ✓ |
+
+Per-path cap lifted ~3–6× but stays per-path (per-file/cluster), not one
+account-level number.
+
+### The 1102 discovery: premium chunk sizes exceed the free-plan CPU budget
+
+The >4 GiB **byte-proof** (real upload through
+`precreate → superfile2 → create`, 4 GiB + 1 MiB staged locally) passed the
+gate twice — first at the pre-fix 8 MiB premium bucket (chunks 0–88
+accepted, then `503 error code: 1102` = "Worker exceeded resource limits"
+streaks from ~chunk 89 on, re-failing persistently at 99–122), then at the
+post-fix 4 MiB cap (chunks through ~195 accepted with rising retry noise,
+then a persistent 1102 wall at chunk 198; ~78 failing attempts across ~198
+chunks). Root cause: the chunk-PUT request cost (streamed 4–8 MiB body +
+session bookkeeping + the DO-slot hop) sits near the Workers **free
+plan** per-request CPU budget, and the edge kills over-budget requests
+sporadically with 1102. Retry ladders absorb blips, but late-session
+failure rates rise past what client patience survives.
+
+Shipped while finding this: **`MAX_CHUNK_BYTES`** (`src/sign.ts`
+`getChunkSize(fileSize, isVIP, capBytes?)`, default 4 MiB = the free-plan-
+proven size; raise on Workers paid plans or via dashboard env to restore the
+tier's larger buckets) — `fix: chunk-size cap — premium 8 MiB buckets exceed
+free-plan CPU (live 1102)` (`008a2c3`), deployed by the new pipeline, smoke
+34/34, and begin-with-the-fix live-verified: the same >4 GiB begin now
+answers `chunkSize: 4194304, chunkCount: 1025` (4 MiB, premium account).
+
+**Still open:** the >4 GiB end-to-end byte-proof itself — the 4 GiB free-tier
+proof (Campaign 6) stands, premium *acceptance* of >4 GiB is live-verified,
+but a full premium byte pass needs either a Workers paid plan or
+MAX_CHUNK_BYTES lowered below 4 MiB to fit the free-plan CPU budget
+comfortably. The Playbook: stage a 4 GiB+1 MiB random file, `begin` at that
+size, PUT the chunks (the 4 MiB recipe above), finalize, HEAD size match.
+Session was canceled (204) and staging cleaned after the 1102 wall.
+
+### Housekeeping in this campaign
+
+- Campaign 8 folders (`/premium-campaign/…`) were created for the byte-proof
+  and cleaned up afterwards; account keeps only real data.
+- Deployments checked via
+  `CLOUDFLARE_ACCOUNT_ID=d5d15d42e8e4fd5a159feb81ae38f036 npx wrangler
+  deployments list` (davbox lives in the `tes1ing` account; three accounts
+  share the token).
+
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-12, post review rounds 4–18 + perf work + the Campaign 7 website): `main` =
-production; deploys are **manual** `wrangler deploy` after `npm run review`
-(the optional dashboard Git integration is documented in README — do not
-assume a push deploys). Current verification: **litmus 138/138** (basic,
+Branch state (2026-10-17, post Campaign 8 — premium limits + the free-plan chunk cap; deploy target is `davbox` in the `tes1ing` account via the Workers Builds git integration, hence `https://davbox.tes1ing.workers.dev/dav/` and creds `test:test`):
+production; **deploys now run automatically on every push** via the Workers
+Builds git integration (Campaign 8 superseded the manual `wrangler deploy`
+flow); the `npm run review` gate applies to every push and the live smoke
+to every push and deploy. Current verification: **litmus 138/138** (basic,
 copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
-**388 unit tests**. Latest shipped work: viewer/sign-in UI retheme + fixed table layout + login username prefill (`e42c6f0`, live `da0faade`), browser chunked upload for >64 MiB files (`4b79810`, live `eabbf04e`), session sign-in form + attachment downloads + preview removal (`4b1ef7e`), download-URL cache (repeat-open TTFB
+**388 unit tests** (the Campaign 8 pins live inside the same `it`). Latest shipped work:
+the Campaign 8 premium-limit campaign — `.npmrc` legacy-peer-deps for CI
+(`85b9082`), tier-aware `MAX_CHUNK_BYTES` chunk cap after the live 1102
+finding (`008a2c3`; begin-with-fix live-verified: >4 GiB begin answers
+4 MiB × 1025), and the zero-byte probe battery `scripts/premium-limits.sh`
+— before that: viewer/sign-in UI retheme + fixed table layout + login
+username prefill (`e42c6f0`, live `da0faade`), browser chunked upload for >64 MiB files (`4b79810`, live `eabbf04e`), session sign-in form + attachment downloads + preview removal (`4b1ef7e`), download-URL cache (repeat-open TTFB
 0.12 s, `96b1273`), account-wide API pacing through the DAV_STATE DO
 (`2ef74a7`), Worker Placement dead-end documented (`d0b83fb` — the ~1.8 MB/s
 cap is TeraBox free-tier, colo-independent), review rounds 14–17 (rounds 14–15 = the session-cookie boundary work below; 16–17 = test/doc/script hardening, findings in `scripts/live-litmus.sh` + quota discipline in AGENTS.md; session
