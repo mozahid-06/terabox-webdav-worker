@@ -28,7 +28,7 @@ WEBDAV_USER=… WEBDAV_PASS=… node test/live/rate-probe.mjs
 ```
 
 Local toolchain: Node 22 LTS in `~/.local/node/bin` (added to `~/.bashrc`);
-`npm install --legacy-peer-deps` once, then `npm test` / `npm run typecheck`.
+`npm install` once (`.npmrc` pins `legacy-peer-deps` for both local and CI installs), then `npm test` / `npm run typecheck`.
 
 ## Campaign 1 — 2026-10-09
 
