@@ -181,36 +181,43 @@ describe('MKCOL', () => {
 		expect(tb.find('/new-folder')?.isdir).toBe(1);
 	});
 
-	it('rewrites emoji in the created name to # (upstream rejects emoji, errno -7)', async () => {
-		// Live-proven: upstream web API answers errno -7 for emoji names; a
-		// literal '#' is accepted. Creating through this worker rewrites
-		// emoji to '#' instead of 403ing.
+	it('rewrites emoji in the created name by removing it (upstream rejects emoji, errno -7)', async () => {
+		// Live-proven: upstream web API answers errno -7 for emoji names.
+		// Creating through this worker REMOVES the rejected run instead of
+		// 403ing or littering the name with a placeholder.
 		const res = await request('/casterix%F0%9F%9A%80-test', { method: 'MKCOL' });
 		expect(res.status).toBe(201);
-		expect(tb.find('/casterix#-test')?.isdir).toBe(1);
+		expect(tb.find('/casterix-test')?.isdir).toBe(1);
 	});
 
-	it('rewrites emoji in PUT names to #', async () => {
+	it('removes emoji runs from PUT names', async () => {
 		const res = await request('/casterix%F0%9F%8E%89-file.txt', {
 			method: 'PUT', body: 'emoji name works',
 		});
 		expect(res.status).toBe(201);
 		// Reads stay raw, so the rewritten name is what resolves afterward.
-		const got = await request('/casterix%23-file.txt');
+		const got = await request('/casterix-file.txt');
 		expect(got.status).toBe(200);
 		expect(await got.text()).toBe('emoji name works');
 		// The raw emoji URL no longer matches anything upstream (the stored
-		// name carries '#') — a listing refresh is how clients learn it.
+		// name lost the emoji) — a listing refresh is how clients learn it.
 		const raw = await request('/casterix%F0%9F%8E%89-file.txt');
 		expect(raw.status).toBe(404);
 	});
 
-	it('rewrites rejected ASCII/controls too (live-proven -7 set)', async () => {
-		// ?:*<>"|\ and tab are refused upstream like emoji; the same '#'
-		// policy applies (runs collapse, trailing spaces trim on dirs).
+	it('removes rejected ASCII/controls too (live-proven -7 set)', async () => {
+		// ?:*<>"|\ and tab are refused upstream like emoji; the same removal
+		// policy applies (runs vanish, trailing spaces trim on dirs).
 		const res = await request('/what%3Fname', { method: 'MKCOL' });
 		expect(res.status).toBe(201);
-		expect(tb.find('/what#name')?.isdir).toBe(1);
+		expect(tb.find('/whatname')?.isdir).toBe(1);
+	});
+
+	it('falls back to _ for a name that was pure rejected characters', async () => {
+		// A stripped-to-nothing name must still create something addressable.
+		const res = await request('/%F0%9F%9A%80%F0%9F%9A%80', { method: 'MKCOL' });
+		expect(res.status).toBe(201);
+		expect(tb.find('/_')?.isdir).toBe(1);
 	});
 
 	it('trims trailing spaces from created directory names', async () => {
@@ -246,26 +253,30 @@ describe('MKCOL', () => {
 	});
 });
 
-describe('upstreamSafeName (emoji + live-proven rejected ASCII/controls → #)', () => {
+describe('upstreamSafeName (emoji + live-proven rejected ASCII/controls → removed)', () => {
 	const cases: Array<[string, string]> = [
-		// One '#' per emoji RUN: ZWJ clusters and repeated emoji collapse.
-		['casterix🚀-test', 'casterix#-test'],
-		['🎉🎉party', '#party'],
-		['👨‍👩‍👧-family', '#-family'],
-		['🇺🇸flag', '#flag'],
-		['1️⃣st', '1#st'],
-		['pure🚀', 'pure#'],
-		['🚀🚀', '#'],
-		// Live-proven rejected ASCII (upstream -7): maps to '#', runs collapse.
-		['what?ever', 'what#ever'],
-		['might:<be*"weird|>', 'might#be#weird#'],
-		['win\\nt:2*.txt', 'win#nt#2#.txt'],
-		// Control characters collapse into the same run rule.
-		['a\tb\x7f', 'a#b#'],
+		// Each rejected RUN is removed outright: ZWJ clusters, flags,
+		// repeated emoji and adjacent rejected ASCII all vanish together.
+		['casterix🚀-test', 'casterix-test'],
+		['🎉🎉party', 'party'],
+		['👨‍👩‍👧-family', '-family'],
+		['🇺🇸flag', 'flag'],
+		['1️⃣st', '1st'],
+		['pure🚀', 'pure'],
+		['🚀🚀', '_'],
+		// Live-proven rejected ASCII (upstream -7): runs are removed.
+		['what?ever', 'whatever'],
+		['might:<be*"weird|>', 'mightbeweird'],
+		['win\\nt:2*.txt', 'winnt2.txt'],
+		// Control characters vanish into the same run rule.
+		['a\tb\x7f', 'ab'],
 		// Directory rule: trailing spaces trim (the emoji-then-space case
-		// resolves to '#' first, then the trim leaves one '#').
+		// empties to the trim and stays non-empty).
 		['trail ', 'trail'],
-		['casterix🚀 ', 'casterix#'],
+		['casterix🚀 ', 'casterix'],
+		[' 🚀', '_'],
+		// Structural empties pass through (never become '_').
+		['', ''],
 		// Letters (CJK/accents) and accepted symbols/ASCII pass through.
 		['唱片 #1', '唱片 #1'],
 		['naïve-файл', 'naïve-файл'],
@@ -273,7 +284,7 @@ describe('upstreamSafeName (emoji + live-proven rejected ASCII/controls → #)',
 		['⌘-tech', '⌘-tech'],
 		["don't&do$that%~ok", "don't&do$that%~ok"],
 		['seed(1)[a]{b}—…', 'seed(1)[a]{b}—…'],
-		// '#' is never matched: idempotent.
+		// '#' is an accepted character, never matched: idempotent.
 		['already#fine', 'already#fine'],
 		['casterix#-test', 'casterix#-test'],
 	];
@@ -287,7 +298,7 @@ describe('upstreamSafeName (emoji + live-proven rejected ASCII/controls → #)',
 		});
 	}
 	it('rewrites per segment but never touches separators', () => {
-		expect(upstreamSafeDavPath('/🚀dir/a:b/f🚀.txt')).toBe('/#dir/a#b/f#.txt');
+		expect(upstreamSafeDavPath('/🚀dir/a:b/f🚀.txt')).toBe('/dir/ab/f.txt');
 	});
 });
 

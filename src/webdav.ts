@@ -166,11 +166,12 @@ export function encodeHref(path: string, isDir: boolean): string {
  * `errno -7` ("Invalid file name") — live-proven 2026-10-18 (MKCOL + PUT
  * batteries): emoji/pictographs AND the ASCII set `? " * < > | : \` AND
  * tab/control characters are all refused, and a directory name may not
- * end in a space. A literal '#' in names is accepted upstream (also
- * live-proven), so every rejected code point is rewritten to '#' before a
- * write path reaches Terabox. Reads are left raw so names that were
- * created elsewhere (a mobile app) stay addressable when a client follows
- * their listed href. */
+ * end in a space. Rather than littering files with a placeholder glyph,
+ * every rejected code point is REMOVED before a write path reaches
+ * Terabox (a name that strips to nothing or to bare dot/space residue
+ * falls back to `_` so it stays addressable). Reads are left raw so names
+ * that were created elsewhere (a mobile app) stay addressable when a
+ * client follows their listed href. */
 
 /** Emoji / pictograph ranges and the ASCII/control set upstream refuses. */
 const REJECTED_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
@@ -208,29 +209,29 @@ function isRejectedCodePoint(cp: number): boolean {
   return REJECTED_CODEPOINT_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
 }
 
-/** Rewrite rejected code points in ONE path segment to the accepted '#'
- * (one '#' per RUN of rejected code points: emoji clusters, flags,
- * repeated combines, and adjacent rejected ASCII collapse rather than
- * littering the name), then trim trailing spaces (upstream refuses a
- * directory name ending in one; the trailing emoji-then-space case
- * resolves to a single '#' before the trim). Letters (CJK, accents),
- * ©/®, ⌘ and every other ACCEPTED character pass through untouched; '#'
- * itself is never matched, making the rewrite idempotent. */
+/** Sanitize ONE path segment for upstream: rejected code points (emoji
+ * runs, flags, rejected ASCII, controls) are REMOVED outright, then
+ * trailing spaces trim (upstream refuses a directory name ending in one;
+ * an emoji-then-space tail empties to the trim). A segment that strips to
+ * nothing — or to bare dot/space residue, which cannot anchor a name —
+ * falls back to `_`. Letters (CJK, accents), ©/®, ⌘, and every other
+ * ACCEPTED character — including a literal '#' — pass through untouched,
+ * which also keeps the rewrite idempotent. */
 export function upstreamSafeName(name: string): string {
+  if (name === '') return ''; // structural segment (path root / middle empties)
   let out = '';
   for (const ch of name) {
-    if (isRejectedCodePoint(ch.codePointAt(0)!)) {
-      if (!out.endsWith('#')) out += '#';
-    } else {
-      out += ch;
-    }
+    if (isRejectedCodePoint(ch.codePointAt(0)!)) continue;
+    out += ch;
   }
-  return out.replace(/[ ]+$/, '');
+  out = out.replace(/ +$/, '');
+  if (out === '' || /^[.\s]*$/.test(out)) return '_';
+  return out;
 }
 
 /** Apply `upstreamSafeName` to every segment of a write-path. Input is
  * already cleaned (`.`/`..` removed by the callers), so a segment that
- * was pure rejected characters still yields '#' (never an empty name). */
+ * was pure rejected characters yields `_` (never an empty name). */
 export function upstreamSafeDavPath(davPath: string): string {
   return davPath.split('/').map(upstreamSafeName).join('/');
 }
@@ -1413,8 +1414,8 @@ export async function handleWebDav(
     }
   }
 
-  // Emoji names are illegal upstream (-7 at creation) but legal as '#':
-  // state-changing paths get the rewrite (create + delete address
+  // Emoji names are illegal upstream (-7 at creation): the rewrite drops
+  // them from state-changing paths (create + delete address
   // OUR-created names coherently), read paths stay raw so names created
   // elsewhere keep working via their listed hrefs. MOVE/COPY sources stay
   // raw too (they read an existing resource); only their Destination is
@@ -1524,7 +1525,7 @@ async function handleResumable(
     if (!davPath.startsWith('/') || size < 0) return errorResponse('path and size required', 400);
     // The JSON path is already percent-decoded, but still needs `.`/`..`
     // collapsing — otherwise a crafted `..` walks above a ROOT_ID mount.
-    // Emoji names are rewritten ('#') exactly like PUT/MKCOL: this is a
+    // Emoji names are dropped exactly like PUT/MKCOL: this is a
     // write, and upstream refuses emoji at creation (-7).
     let absPath: string;
     try {
@@ -2360,7 +2361,7 @@ async function handleMoveCopy(
   if (destDav.length > 1 && destDav.endsWith('/')) destDav = destDav.slice(0, -1);
   if (isReservedDavSegment(destDav)) return errorResponse('Forbidden', 403);
   // The destination of a MOVE/COPY is a write: emoji names would be
-  // refused upstream (-7), so they arrive rewritten ('#').
+  // refused upstream (-7), so they arrive stripped.
   const destPath = mount.toTera(upstreamSafeDavPath(destDav));
   if (mount.isRoot(destPath) || destPath === '') return errorResponse('Forbidden', 403);
 
