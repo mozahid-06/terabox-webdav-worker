@@ -6,3 +6,5 @@ dist/
 *.log
 .env
 .env.*
+# brainstorm mockup sessions
+.superpowers/
