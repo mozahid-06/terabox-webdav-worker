@@ -1,13 +1,13 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-	emojiSafeDavPath,
-	emojiSafeName,
 	metaCacheHasForTest,
 	metaCacheSeedForTest,
 	metaCacheSize,
 	resetDavVolatileState,
 	safeRelocate,
+	upstreamSafeDavPath,
+	upstreamSafeName,
 } from '../src/webdav';
 import type { DavStore, RelocateItem } from '../src/davstate';
 import { validateXml } from '../src/davxml';
@@ -202,6 +202,27 @@ describe('MKCOL', () => {
 		expect(raw.status).toBe(404);
 	});
 
+	it('rewrites rejected ASCII/controls too (live-proven -7 set)', async () => {
+		// ?:*<>"|\ and tab are refused upstream like emoji; the same '#'
+		// policy applies (runs collapse, trailing spaces trim on dirs).
+		const res = await request('/what%3Fname', { method: 'MKCOL' });
+		expect(res.status).toBe(201);
+		expect(tb.find('/what#name')?.isdir).toBe(1);
+	});
+
+	it('trims trailing spaces from created directory names', async () => {
+		const res = await request('/curry%20', { method: 'MKCOL' });
+		expect(res.status).toBe(201);
+		expect(tb.find('/curry')?.isdir).toBe(1);
+	});
+
+	it('keeps accepted ASCII names untouched: percent drops through', async () => {
+		// Live-proven accepted upstream; the URL layer decodes it once.
+		const res = await request('/100%25off%26more', { method: 'MKCOL' });
+		expect(res.status).toBe(201);
+		expect(tb.find('/100%off&more')?.isdir).toBe(1);
+	});
+
 	it('keeps read paths raw: GET of a literally-#-named file resolves it', async () => {
 		// The name a client sees after creating is the '#' form; reads of
 		// it must resolve (raw == the stored name, no rewrite needed).
@@ -222,7 +243,7 @@ describe('MKCOL', () => {
 	});
 });
 
-describe('emojiSafeName', () => {
+describe('upstreamSafeName (emoji + live-proven rejected ASCII/controls → #)', () => {
 	const cases: Array<[string, string]> = [
 		// One '#' per emoji RUN: ZWJ clusters and repeated emoji collapse.
 		['casterix🚀-test', 'casterix#-test'],
@@ -232,27 +253,38 @@ describe('emojiSafeName', () => {
 		['1️⃣st', '1#st'],
 		['pure🚀', 'pure#'],
 		['🚀🚀', '#'],
-		// Letters (CJK/accents) and non-emoji symbols pass through.
+		// Live-proven rejected ASCII (upstream -7): maps to '#', runs collapse.
+		['what?ever', 'what#ever'],
+		['might:<be*"weird|>', 'might#be#weird#'],
+		['win\\nt:2*.txt', 'win#nt#2#.txt'],
+		// Control characters collapse into the same run rule.
+		['a\tb\x7f', 'a#b#'],
+		// Directory rule: trailing spaces trim (the emoji-then-space case
+		// resolves to '#' first, then the trim leaves one '#').
+		['trail ', 'trail'],
+		['casterix🚀 ', 'casterix#'],
+		// Letters (CJK/accents) and accepted symbols/ASCII pass through.
 		['唱片 #1', '唱片 #1'],
 		['naïve-файл', 'naïve-файл'],
 		['©-Copy', '©-Copy'],
 		['⌘-tech', '⌘-tech'],
+		["don't&do$that%~ok", "don't&do$that%~ok"],
+		['seed(1)[a]{b}—…', 'seed(1)[a]{b}—…'],
 		// '#' is never matched: idempotent.
 		['already#fine', 'already#fine'],
 		['casterix#-test', 'casterix#-test'],
 	];
 	for (const [input, expected] of cases) {
 		it(`maps ${JSON.stringify(input)} → ${JSON.stringify(expected)}`, () => {
-			expect(emojiSafeName(input)).toBe(expected);
-			// Path form keeps segment structure; idempotency holds for both.
-			expect(emojiSafeDavPath(input)).toBe(expected);
-			expect(emojiSafeDavPath(emojiSafeDavPath(input))).toBe(
-				emojiSafeDavPath(input),
+			expect(upstreamSafeName(input)).toBe(expected);
+			// Idempotency holds for the path form as well.
+			expect(upstreamSafeDavPath(upstreamSafeDavPath(input))).toBe(
+				upstreamSafeDavPath(input),
 			);
 		});
 	}
 	it('rewrites per segment but never touches separators', () => {
-		expect(emojiSafeDavPath('/🚀dir/sub📁/f🚀.txt')).toBe('/#dir/sub#/f#.txt');
+		expect(upstreamSafeDavPath('/🚀dir/a:b/f🚀.txt')).toBe('/#dir/a#b/f#.txt');
 	});
 });
 

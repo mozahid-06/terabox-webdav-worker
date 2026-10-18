@@ -148,14 +148,19 @@ export function encodeHref(path: string, isDir: boolean): string {
   return '/' + segments.join('/') + (isDir ? '/' : '');
 }
 
-/** TeraBox's web API rejects pictograph (emoji) names at creation with
- * `errno -7` ("Invalid file name") — live-proven 2026-10-18 on both MKCOL
- * and PUT, from folder and file paths alike (403 through this worker).
- * Literal '#' in names is accepted upstream (also live-proven), so emoji
- * code points are rewritten to '#' before a write path reaches Terabox.
- * Reads are left raw so names that were created elsewhere (a mobile app)
- * stay addressable when a client follows their listed href. */
-const EMOJI_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
+/** TeraBox's web API rejects names it considers invalid at creation with
+ * `errno -7` ("Invalid file name") — live-proven 2026-10-18 (MKCOL + PUT
+ * batteries): emoji/pictographs AND the ASCII set `? " * < > | : \` AND
+ * tab/control characters are all refused, and a directory name may not
+ * end in a space. A literal '#' in names is accepted upstream (also
+ * live-proven), so every rejected code point is rewritten to '#' before a
+ * write path reaches Terabox. Reads are left raw so names that were
+ * created elsewhere (a mobile app) stay addressable when a client follows
+ * their listed href. */
+
+/** Emoji / pictograph ranges and the ASCII/control set upstream refuses. */
+const REJECTED_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x00, 0x1f], // C0 control characters (tab probe proven rejected; rest hostile everywhere)
   [0x1f000, 0x1ffff], // all supplementary pictographs: transport/symbols/flags/skin tones
   [0x231a, 0x231b], // ⌚⌛
   [0x23e9, 0x23fa], // playback controls
@@ -168,39 +173,52 @@ const EMOJI_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x303d, 0x303d], // 〽
   [0x3297, 0x3297], // ㊗
   [0x3299, 0x3299], // ㊙
+  [0x7f, 0x7f], // DEL
+  // Live-proven name-invalid ASCII (upstream -7): ? " * < > | : \
+  [0x22, 0x22], // "
+  [0x2a, 0x2a], // *
+  [0x3a, 0x3a], // :
+  [0x3c, 0x3e], // < >
+  [0x3f, 0x3f], // ?
+  [0x5c, 0x5c], // \
+  [0x7c, 0x7c], // |
 ];
+// NB: 0x2f ('/') is the path separator and never reaches a segment here.
 
-function isEmojiCodePoint(cp: number): boolean {
+function isRejectedCodePoint(cp: number): boolean {
   // Joiners/enclosures that only exist inside emoji clusters: ZWJ, keycap,
   // and the emoji variation selectors.
   if (cp === 0x200d) return true;
   if (cp === 0x20e3) return true;
   if (cp >= 0xfe00 && cp <= 0xfe0f) return true;
-  return EMOJI_CODEPOINT_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
+  return REJECTED_CODEPOINT_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
 }
 
-/** Rewrite emoji in ONE path segment: one '#' per run of emoji code
- * points, so ZWJ sequences, flag pairs and skin-tone variants collapse
- * rather than littering the name. Letters (CJK, accents), ©/®, ⌘ and
- * every other character pass through untouched; '#' itself is never
- * matched, making the rewrite idempotent. */
-export function emojiSafeName(name: string): string {
+/** Rewrite rejected code points in ONE path segment to the accepted '#'
+ * (one '#' per RUN of rejected code points: emoji clusters, flags,
+ * repeated combines, and adjacent rejected ASCII collapse rather than
+ * littering the name), then trim trailing spaces (upstream refuses a
+ * directory name ending in one; the trailing emoji-then-space case
+ * resolves to a single '#' before the trim). Letters (CJK, accents),
+ * ©/®, ⌘ and every other ACCEPTED character pass through untouched; '#'
+ * itself is never matched, making the rewrite idempotent. */
+export function upstreamSafeName(name: string): string {
   let out = '';
   for (const ch of name) {
-    if (isEmojiCodePoint(ch.codePointAt(0)!)) {
+    if (isRejectedCodePoint(ch.codePointAt(0)!)) {
       if (!out.endsWith('#')) out += '#';
     } else {
       out += ch;
     }
   }
-  return out;
+  return out.replace(/[ ]+$/, '');
 }
 
-/** Apply `emojiSafeName` to every segment of a write-path. Input is
+/** Apply `upstreamSafeName` to every segment of a write-path. Input is
  * already cleaned (`.`/`..` removed by the callers), so a segment that
- * was pure emoji still yields '#' (never an empty name). */
-export function emojiSafeDavPath(davPath: string): string {
-  return davPath.split('/').map(emojiSafeName).join('/');
+ * was pure rejected characters still yields '#' (never an empty name). */
+export function upstreamSafeDavPath(davPath: string): string {
+  return davPath.split('/').map(upstreamSafeName).join('/');
 }
 
 /** Decode a request pathname into a cleaned absolute path. */
@@ -1344,7 +1362,7 @@ export async function handleWebDav(
   // raw too (they read an existing resource); only their Destination is
   // rewritten, inside handleMoveCopy.
   const writeIntent = method === 'PUT' || method === 'MKCOL' || method === 'DELETE';
-  const absPath = mount.toTera(writeIntent ? emojiSafeDavPath(davPath) : davPath);
+  const absPath = mount.toTera(writeIntent ? upstreamSafeDavPath(davPath) : davPath);
 
   // Reserved metadata segment (litmus 0.18 `protected` suite; the
   // CVE-2026-42535 class in mod_dav_fs): a path whose segment is `.DAV`
@@ -1452,7 +1470,7 @@ async function handleResumable(
     // write, and upstream refuses emoji at creation (-7).
     let absPath: string;
     try {
-      absPath = mount.toTera(emojiSafeDavPath(sanitizeDavPath(davPath)));
+      absPath = mount.toTera(upstreamSafeDavPath(sanitizeDavPath(davPath)));
     } catch {
       return errorResponse('Invalid path encoding', 400);
     }
@@ -2286,7 +2304,7 @@ async function handleMoveCopy(
   if (isReservedDavSegment(destDav)) return errorResponse('Forbidden', 403);
   // The destination of a MOVE/COPY is a write: emoji names would be
   // refused upstream (-7), so they arrive rewritten ('#').
-  const destPath = mount.toTera(emojiSafeDavPath(destDav));
+  const destPath = mount.toTera(upstreamSafeDavPath(destDav));
   if (mount.isRoot(destPath) || destPath === '') return errorResponse('Forbidden', 403);
 
   const overwrite = (request.headers.get('Overwrite') || 'T').toUpperCase() === 'T';

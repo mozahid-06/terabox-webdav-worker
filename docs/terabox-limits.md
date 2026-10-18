@@ -80,19 +80,26 @@ service from Cloudflare.
   verifies `block_list` (per-chunk md5 + upload md5).
   The worker re-computes the control md5 itself and raises `-5` (→ 502) on
   mismatch; upstream `-32` is "space insufficient" (→ 507).
-- **Emoji names → `#` (2026-10-18, live-proven)**: TeraBox's web API
-  refuses emoji in file/folder names at creation (`errno -7`, mapped 403
-  "Invalid file name") and even rejects emoji **lookup** paths. Literal
-  `#` in names is accepted upstream. So every write through this worker
-  (MKCOL, PUT, resumable begin, MOVE/COPY Destination) rewrites emoji code
-  points in the name to `#` — one `#` per emoji run, so ZWJ families,
-  flags and repeated emoji collapse (`👨‍👩‍👧-family` → `#-family`,
-  `casterix🚀` → `casterix#`). Reads stay raw: names created elsewhere
-  keep their listed hrefs, and names created here are addressed by the
-  `#`-form a listing shows. Trade-offs: a client that PUTs an emoji name
-  learns the rewritten name on its next listing, and two emoji names that
-  rewrite to the same `#` form collide (the second create answers 405/409
-  like any existing-name conflict).
+- **Write-name rewrite → `#` (2026-10-18, live-proven)**: TeraBox's web
+  API refuses at creation (`errno -7`, mapped 403 "Invalid file name",
+  MKCOL + PUT batteries): emoji/pictographs **and** the ASCII set
+  `? " * < > | : \` **and** tab/control characters; it also refuses emoji
+  **lookup** paths. A directory name may not end in a space. Literal `#`
+  in names is accepted upstream (also live-proven). So every write through
+  this worker (MKCOL, PUT, resumable begin, MOVE/COPY Destination)
+  rewrites each rejected code point to `#` — one `#` per rejected run,
+  then trims trailing spaces: ZWJ families, flags, repeated emoji and
+  adjacent rejected ASCII collapse (`👨‍👩‍👧-family` → `#-family`,
+  `what?name` → `what#name`, `casterix🚀 ` → `casterix#`). Accepted chars
+  pass untouched: `& % + ' ! ~ ^ $ @ [ ] { } ( ) semantic-typographic`
+  (`™ ° ∞ — … （`), trailing dots, leading/embedded spaces, and ≤280-char
+  names. Reads stay raw: names created elsewhere keep their listed hrefs,
+  and names created here are addressed by the `#`-form a listing shows.
+  Trade-offs: a client that writes a rejected name learns the rewritten
+  name on its next listing, and different names that rewrite to the same
+  `#` form collide (the second create answers 405/409 like any
+  existing-name conflict; `'...'` also answers 405 at MKCOL — pre-existing
+  worker behavior for that odd name).
 
 - **Chunk-size floor + ceiling (2026-10-17, live-measured both ways)**: a
   splitting upload's FIRST full part must be ≥ 4 MiB — TeraBox rejects
