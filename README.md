@@ -33,10 +33,12 @@ What you can do once deployed:
 - [Using a WebDAV client](#using-a-webdav-client)
   - [rclone](#rclone)
   - [davfs2 (Linux)](#davfs2-linux)
+  - [gvfs / GNOME Files (Linux)](#gvfs--gnome-files-linux)
 - [Troubleshooting (FAQ)](#troubleshooting-faq)
 - [Limitations](#limitations)
 - [Development](#development)
 - [Documentation index](#documentation-index)
+- [License](#license)
 
 ## Quick start
 
@@ -350,6 +352,33 @@ Two behaviors worth knowing:
 - `lost+found/` in the mount is davfs2's own directory for failed uploads —
   it exists only in the client's view, never on the server.
 
+### gvfs / GNOME Files (Linux)
+
+Nautilus and GNOME apps mount WebDAV through `gvfsd-dav` (no config file —
+set up once from the sidebar's "Other Locations" → `dav://<worker>.<subdomain>.workers.dev/dav`
+and answer the credential prompt once; the share then appears under
+`/run/user/<uid>/gvfs/`). Two measured behaviors worth knowing:
+
+- **Directory opens.** gvfsd-dav probes ~40 plausible cover-art names
+  (`AlbumArt.jpg`, `cover.png`, `thumb.*`, …) for *every* directory view.
+  The worker remembers upstream "does not exist" answers for 30 s
+  (see [Limitations](#limitations)), so repeat views and re-mounts stop
+  paying a real TeraBox round-trip per fake name; the first view of each
+  name still costs one upstream call by design.
+- **Slow video-player close.** If mpv (or any GIO-backed player) takes up
+  to ~60 s to close a video opened through the gvfs path, that is a
+  gvfsd-dav/libsoup interaction, not the worker: one in-flight ranged read
+  is released only by libsoup's 60 s read timeout. Measured 2026-10-18: the same file closes in <0.1 s over a local WebDAV server
+  (fast *or* deliberately slow) and in ~0.04 s with mpv straight over
+  HTTPS. Fine result: browse/copy with gvfs, but open media directly:
+
+  ```
+  mpv https://USER:PASSWORD@<worker>.<subdomain>.workers.dev/dav/<path>.mkv
+  ```
+
+  (a small wrapper script or Nautilus custom action keeps the credentials
+  out of the shell history).
+
 ## Troubleshooting (FAQ)
 
 **`500 {"error":"WebDAV server not configured"}`?**
@@ -417,13 +446,20 @@ per-request, but not shared across isolates. The Worker keeps serving.
 - **TeraBox is the source of truth**: quotas, file-size caps, rate gates and
   regional origin rules all come from the account. The full reference (errno
   table, gates, upload pipeline) is `docs/terabox-limits.md`.
+- **Staleness envelope for repeated stats**: existing paths are cached for
+  60 s, missing paths ("does not exist" answers) for **30 s** — so a file
+  created *outside* the worker (phone app, web UI) can stat as missing for
+  up to 30 s after its creation, inside the envelope external rewrites
+  already had. Writes through the worker invalidate immediately (same
+  second in every client), and requests carrying `If-Match`/`If-None-Match`
+  always see live validators.
 
 ## Development
 
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 353 cases over a mocked TeraBox API
+npm test                         # Vitest: 420 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)
@@ -446,3 +482,7 @@ Live end-to-end verification notes live in `docs/live-testing.md`.
 | [`docs/ndus-cookie-lifetime.md`](docs/ndus-cookie-lifetime.md) | Cookie anatomy + lifetime evidence (`ndus` fixed ~1y, rotating extras) |
 | [`docs/davfs2-etag-hang-investigation.md`](docs/davfs2-etag-hang-investigation.md) | Root cause of the davfs2 `cache_size` re-download loop |
 | [`docs/live-testing.md`](docs/live-testing.md) | How the worker was verified live against a real account |
+
+## License
+
+Released under the [MIT License](LICENSE).

@@ -193,6 +193,21 @@ service from Cloudflare.
   hooks and DO generation bump as `metaCache`, and any upstream refusal
   self-heals by falling back to the ladder. Measured: repeat-open TTFB
   2.4-5.1 s → **0.12-0.24 s**.
+- **Stat-miss cache (shipped 2026-10-18, was "never caches negative
+  lookups")**: upstream "path does not exist" (`errno -9`) answers are
+  remembered per isolate for **30 s** (deliberately half the positive meta
+  TTL), FIFO-capped at 2000 like `metaCache`, keyed by the same absPath,
+  and dropped by the same write-invalidation hooks (exact path + subtree +
+  parent), DO generation sync, and expiry. Only true `-9` answers are
+  cached, and the caught error object is rethrown verbatim, so every caller
+  keeps its exact error contract. Purpose: gvfsd-dav probes ~40
+  nonexistent cover-art names (`AlbumArt.jpg`, `cover.png`, `thumb.*`, …)
+  per directory view — each previously paid a real `/api/filemetas`
+  round-trip, which reads as sluggish mounts. Consequence: a path created
+  OUTSIDE this worker (phone app, web UI) can stat as missing for ≤30 s
+  after its creation — inside the 60 s staleness envelope the positive
+  cache already accepted; writes through the worker remain immediately
+  visible, and conditional requests always bypass the cache.
 - **No parallel-range bandwidth gain**: limited by the CDN path cap, not by the
   worker.
 
