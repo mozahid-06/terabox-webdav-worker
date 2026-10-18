@@ -123,6 +123,18 @@ service from Cloudflare.
 - **Pacing applies here too**: chunk uploads run through the same 400 ms gate —
   a 20 MB PUT measured **18.2 s** (5 chunks × paced calls). Upload is slow by
   design to keep the account unbanned.
+- **Client-facing single-request cap ≈ 100 MB (free plan, 2026-10-18
+  live-measured)**: a WebDAV `PUT` is ONE client request, so its whole body
+  must fit the edge's per-request body limit before the Worker ever runs —
+  105 MiB body → `413` in 0.15 s (edge answers on the declared
+  Content-Length); exactly 100 MiB → connection trickles ~27 MB then dies
+  with no HTTP status (gvfs shows this as `HTTP Error: (null)`); wrangler
+  tail stays empty for both. This is a Cloudflare plan limit (Free/Pro
+  100 MB, Business 200 MB, Enterprise default 500 MB), not a TeraBox or
+  worker limit — no WebDAV client can paste a bigger file through the
+  free plan. The chunked control plane (worker root page) exists for
+  exactly this: it re-sends the file as ≤ 4 MiB requests and reuses the
+  pipeline above.
 
 ## 5. Sessions & cookies
 

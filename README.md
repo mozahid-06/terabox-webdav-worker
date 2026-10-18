@@ -75,7 +75,7 @@ sudo mkdir -p /mnt/terabox && rclone mount terabox: /mnt/terabox --vfs-cache-mod
 | Auth | HTTP Basic over `USERS`; **fails closed** (`500 WebDAV server not configured`) when `USERS`/`COOKIE` are unset; a TeraBox session that dies mid-flight maps to `401` so clients re-authenticate |
 | Locks & properties | Real `LOCK`/`UNLOCK` with 423 enforcement and dead properties, backed by a `DavState` Durable Object (one serialized instance for the whole account) |
 | Downloads | Terabox CDN links with `Range` support; `HEAD` streams nothing (the upstream body is cancelled after headers) |
-| Uploads | Chunked Terabox upload (up to 4 GiB per file free, 128 GiB premium) |
+| Uploads | Chunked Terabox upload — the built-in uploader (worker root page) streams files in ≤4 MiB requests, up to 4 GiB per file free / 128 GiB premium. **WebDAV `PUT` is a single request, so on the free plan the edge caps it at ~100 MB** (see [Limitations](#limitations)) |
 | Rate safety | Every outbound call paced by `MIN_GAP_MS`, account-wide via the `DAV_STATE` DO (`/api-slot`; per-isolate floor as backstop); `Retry-After` honored (capped 5 s); jsToken re-minted at most once per 5 minutes |
 | State | No persistent server state of your own: everything lives in the TeraBox account |
 
@@ -365,6 +365,13 @@ and answer the credential prompt once; the share then appears under
   (see [Limitations](#limitations)), so repeat views and re-mounts stop
   paying a real TeraBox round-trip per fake name; the first view of each
   name still costs one upstream call by design.
+- **Pasting files bigger than ~100 MB fails** with a useless
+  `HTTP Error: (null)` dialog — that is the free-plan edge cap on a single
+  request body (gvfs uploads each file as one `PUT`), not a worker or
+  network fault, and nothing partial is left behind. For those files use
+  the **built-in uploader** on the worker's root page in a browser
+  (chunked, same login), or the TeraBox app — details in
+  [Limitations](#limitations).
 - **Slow video-player close.** If mpv (or any GIO-backed player) takes up
   to ~60 s to close a video opened through the gvfs path, that is a
   gvfsd-dav/libsoup interaction, not the worker: one in-flight ranged read
@@ -443,6 +450,17 @@ per-request, but not shared across isolates. The Worker keeps serving.
 - **`USERS`/`COOKIE` are required** — unset, the Worker answers
   `500 {"error":"WebDAV server not configured"}` for everyone. There is no
   anonymous read mode.
+- **Single-request body ≈ 100 MB (free-plan edge limit)**: a WebDAV `PUT`
+  is one request, so **pasting/uploading a file bigger than ~100 MB through
+  any WebDAV client (gvfs/Nautilus, rclone, davfs2) fails at the Cloudflare
+  edge** before this Worker runs — gvfs shows it as a useless
+  `HTTP Error: (null)`, rclone as a 413. Measured 2026-10-18: 105 MB →
+  `413` in 0.15 s; 100 MiB → silent connection death. Nothing arrives
+  partially. Use the **built-in uploader on the worker's root page**
+  (chunked, ≤4 MiB per request — handles files up to the free-plan
+  ~4 GiB ceiling), or the TeraBox app/web. Files under ~100 MB are
+  unaffected on every client. A Workers paid plan raises the request cap
+  (Business 200 MB, Enterprise default 500 MB).
 - **TeraBox is the source of truth**: quotas, file-size caps, rate gates and
   regional origin rules all come from the account. The full reference (errno
   table, gates, upload pipeline) is `docs/terabox-limits.md`.
