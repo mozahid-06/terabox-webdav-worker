@@ -148,6 +148,61 @@ export function encodeHref(path: string, isDir: boolean): string {
   return '/' + segments.join('/') + (isDir ? '/' : '');
 }
 
+/** TeraBox's web API rejects pictograph (emoji) names at creation with
+ * `errno -7` ("Invalid file name") — live-proven 2026-10-18 on both MKCOL
+ * and PUT, from folder and file paths alike (403 through this worker).
+ * Literal '#' in names is accepted upstream (also live-proven), so emoji
+ * code points are rewritten to '#' before a write path reaches Terabox.
+ * Reads are left raw so names that were created elsewhere (a mobile app)
+ * stay addressable when a client follows their listed href. */
+const EMOJI_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x1f000, 0x1ffff], // all supplementary pictographs: transport/symbols/flags/skin tones
+  [0x231a, 0x231b], // ⌚⌛
+  [0x23e9, 0x23fa], // playback controls
+  [0x23f0, 0x23f0], // ⏰
+  [0x23f3, 0x23f3], // ⏳
+  [0x2600, 0x27bf], // misc symbols + dingbats (☀ ⚡ ✂ ✈ ✉)
+  [0x2934, 0x2935], // ⤴⤵
+  [0x2b00, 0x2bff], // ⭐⬛⬆
+  [0x3030, 0x3030], // 〰
+  [0x303d, 0x303d], // 〽
+  [0x3297, 0x3297], // ㊗
+  [0x3299, 0x3299], // ㊙
+];
+
+function isEmojiCodePoint(cp: number): boolean {
+  // Joiners/enclosures that only exist inside emoji clusters: ZWJ, keycap,
+  // and the emoji variation selectors.
+  if (cp === 0x200d) return true;
+  if (cp === 0x20e3) return true;
+  if (cp >= 0xfe00 && cp <= 0xfe0f) return true;
+  return EMOJI_CODEPOINT_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
+}
+
+/** Rewrite emoji in ONE path segment: one '#' per run of emoji code
+ * points, so ZWJ sequences, flag pairs and skin-tone variants collapse
+ * rather than littering the name. Letters (CJK, accents), ©/®, ⌘ and
+ * every other character pass through untouched; '#' itself is never
+ * matched, making the rewrite idempotent. */
+export function emojiSafeName(name: string): string {
+  let out = '';
+  for (const ch of name) {
+    if (isEmojiCodePoint(ch.codePointAt(0)!)) {
+      if (!out.endsWith('#')) out += '#';
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/** Apply `emojiSafeName` to every segment of a write-path. Input is
+ * already cleaned (`.`/`..` removed by the callers), so a segment that
+ * was pure emoji still yields '#' (never an empty name). */
+export function emojiSafeDavPath(davPath: string): string {
+  return davPath.split('/').map(emojiSafeName).join('/');
+}
+
 /** Decode a request pathname into a cleaned absolute path. */
 export function decodePathname(pathname: string): string {
   const segments = pathname.split('/');
@@ -1282,7 +1337,14 @@ export async function handleWebDav(
     }
   }
 
-  const absPath = mount.toTera(davPath);
+  // Emoji names are illegal upstream (-7 at creation) but legal as '#':
+  // state-changing paths get the rewrite (create + delete address
+  // OUR-created names coherently), read paths stay raw so names created
+  // elsewhere keep working via their listed hrefs. MOVE/COPY sources stay
+  // raw too (they read an existing resource); only their Destination is
+  // rewritten, inside handleMoveCopy.
+  const writeIntent = method === 'PUT' || method === 'MKCOL' || method === 'DELETE';
+  const absPath = mount.toTera(writeIntent ? emojiSafeDavPath(davPath) : davPath);
 
   // Reserved metadata segment (litmus 0.18 `protected` suite; the
   // CVE-2026-42535 class in mod_dav_fs): a path whose segment is `.DAV`
@@ -1386,9 +1448,11 @@ async function handleResumable(
     if (!davPath.startsWith('/') || size < 0) return errorResponse('path and size required', 400);
     // The JSON path is already percent-decoded, but still needs `.`/`..`
     // collapsing — otherwise a crafted `..` walks above a ROOT_ID mount.
+    // Emoji names are rewritten ('#') exactly like PUT/MKCOL: this is a
+    // write, and upstream refuses emoji at creation (-7).
     let absPath: string;
     try {
-      absPath = mount.toTera(sanitizeDavPath(davPath));
+      absPath = mount.toTera(emojiSafeDavPath(sanitizeDavPath(davPath)));
     } catch {
       return errorResponse('Invalid path encoding', 400);
     }
@@ -2220,7 +2284,9 @@ async function handleMoveCopy(
   }
   if (destDav.length > 1 && destDav.endsWith('/')) destDav = destDav.slice(0, -1);
   if (isReservedDavSegment(destDav)) return errorResponse('Forbidden', 403);
-  const destPath = mount.toTera(destDav);
+  // The destination of a MOVE/COPY is a write: emoji names would be
+  // refused upstream (-7), so they arrive rewritten ('#').
+  const destPath = mount.toTera(emojiSafeDavPath(destDav));
   if (mount.isRoot(destPath) || destPath === '') return errorResponse('Forbidden', 403);
 
   const overwrite = (request.headers.get('Overwrite') || 'T').toUpperCase() === 'T';

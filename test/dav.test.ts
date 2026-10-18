@@ -1,6 +1,8 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	emojiSafeDavPath,
+	emojiSafeName,
 	metaCacheHasForTest,
 	metaCacheSeedForTest,
 	metaCacheSize,
@@ -176,6 +178,39 @@ describe('MKCOL', () => {
 		expect(tb.find('/new-folder')?.isdir).toBe(1);
 	});
 
+	it('rewrites emoji in the created name to # (upstream rejects emoji, errno -7)', async () => {
+		// Live-proven: upstream web API answers errno -7 for emoji names; a
+		// literal '#' is accepted. Creating through this worker rewrites
+		// emoji to '#' instead of 403ing.
+		const res = await request('/casterix%F0%9F%9A%80-test', { method: 'MKCOL' });
+		expect(res.status).toBe(201);
+		expect(tb.find('/casterix#-test')?.isdir).toBe(1);
+	});
+
+	it('rewrites emoji in PUT names to #', async () => {
+		const res = await request('/casterix%F0%9F%8E%89-file.txt', {
+			method: 'PUT', body: 'emoji name works',
+		});
+		expect(res.status).toBe(201);
+		// Reads stay raw, so the rewritten name is what resolves afterward.
+		const got = await request('/casterix%23-file.txt');
+		expect(got.status).toBe(200);
+		expect(await got.text()).toBe('emoji name works');
+		// The raw emoji URL no longer matches anything upstream (the stored
+		// name carries '#') — a listing refresh is how clients learn it.
+		const raw = await request('/casterix%F0%9F%8E%89-file.txt');
+		expect(raw.status).toBe(404);
+	});
+
+	it('keeps read paths raw: GET of a literally-#-named file resolves it', async () => {
+		// The name a client sees after creating is the '#' form; reads of
+		// it must resolve (raw == the stored name, no rewrite needed).
+		await request('/hash-%23-file.txt', { method: 'PUT', body: 'kept' });
+		const res = await request('/hash-%23-file.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('kept');
+	});
+
 	it('returns 405 for an existing resource', async () => {
 		const res = await request('/a.txt', { method: 'MKCOL' });
 		expect(res.status).toBe(405);
@@ -184,6 +219,40 @@ describe('MKCOL', () => {
 	it('rejects creating the root', async () => {
 		const res = await request('/', { method: 'MKCOL' });
 		expect(res.status).toBe(403);
+	});
+});
+
+describe('emojiSafeName', () => {
+	const cases: Array<[string, string]> = [
+		// One '#' per emoji RUN: ZWJ clusters and repeated emoji collapse.
+		['casterix🚀-test', 'casterix#-test'],
+		['🎉🎉party', '#party'],
+		['👨‍👩‍👧-family', '#-family'],
+		['🇺🇸flag', '#flag'],
+		['1️⃣st', '1#st'],
+		['pure🚀', 'pure#'],
+		['🚀🚀', '#'],
+		// Letters (CJK/accents) and non-emoji symbols pass through.
+		['唱片 #1', '唱片 #1'],
+		['naïve-файл', 'naïve-файл'],
+		['©-Copy', '©-Copy'],
+		['⌘-tech', '⌘-tech'],
+		// '#' is never matched: idempotent.
+		['already#fine', 'already#fine'],
+		['casterix#-test', 'casterix#-test'],
+	];
+	for (const [input, expected] of cases) {
+		it(`maps ${JSON.stringify(input)} → ${JSON.stringify(expected)}`, () => {
+			expect(emojiSafeName(input)).toBe(expected);
+			// Path form keeps segment structure; idempotency holds for both.
+			expect(emojiSafeDavPath(input)).toBe(expected);
+			expect(emojiSafeDavPath(emojiSafeDavPath(input))).toBe(
+				emojiSafeDavPath(input),
+			);
+		});
+	}
+	it('rewrites per segment but never touches separators', () => {
+		expect(emojiSafeDavPath('/🚀dir/sub📁/f🚀.txt')).toBe('/#dir/sub#/f#.txt');
 	});
 });
 
