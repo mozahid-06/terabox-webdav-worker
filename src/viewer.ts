@@ -175,7 +175,7 @@ button, .btn {
   border-radius: 8px;
   padding: 7px 14px;
   cursor: pointer;
-  transition: background-color 120ms var(--ease-out), border-color 120ms var(--ease-out), filter 120ms var(--ease-out);
+  transition: background-color 120ms var(--ease-out), border-color 120ms var(--ease-out), filter 120ms var(--ease-out), transform 120ms var(--ease-out);
 }
 button:hover, .btn:hover { background: var(--ridge); border-color: #35555A; }
 button.primary {
@@ -186,20 +186,35 @@ button.primary {
   padding: 7px 16px;
 }
 button.primary:hover { background: var(--brass); filter: brightness(1.07); border-color: var(--brass); }
-button:active { filter: brightness(0.93); }
+button:active { filter: brightness(0.93); transform: scale(.96); }
 :focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
 
 main { flex: 1; overflow: auto; position: relative; }
+body.dropping main::before {
+  content: "";
+  position: absolute; inset: 8px;
+  border-radius: 6px;
+  z-index: 6;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, var(--brass) 50%, transparent 0) repeat-x top / 16px 2px,
+    linear-gradient(90deg, var(--brass) 50%, transparent 0) repeat-x bottom / 16px 2px,
+    linear-gradient(0deg, var(--brass) 50%, transparent 0) repeat-y left / 2px 16px,
+    linear-gradient(0deg, var(--brass) 50%, transparent 0) repeat-y right / 2px 16px;
+  animation: ants 500ms linear infinite;
+}
 body.dropping main::after {
   content: "Drop files to upload";
   position: absolute; inset: 0;
   display: grid; place-items: center;
   background: color-mix(in srgb, var(--void) 86%, transparent);
-  border: 2px dashed var(--brass);
   font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--brass);
   z-index: 5;
   pointer-events: none;
+}
+@keyframes ants {
+  to { background-position: 16px 0, -16px 100%, 0 -16px, 100% 16px; }
 }
 
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
@@ -222,8 +237,15 @@ td {
   vertical-align: middle;
 }
 tbody tr {
-  cursor: default;
+  cursor: pointer;
   transition: background-color 140ms var(--ease-out);
+  animation: rowIn .5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  animation-delay: calc(var(--i, 0) * 38ms);
+}
+@keyframes rowIn {
+  0% { opacity: 0; transform: translateX(-12px) scale(.985); }
+  62% { opacity: 1; transform: translateX(2px) scale(1); }
+  100% { opacity: 1; transform: none; }
 }
 @media (hover: hover) and (pointer: fine) {
   tbody tr:hover,
@@ -245,11 +267,17 @@ th:nth-child(4) { width: 132px; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  transition: color 120ms var(--ease-out);
+  background: linear-gradient(var(--brass), var(--brass)) left 100% / 0% 1px no-repeat;
+  transition: color 120ms var(--ease-out), background-size 220ms var(--ease-out);
+  padding-bottom: 1px;
 }
 @media (hover: hover) and (pointer: fine) {
-  .name a:hover { color: var(--brass); text-decoration: underline; text-underline-offset: 3px; }
+  .name a:hover { color: var(--brass); text-decoration: none; background-size: 100% 1px; }
 }
+/* Name block: the link (+ a meta line phones show under it); badge after. */
+.nmcol { display: block; min-width: 0; }
+.m-meta { display: none; }
+.m-meta b { color: var(--brass); font-weight: 600; }
 /* Extension tags: plain mono text in the kind color — no pill boxes. */
 .badge {
   flex: none;
@@ -257,22 +285,33 @@ th:nth-child(4) { width: 132px; }
   font-size: 10px;
   letter-spacing: 0.03em;
   text-transform: lowercase;
+  animation: badgeIn .35s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  animation-delay: calc(var(--i, 0) * 38ms + 220ms);
+}
+@keyframes badgeIn {
+  from { opacity: 0; transform: scale(.55); }
 }
 .badge.k-img { color: #7FC9A2; }
 .badge.k-vid { color: #B9A6F0; }
 .badge.k-aud { color: #E8A87C; }
 .badge.k-txt { color: #86B6E8; }
 .ic-dir { color: var(--brass); }
+@media (hover: hover) and (pointer: fine) {
+  .ic-dir { transition: transform .28s cubic-bezier(0.34, 1.56, 0.64, 1); transform-origin: 40% 60%; }
+  tbody tr:hover .ic-dir { transform: rotate(-11deg) scale(1.22); }
+}
 .ic-file { color: var(--fog); }
 .ic-up { color: #5E7A78; }
 tr.up .name a { color: var(--fog); font-weight: 600; }
 td.when { color: var(--fog); font-size: 12px; white-space: nowrap; }
 td.size { color: var(--fog); font-size: 12px; white-space: nowrap; }
-.row-actions { display: flex; gap: 4px; justify-content: flex-end; opacity: 1; }
+.row-actions { display: flex; gap: 4px; justify-content: flex-end; opacity: 1; transition: opacity 140ms var(--ease-out), transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1); }
 @media (hover: hover) and (pointer: fine) {
-  .row-actions { opacity: 0; transition: opacity 140ms var(--ease-out); }
-  tbody tr:hover .row-actions, tbody tr:focus-within .row-actions { opacity: 1; }
+  .row-actions { opacity: 0; transform: translateX(7px); }
+  tbody tr:hover .row-actions, tbody tr:focus-within .row-actions { opacity: 1; transform: none; }
 }
+/* Row overflow button — opens the bottom action sheet on phones. */
+.mmore { display: none; }
 .row-actions a, .row-actions button {
   display: grid; place-items: center;
   width: 28px; height: 28px;
@@ -321,6 +360,7 @@ td.size { color: var(--fog); font-size: 12px; white-space: nowrap; }
   border-radius: 999px;
   padding: 5px 12px;
   white-space: nowrap;
+  animation: chipPulse 1600ms ease-in-out infinite;
 }
 .upchip[hidden] { display: none; }
 .upchip em {
@@ -340,8 +380,12 @@ td.size { color: var(--fog); font-size: 12px; white-space: nowrap; }
   background: var(--brass);
   transition: width 160ms var(--ease-out), background-color 200ms var(--ease-out);
 }
-.upchip.done { border-color: #33563F; color: var(--jade); }
+.upchip.done { border-color: #33563F; color: var(--jade); animation: none; }
 .upchip.done em i { background: var(--jade); }
+@keyframes chipPulse {
+  0%, 100% { border-color: var(--line); }
+  50% { border-color: var(--brass); }
+}
 
 /* Upload status lines — fixed to the viewport bottom so they can never be
    missed while a transfer is running; they append and never move rows. */
@@ -385,13 +429,168 @@ body.uploading main { padding-bottom: 68px; }
 .pline.bad { color: var(--coral); }
 @keyframes pline-slide { from { transform: translateX(-100%); } to { transform: translateX(320%); } }
 
+/* ===== Mobile: the phone gets its own layout, not a shrunken table ===== */
 @media (max-width: 640px) {
-  th:nth-child(3), td:nth-child(3) { display: none; }
-  .top { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
-  #crumbs { flex-basis: 100%; order: -1; }
-  td, th { padding-left: 14px; padding-right: 14px; }
+  .top { padding: 10px 12px; gap: 8px; }
+  #upload { display: none; }
+  #mkdir, #refresh, #signout button {
+    width: 34px; height: 34px;
+    padding: 0;
+    border-radius: 50%;
+    font-size: 0;
+    color: transparent;
+    background-color: color-mix(in srgb, var(--ridge) 50%, transparent);
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 15px 15px;
+  }
+  #mkdir {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23E6F0EE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1.75 4.5c0-.97.78-1.75 1.75-1.75h2.6c.47 0 .92.19 1.26.53l.8.8h4.34c.97 0 1.75.78 1.75 1.75v5.42c0 .97-.78 1.75-1.75 1.75H3.5a1.75 1.75 0 0 1-1.75-1.75z'/%3E%3C/svg%3E");
+  }
+  #refresh {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23E6F0EE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.2 8a5.2 5.2 0 1 1-1.6-3.75'/%3E%3Cpath d='M13.4 1.8v2.6h-2.6'/%3E%3C/svg%3E");
+  }
+  #signout button {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23E6F0EE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 2.5h5a.8.8 0 0 1 .8.8v9.4a.8.8 0 0 1-.8.8h-5'/%3E%3Cpath d='M2.5 8h6.2M6.5 5.8 8.7 8l-2.2 2.2'/%3E%3C/svg%3E");
+  }
+
+  /* List rows: tile icon, wrapping name, meta line, overflow button. */
+  thead { display: none; }
+  table, tbody { display: block; }
+  tbody tr { display: flex; align-items: center; border-bottom: 1px solid var(--ridge); }
+  td { display: block; border-bottom: none; padding: 0; }
+  td.nm { flex: 1; min-width: 0; padding: 10px 0 10px 14px; }
+  td.acts { flex: none; padding: 10px 14px 10px 0; }
+  td.num, td.when { display: none; }
+  .name { gap: 11px; }
+  .name svg { box-sizing: content-box; width: 17px; height: 17px; padding: 9px; background: var(--petrol); border: 1px solid var(--line); border-radius: 9px; }
+  .name a {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    word-break: break-word;
+    background: none;
+  }
+  .m-meta { display: block; margin-top: 2px; }
+  .badge { display: none; }
+  .row-actions { display: none; }
+  .mmore {
+    display: grid; place-items: center;
+    width: 34px; height: 34px;
+    border: 1px solid var(--line);
+    background: var(--petrol);
+    color: var(--fog);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 15px;
+    cursor: pointer;
+    transition: transform 150ms var(--ease-out);
+  }
+  .mmore:active { transform: scale(.94); }
 }
+
+/* ===== Bottom action sheet + scrim (phones only) ===== */
+.scrim {
+  position: fixed; inset: 0;
+  background: rgba(12, 22, 23, .72);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms var(--ease-out);
+  z-index: 40;
+}
+.sheet {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  margin: 0 auto;
+  max-width: 480px;
+  background: var(--petrol);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 18px 18px 0 0;
+  padding: 8px 16px 14px;
+  transform: translateY(110%);
+  transition: transform 320ms cubic-bezier(0.34, 1.4, 0.64, 1);
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, .5);
+  z-index: 41;
+}
+body.sheeton .scrim { opacity: 1; pointer-events: auto; }
+body.sheeton .sheet { transform: none; }
+.sheet .handle { width: 36px; height: 4px; border-radius: 2px; background: #2A4648; margin: 2px auto 10px; }
+.sheet .shname {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--fog);
+  margin: 0 2px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sheet .shname b { color: var(--paper); font-weight: 500; }
+.sbtn {
+  display: flex; align-items: center; gap: 11px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--paper);
+  background: rgba(23, 49, 48, .45);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: transform 150ms var(--ease-out), background-color 150ms var(--ease-out);
+}
+.sbtn:active { transform: scale(.98); background: var(--ridge); }
+.sbtn .si { width: 16px; flex: none; display: grid; place-items: center; color: var(--fog); }
+.sbtn.danger { color: var(--coral); border-color: color-mix(in srgb, var(--coral) 35%, transparent); }
+.sbtn.danger .si { color: var(--coral); }
+.sbtn[hidden] { display: none; }
+.scancel {
+  width: 100%;
+  text-align: center;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fog);
+  background: transparent;
+  border: none;
+  padding: 9px;
+  cursor: pointer;
+}
+@media (min-width: 641px) {
+  .scrim, .sheet { display: none; }
+}
+
+/* ===== Floating upload button (phones) ===== */
+.fab {
+  display: none;
+  position: fixed; right: 18px; bottom: 26px;
+  width: 54px; height: 54px;
+  border-radius: 50%;
+  border: none;
+  background: var(--brass);
+  color: var(--brass-ink);
+  place-items: center;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(227, 168, 87, .4);
+  transition: transform 180ms cubic-bezier(0.34, 1.56, 0.64, 1), bottom 200ms var(--ease-out);
+  animation: fabIn .45s .5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  z-index: 7;
+}
+.fab:active { transform: scale(.9); }
+@keyframes fabIn {
+  from { opacity: 0; transform: scale(.4); }
+}
+@media (max-width: 640px) {
+  .fab { display: grid; }
+  body.uploading .fab { bottom: 140px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  tbody tr, .badge, .fab, .upchip { animation: none !important; }
+  tbody tr, .row-actions, .name .ic-dir, .name a, .upchip, .sheet, .scrim, .mmore, .sbtn { transition: none !important; }
+  body.dropping main::before { animation: none !important; }
   .pline.indet i { animation: none; }
 }
 </style>
@@ -401,7 +600,7 @@ body.uploading main { padding-bottom: 68px; }
   <nav id="crumbs" class="mono" aria-label="Path"></nav>
   <button id="upload" class="primary">Upload files</button>
   <span id="upchip" class="upchip" hidden><em><i></i></em><span class="pct"></span></span>
-  <button id="mkdir">New folder</button>
+  <button id="mkdir" aria-label="New folder">New folder</button>
   <button id="refresh" aria-label="Refresh listing">Refresh</button>
   <form id="signout" method="post" action="/.dav-logout">
     <input type="hidden" name="next" value="">
@@ -424,6 +623,17 @@ body.uploading main { padding-bottom: 68px; }
   <p id="empty" hidden></p>
   <p id="error" role="alert" hidden></p>
 </main>
+<button id="fab" class="fab" type="button" aria-label="Upload files"><svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg></button>
+<div id="scrim" class="scrim"></div>
+<div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-label="File actions">
+  <div class="handle" aria-hidden="true"></div>
+  <p class="shname"><b id="sheetName"></b></p>
+  <button class="sbtn" id="sheetOpen" type="button"><span class="si"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg></span>Open</button>
+  <a class="sbtn" id="sheetDl" download><span class="si"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5V10m0 0 3-3m-3 3-3-3M3 12v1.2c0 .44.36.8.8.8h8.4c.44 0 .8-.36.8-.8V12"/></svg></span>Download</a>
+  <button class="sbtn" id="sheetRen" type="button"><span class="si"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m11 2.6 2.4 2.4-7.4 7.4-3.2.8.8-3.2zM9.9 3.7l2.4 2.4"/></svg></span>Rename</button>
+  <button class="sbtn danger" id="sheetDel" type="button"><span class="si"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.75 4.5h10.5M6.25 4.5v-.9a.9.9 0 0 1 .9-.9h1.7a.9.9 0 0 1 .9.9v.9M4.4 4.5l.55 8.2A1.15 1.15 0 0 0 6.09 13.75h3.82a1.15 1.15 0 0 0 1.14-1.05l.55-8.2M6.6 7v4.4M9.4 7v4.4"/></svg></span>Delete</button>
+  <button class="scancel" id="sheetCancel" type="button">Cancel</button>
+</div>
 <div id="uploads" class="uploads" aria-live="polite"></div>
 <script>
 (function () {
@@ -675,20 +885,25 @@ body.uploading main { padding-bottom: 68px; }
     // Classic FTP-style parent entry — one row above the listing.
     var tr = document.createElement('tr');
     tr.className = 'up';
+    tr.style.setProperty('--i', '0');
+    tr.setAttribute('data-href', base.slice(0, base.lastIndexOf('/', base.length - 2) + 1));
     var tdName = document.createElement('td');
+    tdName.className = 'nm';
     var wrap = el('div', 'name');
+    var nmcol = el('div', 'nmcol');
     var link = document.createElement('a');
-    link.href = base.slice(0, base.lastIndexOf('/', base.length - 2) + 1);
+    link.href = tr.getAttribute('data-href');
     link.textContent = '..';
     link.title = 'Go to parent folder';
     link.setAttribute('aria-label', 'Parent folder');
+    nmcol.appendChild(link);
     wrap.appendChild(svg(ICON_UP, 'ic-up'));
-    wrap.appendChild(link);
+    wrap.appendChild(nmcol);
     tdName.appendChild(wrap);
     tr.appendChild(tdName);
     tr.appendChild(el('td', 'num size mono', '—'));
     tr.appendChild(el('td', 'when mono', ''));
-    tr.appendChild(el('td', '', ''));
+    tr.appendChild(el('td', 'acts', ''));
     return tr;
   }
 
@@ -701,7 +916,7 @@ body.uploading main { padding-bottom: 68px; }
     });
     if (base !== mountHome()) rows.appendChild(upRow());
     for (var i = 0; i < list.length; i++) {
-      rows.appendChild(rowFor(list[i]));
+      rows.appendChild(rowFor(list[i], i));
     }
     if (list.length === 0) {
       empty.textContent = 'Nothing here yet. Drop files here or use Upload files.';
@@ -711,33 +926,53 @@ body.uploading main { padding-bottom: 68px; }
     }
   }
 
-  function rowFor(entry) {
+  function rowFor(entry, i) {
     var tr = document.createElement('tr');
+    tr.style.setProperty('--i', String(Math.min(i, 12)));
+    tr.setAttribute('data-i', String(i));
 
     var tdName = document.createElement('td');
+    tdName.className = 'nm';
     var wrap = el('div', 'name');
+    var nmcol = el('div', 'nmcol');
     var link = document.createElement('a');
     link.className = entry.isDir ? '' : 'mono';
     link.href = entry.href + (entry.isDir && entry.href.charAt(entry.href.length - 1) !== '/' ? '/' : '');
     link.textContent = entry.name;
     link.title = entry.name;
+    nmcol.appendChild(link);
+    var meta = el('span', 'm-meta');
+    var ext = '';
     if (entry.isDir) {
+      meta.textContent = 'folder';
       wrap.appendChild(svgF(ICON_DIR, 'ic-dir'));
-      wrap.appendChild(link);
     } else {
       wrap.appendChild(svg(ICON_FL, 'ic-file'));
-      wrap.appendChild(link);
-      var ext = extOf(entry.name);
-      if (ext) wrap.appendChild(el('span', 'badge k-' + kindOf(entry.name), ext));
+      ext = extOf(entry.name);
+      meta.appendChild(el('b', '', fmtSize(entry.size)));
+      var when = fmtWhen(entry.when);
+      if (when) meta.appendChild(document.createTextNode(' · ' + when));
+    }
+    nmcol.appendChild(meta);
+    wrap.appendChild(nmcol);
+    if (!entry.isDir && ext) {
+      wrap.appendChild(el('span', 'badge k-' + kindOf(entry.name), ext));
     }
     tdName.appendChild(wrap);
     tr.appendChild(tdName);
+    tr.setAttribute('data-href', link.href);
 
     var tdSize = el('td', 'num size mono', entry.isDir ? '—' : fmtSize(entry.size));
     tr.appendChild(tdSize);
     tr.appendChild(el('td', 'when mono', fmtWhen(entry.when)));
 
     var tdAct = document.createElement('td');
+    tdAct.className = 'acts';
+    var mm = el('button', 'mmore');
+    mm.type = 'button';
+    mm.textContent = '⋮';
+    mm.setAttribute('aria-label', 'Actions for ' + entry.name);
+    tdAct.appendChild(mm);
     var acts = el('div', 'row-actions');
     var dl = document.createElement('a');
     dl.href = entry.href;
@@ -1074,6 +1309,114 @@ body.uploading main { padding-bottom: 68px; }
     uploadFiles(picker.files);
     picker.value = '';
   });
+
+  // ===== Full-row activation + bottom action sheet =====
+  // Clicking anywhere in a row does what clicking the name would (folders
+  // navigate, files open); the name link, download link and sheet button keep
+  // their native/own behavior, and an in-progress text selection is never
+  // hijacked.
+  var sheetOpenBtn = document.getElementById('sheetOpen');
+  var sheetDl = document.getElementById('sheetDl');
+  var sheetRenBtn = document.getElementById('sheetRen');
+  var sheetDelBtn = document.getElementById('sheetDel');
+  var sheetCancelBtn = document.getElementById('sheetCancel');
+  var sheetNameEl = document.getElementById('sheetName');
+  var currentEntry = null;
+  var lpFired = false;
+
+  function rowEntry(tr) {
+    if (!tr || !tr.hasAttribute('data-i')) return null;
+    return entries[+tr.getAttribute('data-i')] || null;
+  }
+  function openSheet(entry) {
+    if (!entry) return;
+    currentEntry = entry;
+    sheetNameEl.textContent = entry.name;
+    sheetDl.href = entry.href;
+    sheetDl.hidden = entry.isDir;
+    document.body.classList.add('sheeton');
+    sheetOpenBtn.focus();
+  }
+  function closeSheet() {
+    document.body.classList.remove('sheeton');
+  }
+
+  rows.addEventListener('click', function (ev) {
+    var tr = ev.target.closest('tr');
+    if (!tr) return;
+    if (ev.target.closest('.mmore')) {
+      openSheet(rowEntry(tr));
+      return;
+    }
+    if (lpFired) { lpFired = false; return; }
+    if (ev.target.closest('a, button')) return;
+    if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    var sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    var href = tr.getAttribute('data-href');
+    if (href) window.location.href = href;
+  });
+
+  sheetOpenBtn.addEventListener('click', function () {
+    if (!currentEntry) return;
+    var slash = currentEntry.isDir && currentEntry.href.charAt(currentEntry.href.length - 1) !== '/' ? '/' : '';
+    window.location.href = currentEntry.href + slash;
+  });
+  sheetDl.addEventListener('click', function () { closeSheet(); });
+  sheetRenBtn.addEventListener('click', function () {
+    var entry = currentEntry;
+    closeSheet();
+    if (entry) renameEntry(entry);
+  });
+  sheetDelBtn.addEventListener('click', function () {
+    var entry = currentEntry;
+    closeSheet();
+    if (entry) deleteEntry(entry);
+  });
+  sheetCancelBtn.addEventListener('click', closeSheet);
+  document.getElementById('scrim').addEventListener('click', function () {
+    if (lpFired) { lpFired = false; return; }
+    closeSheet();
+  });
+  document.getElementById('fab').addEventListener('click', function () { picker.click(); });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') closeSheet();
+  });
+
+  // Long-press (touch) and right-click open the sheet on phones only — a
+  // desktop right-click keeps the browser's own menu.
+  if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
+    var lp = null;
+    var lpClear = function () {
+      if (lp) { clearTimeout(lp.t); lp = null; }
+    };
+    rows.addEventListener('touchstart', function (ev) {
+      if (ev.touches.length !== 1) return;
+      var tr = ev.target.closest('tr');
+      if (!tr || !tr.hasAttribute('data-i')) return;
+      lpClear();
+      lp = { tr: tr, x: ev.touches[0].clientX, y: ev.touches[0].clientY, t: null };
+      lp.t = setTimeout(function () {
+        lp = null;
+        lpFired = true;
+        openSheet(rowEntry(tr));
+        setTimeout(function () { lpFired = false; }, 400);
+      }, 500);
+    }, { passive: true });
+    rows.addEventListener('touchmove', function (ev) {
+      if (!lp) return;
+      var dx = ev.touches[0].clientX - lp.x, dy = ev.touches[0].clientY - lp.y;
+      if (dx * dx + dy * dy > 144) lpClear(); // moved — it's a scroll, not a press
+    }, { passive: true });
+    rows.addEventListener('touchend', lpClear, { passive: true });
+    rows.addEventListener('touchcancel', lpClear, { passive: true });
+    rows.addEventListener('contextmenu', function (ev) {
+      var tr = ev.target.closest('tr');
+      if (!tr || !tr.hasAttribute('data-i')) return;
+      ev.preventDefault();
+      openSheet(rowEntry(tr));
+    });
+  }
 
   document.addEventListener('dragover', function (ev) {
     // Always suppress the default: dropping selected text or a URL without
