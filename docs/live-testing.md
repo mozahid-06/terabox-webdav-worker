@@ -877,6 +877,15 @@ saved cookie, ever.** Campaign 7's HttpOnly cookie (`davbox_session`,
   inert legacy cookie, public shell, reserved-path 401, token
   mint/verify (path-bound, 60 s expiry, forgery, PUT/DELETE-with-token
   refusal, sign-path traversal/junk 400s), POST-only contracts.
+- **Post-deploy support case (same day)**: Nautilus reported `HTTP Error:
+  (null)` copying `Chapter_:_01.mkv` into the mount. Root cause = size, not
+  the name: the file is 1.07 GB (past the ~100 MB single-request edge cap —
+  the kill leaves gvfs with no status to print, hence "(null)"). The colon
+  was cleared innocent twice on the live worker: raw `:` PUT → 201 (stored
+  as `#`), and the same copy through `gio copy` (gvfsd-dav itself) →
+  success, stored `colonprobe-#_01.txt`. Remedy for files this size: the
+  web viewer's chunked uploader or the TeraBox app; no WebDAV single-PUT
+  client can exceed the cap on the free plan.
 
 ## Repo map (context for AI sessions)
 
