@@ -28,6 +28,7 @@ import type { Dentry, TeraboxItem } from './types';
 export function resetDavVolatileState(): void {
   resetDavStoreState();
   metaCache.clear();
+  metaMissCache.clear();
   dlUrlCache.clear();
   metaGenState.value = -1;
   metaGenState.checkedAt = 0;
@@ -45,6 +46,19 @@ export function metaCacheSeedForTest(absPath: string, item: TeraboxItem): void {
 /** Test hook: is a path currently cached? */
 export function metaCacheHasForTest(absPath: string): boolean {
   return metaCache.has(absPath);
+}
+/** Test hook: current miss-cache occupancy (cap assertions in dav.test.ts). */
+export function metaMissCacheSize(): number {
+  return metaMissCache.size;
+}
+/** Test hook: seed the miss cache through the same write path itemInfoCached
+ *  uses, without an HTTP round-trip per entry. */
+export function metaMissCacheSeedForTest(absPath: string, err: unknown): void {
+  missCacheWrite(absPath, err);
+}
+/** Test hook: is a path currently cached as a miss? */
+export function metaMissCacheHasForTest(absPath: string): boolean {
+  return metaMissCache.has(absPath);
 }
 export type { LockRecord };
 
@@ -525,6 +539,21 @@ const META_TTL_MS = 60_000;
 const META_MAX_ENTRIES = 2000;
 const metaCache = new Map<string, { item: TeraboxItem; expires: number }>();
 
+/**
+ * Negative mirror of metaCache: upstream "path does not exist" (errno -9)
+ * answers, keyed by the same absPath. gvfsd-dav probes dozens of plausible
+ * cover-art names (AlbumArt.jpg, cover.png, thumb.*) on EVERY directory
+ * view; before this cache each probe paid a full /api/filemetas round-trip,
+ * which made mounts and directory opens feel sluggish. The caught error is
+ * rethrown verbatim so consumers keep their exact error contract
+ * ("same behavior as an uncached miss"), and the TTL is deliberately half
+ * the positive one: a path created OUTSIDE this worker (phone app, web UI)
+ * must surface within 30 s, inside the 60 s staleness envelope the
+ * positive cache already accepted.
+ */
+const META_MISS_TTL_MS = 30_000;
+const metaMissCache = new Map<string, { err: unknown; expires: number }>();
+
 /** Insert into the meta cache: sweep expired entries, then enforce the size
  *  cap FIFO before writing. Shared by the live stat path and test seeding. */
 function cacheWrite(absPath: string, item: TeraboxItem): void {
@@ -540,12 +569,37 @@ function cacheWrite(absPath: string, item: TeraboxItem): void {
   metaCache.set(absPath, { item, expires: now + META_TTL_MS });
 }
 
+/** Mirror of cacheWrite for the negative mirror: same sweep + FIFO cap so a
+ *  long-lived isolate probing thousands of distinct missing names (a gvfs
+ *  client over a huge share) cannot grow the map without bound. */
+function missCacheWrite(absPath: string, err: unknown): void {
+  const now = Date.now();
+  for (const [key, entry] of metaMissCache) {
+    if (entry.expires <= now) metaMissCache.delete(key);
+  }
+  while (metaMissCache.size >= META_MAX_ENTRIES) {
+    const oldest = metaMissCache.keys().next();
+    if (oldest.done) break;
+    metaMissCache.delete(oldest.value);
+  }
+  metaMissCache.set(absPath, { err, expires: now + META_MISS_TTL_MS });
+}
+
 async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem> {
   const hit = metaCache.get(absPath);
   if (hit && hit.expires > Date.now()) return hit.item;
-  const item = await client.itemInfo(absPath, true);
-  cacheWrite(absPath, item);
-  return item;
+  const hitMiss = metaMissCache.get(absPath);
+  if (hitMiss && hitMiss.expires > Date.now()) throw hitMiss.err;
+  try {
+    const item = await client.itemInfo(absPath, true);
+    cacheWrite(absPath, item);
+    return item;
+  } catch (error) {
+    // Only a definitive nonexistent-path answer is a miss: upstream faults
+    // (network, session, list-truncation) must never masquerade as absence.
+    if (errIsNum(error, -9)) missCacheWrite(absPath, error);
+    throw error;
+  }
 }
 
 /**
@@ -646,13 +700,16 @@ function dlUrlCacheTouch(absPath: string): void {
 async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> {
   metaCache.delete(absPath);
   dlUrlCache.delete(absPath);
+  metaMissCache.delete(absPath);
   const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
   for (const key of [...metaCache.keys()]) if (key.startsWith(prefix)) metaCache.delete(key);
   for (const key of [...dlUrlCache.keys()]) if (key.startsWith(prefix)) dlUrlCache.delete(key);
+  for (const key of [...metaMissCache.keys()]) if (key.startsWith(prefix)) metaMissCache.delete(key);
   const slash = absPath.lastIndexOf('/');
   const parent = slash <= 0 ? '/' : absPath.slice(0, slash);
   metaCache.delete(parent);
   dlUrlCache.delete(parent);
+  metaMissCache.delete(parent);
   if (!store) return;
   try {
     await store.metaGeneration(true);
@@ -685,6 +742,7 @@ async function syncMetaGeneration(store: DavStore): Promise<void> {
     if (metaGenState.value !== -1 && gen !== metaGenState.value) {
       metaCache.clear();
       dlUrlCache.clear();
+      metaMissCache.clear();
     }
     metaGenState.value = gen;
   } catch {

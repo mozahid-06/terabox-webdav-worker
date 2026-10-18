@@ -4,6 +4,9 @@ import {
 	metaCacheHasForTest,
 	metaCacheSeedForTest,
 	metaCacheSize,
+	metaMissCacheHasForTest,
+	metaMissCacheSeedForTest,
+	metaMissCacheSize,
 	resetDavVolatileState,
 	safeRelocate,
 	upstreamSafeDavPath,
@@ -625,11 +628,21 @@ describe('metadata cache (read-path filemetas collapse)', () => {
 		expect(tb.filemetasCalls).toBe(after);
 	});
 
-	it('never caches negative lookups', async () => {
+	it('caches negative lookups for the short miss TTL (policy inversion of the pre-campaign pin)', async () => {
+		// Rewritten pin: the old contract ("never caches negative lookups")
+		// existed to keep freshly-created paths invisible for zero minutes,
+		// but it made every gvfsd-dav directory view a storm of real
+		// /api/filemetas calls for nonexistent cover-art names (AlbumArt.jpg,
+		// cover.png, thumb.*), which is what made mounts feel sluggish.
+		// The new policy bounds the consequence: misses live META_MISS_TTL_MS
+		// (30 s — inside the 60 s staleness envelope the positive cache
+		// already accepted), and are flushed by writes through this worker,
+		// expiry, generation sync, and the FIFO cap. The boundaries are
+		// pinned in describe `stat miss cache (gvfsd-dav probe storm)`.
 		expect((await request('/missing.txt')).status).toBe(404);
 		const after = tb.filemetasCalls;
 		expect((await request('/missing.txt')).status).toBe(404);
-		expect(tb.filemetasCalls).toBe(after + 1);
+		expect(tb.filemetasCalls).toBe(after);
 	});
 
 	it('invalidates on PUT so the next GET re-fetches and serves new bytes', async () => {
@@ -777,6 +790,74 @@ describe('GET download-URL cache (repeat-open TTFB)', () => {
 		} finally {
 			at.mockRestore();
 		}
+	});
+});
+
+describe('stat miss cache (gvfsd-dav probe storm)', () => {
+	it('caches stat misses: re-probing a missing name does not re-ladder upstream', async () => {
+		// gvfsd-dav probes dozens of plausible cover-art names (AlbumArt.jpg,
+		// cover.png, …) on every directory view; on the first absence it got
+		// a live filemetas answer — the second probe must reuse it.
+		expect(
+			(await request('/cover.png', { method: 'PROPFIND', headers: { Depth: '0' } })).status,
+		).toBe(404);
+		const afterFirst = tb.filemetasCalls;
+		expect(
+			(await request('/cover.png', { method: 'PROPFIND', headers: { Depth: '0' } })).status,
+		).toBe(404);
+		expect(tb.filemetasCalls).toBe(afterFirst);
+	});
+
+	it('flushes the cached stat miss on writes through this worker', async () => {
+		expect(
+			(await request('/cover.png', { method: 'PROPFIND', headers: { Depth: '0' } })).status,
+		).toBe(404);
+		expect((await request('/cover.png', { method: 'PUT', body: 'cover art bytes' })).status).toBe(
+			201,
+		);
+		// A surviving miss entry would answer from the cache and make the
+		// just-created file invisible for the whole miss window.
+		expect(
+			(await request('/cover.png', { method: 'PROPFIND', headers: { Depth: '0' } })).status,
+		).toBe(207);
+	});
+
+	it('expires stat misses: a path that later exists is seen after the miss TTL', async () => {
+		const t0 = Date.now();
+		const at = vi.spyOn(Date, 'now');
+		try {
+			expect(
+				(await request('/cover.png', { method: 'PROPFIND', headers: { Depth: '0' } })).status,
+			).toBe(404);
+			const afterFirst = tb.filemetasCalls;
+			// t0+5min: past any sane miss TTL. The next probe must re-walk
+			// upstream — files created OUTSIDE this worker (phone app, web
+			// UI) become visible on the same terms as the positive cache's
+			// 60 s staleness contract, not forever.
+			at.mockReturnValue(t0 + 5 * 60_000);
+			expect(
+				(await request('/cover.png', { method: 'PROPFIND', headers: { Depth: '0' } })).status,
+			).toBe(404);
+			expect(tb.filemetasCalls).toBeGreaterThan(afterFirst);
+		} finally {
+			at.mockRestore();
+		}
+	});
+
+	it('evicts the oldest miss entries once META_MAX_ENTRIES is exceeded', async () => {
+		// Seed 2005 miss entries through the same write path the live stat
+		// handler uses (missCacheWrite: expiry sweep + FIFO cap) — mirrors
+		// the metadata cache cap test's shape without HTTP round-trips.
+		const N = 2005;
+		const missErr = { errno: -9 };
+		for (let i = 0; i < N; i += 1) metaMissCacheSeedForTest(`/capmiss-${i}.txt`, missErr);
+		expect(metaMissCacheSize()).toBeLessThanOrEqual(2000);
+		// 2005 inserts, cap 2000: the first five were FIFO-evicted during
+		// seeding; the oldest survivor is capmiss-5, the newest survives.
+		expect(metaMissCacheHasForTest('/capmiss-0.txt')).toBe(false);
+		expect(metaMissCacheHasForTest('/capmiss-4.txt')).toBe(false);
+		expect(metaMissCacheHasForTest('/capmiss-5.txt')).toBe(true);
+		expect(metaMissCacheHasForTest(`/capmiss-${N - 1}.txt`)).toBe(true);
 	});
 });
 
