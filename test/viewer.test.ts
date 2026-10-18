@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { contentTypeFor, resetDavVolatileState } from '../src/webdav';
 import { resetTeraboxCaches } from '../src/terabox';
 import { VIEWER_HTML, VIEWER_MARKER } from '../src/viewer';
+import { createOpenToken, verifyOpenToken } from '../src/login';
 import { AUTH, MockTerabox, ORIGIN, basic, installMock } from './helpers';
 
 let tb: MockTerabox;
@@ -88,17 +89,17 @@ describe('viewer on collection GET (browser) vs 405 (WebDAV clients)', () => {
 		expect(csp).not.toContain('sandbox');
 	});
 
-	it('answers an unauthenticated browser navigation with the sign-in form', async () => {
-		// No Basic prompt any more: a closed tab must not orphan a PUT, and
-		// the form flow issues the HttpOnly cookie that survives restarts.
+	it('answers an unauthenticated browser navigation with the public shell', async () => {
+		// Per-tab sessions: the shell is static and ships no data — the page
+		// signs in through its own card and every real request (listing,
+		// actions, downloads) still 401s without credentials.
 		const res = await SELF.fetch(ORIGIN + '/docs/', { headers: { Accept: BROWSER_ACCEPT } });
 		expect(res.status).toBe(200);
 		expect(res.headers.get('WWW-Authenticate')).toBeNull();
 		const body = await res.text();
-		expect(body).toContain('action="/.dav-login"');
-		expect(body).not.toContain(VIEWER_MARKER);
-		// deep link: after sign-in the user lands where they aimed
-		expect(body).toContain('value="/docs/"');
+		expect(body).toContain(VIEWER_MARKER);
+		expect(body).toContain('id="authov"');
+		expect(body).not.toContain('action="/.dav-login"');
 	});
 
 	it('still 401s an unauthenticated WebDAV method with the RFC7235 challenge', async () => {
@@ -235,64 +236,40 @@ describe('file GETs download as attachments', () => {
 	});
 });
 
-describe('session sign-in form and cookie', () => {
-	// manual: workers fetch has no cookie jar — it would follow the 303 to
-	// the viewer unauthenticated and drop the Set-Cookie off the 303 itself.
-	// Real browsers apply the cookie then land logged in.
+describe('per-tab viewer session (no persisted cookie)', () => {
+	// The credential never becomes a cookie: the page keeps it in
+	// sessionStorage (which dies with the tab), and /.dav-login is only a
+	// validation endpoint the page's own sign-in card posts to. Closing the
+	// tab therefore ends the session — nothing is saved anywhere.
 	const login = (user: string, pass: string, extra: Record<string, string> = {}) =>
 		SELF.fetch(ORIGIN + '/.dav-login', {
 			method: 'POST',
-			redirect: 'manual',
 			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...extra },
-			body: new URLSearchParams({ user, pass, next: '/docs/' }).toString(),
+			body: new URLSearchParams({ user, pass }).toString(),
 		});
 
-	const cookieOf = (res: Response): string => {
-		const m = /davbox_session=([^;]+)/.exec(res.headers.get('Set-Cookie') || '');
-		expect(m, 'session cookie missing').not.toBeNull();
-		return `davbox_session=${m![1]}`;
-	};
-
-	const viewerWith = (cookie: string, path = '/docs/') =>
-		SELF.fetch(ORIGIN + path, { headers: { Cookie: cookie, Accept: BROWSER_ACCEPT } });
-
-	it('accepts the form and answers 303 + hardened session cookie', async () => {
+	it('answers valid credentials with ok JSON and never a cookie', async () => {
 		const res = await login('test', 'pass');
-		expect(res.status).toBe(303);
-		expect(res.headers.get('Location')).toBe('/docs/');
-		const setCookie = res.headers.get('Set-Cookie') || '';
-		expect(setCookie).toContain('davbox_session=');
-		expect(setCookie).toContain('HttpOnly');
-		expect(setCookie).toContain('Secure');
-		expect(setCookie).toContain('SameSite=Strict');
-		expect(setCookie).toContain('Path=/');
-		expect(setCookie).toContain('Max-Age=2592000');
-	});
-
-	it('serves the viewer on the cookie alone (no Authorization header)', async () => {
-		const cookie = cookieOf(await login('test', 'pass'));
-		const res = await viewerWith(cookie);
 		expect(res.status).toBe(200);
-		const body = await res.text();
-		expect(body).toContain(VIEWER_MARKER);
-		expect(body).toContain('data-session="1"');
-	});
-
-	it('keeps data-session off for Basic-authenticated clients', async () => {
-		const body = await (await request('/docs/', { headers: { Accept: BROWSER_ACCEPT } })).text();
-		expect(body).toMatch(/<body[^>]*\bdata-session=""/);
-		expect(body).not.toMatch(/<body[^>]*\bdata-session="1"/);
-		// sign-out is a browser thing: hide it from the pure-Basic page
-		expect(body).toContain('id="signout"');
-	});
-
-	it('rejects a wrong password with the form and no cookie', async () => {
-		const res = await login('test', 'wrong-password');
-		expect(res.status).toBe(200);
-		const body = await res.text();
-		expect(body).toContain('Wrong user or password.');
+		expect(res.headers.get('Content-Type')).toContain('application/json');
+		expect(res.headers.get('Cache-Control')).toBe('no-store');
+		expect(await res.json()).toEqual({ ok: true });
 		expect(res.headers.get('Set-Cookie')).toBeNull();
+	});
+
+	it('rejects a wrong password with 401 JSON and no Basic prompt', async () => {
+		const res = await login('test', 'wrong-password');
+		expect(res.status).toBe(401);
+		const body = (await res.json()) as { error: string };
+		expect(body.error).toContain('Wrong user or password');
+		expect(res.headers.get('Set-Cookie')).toBeNull();
+		// 401 + WWW-Authenticate on a background fetch pops a native Basic
+		// dialog over the page's own sign-in card — keep the challenge off.
 		expect(res.headers.get('WWW-Authenticate')).toBeNull();
+	});
+
+	it('accepts the unicode credential pair', async () => {
+		expect((await login('üser', 'pässword')).status).toBe(200);
 	});
 
 	it('keeps the RFC7235 challenge when wrong Basic IS presented', async () => {
@@ -303,48 +280,41 @@ describe('session sign-in form and cookie', () => {
 		expect(res.headers.get('WWW-Authenticate')).toContain('Basic');
 	});
 
-	it('never opens the page for a forged cookie (html → form, PROPFIND → 401)', async () => {
-		const forged = 'davbox_session=forged.signature';
-		const html = await viewerWith(forged);
+	it('treats a legacy session cookie as inert (shell for HTML, 401 for PROPFIND)', async () => {
+		const html = await SELF.fetch(ORIGIN + '/docs/', {
+			headers: { Cookie: 'davbox_session=forged.signature', Accept: BROWSER_ACCEPT },
+		});
 		expect(html.status).toBe(200);
-		expect(html.headers.get('WWW-Authenticate')).toBeNull();
-		const body = await html.text();
-		expect(body).toContain('action="/.dav-login"');
-		expect(body).not.toContain(VIEWER_MARKER);
+		expect(await html.text()).toContain(VIEWER_MARKER);
 
 		const propfind = await SELF.fetch(ORIGIN + '/docs/', {
 			method: 'PROPFIND',
-			headers: { Cookie: forged, Depth: '1' },
+			headers: { Cookie: 'davbox_session=forged.signature', Depth: '1' },
 		});
 		expect(propfind.status).toBe(401);
 		expect(propfind.headers.get('WWW-Authenticate')).toContain('Basic');
 	});
 
-	it('survives a session for the unicode test user', async () => {
-		const res = await login('üser', 'pässword');
-		expect(res.status).toBe(303);
-		const body = await (await viewerWith(cookieOf(res))).text();
-		expect(body).toContain(VIEWER_MARKER);
+	it('keeps the shell off the reserved dot-paths', async () => {
+		// /.dav-login and /.dav-logout are pre-gate endpoints (GETs answer
+		// 405 below); /.dav-sign sits inside the gate, so an
+		// unauthenticated GET at it is probing → the RFC 7235 challenge.
+		const res = await SELF.fetch(ORIGIN + '/.dav-sign', { headers: { Accept: BROWSER_ACCEPT } });
+		expect(res.status).toBe(401);
+		expect(res.headers.get('WWW-Authenticate')).toContain('Basic');
 	});
 
-	it('logs out with a Referer fallback and clears the cookie', async () => {
-		const cookie = cookieOf(await login('test', 'pass'));
+	it('logs out: clears a legacy cookie and redirects home', async () => {
 		const res = await SELF.fetch(ORIGIN + '/.dav-logout', {
 			method: 'POST',
 			redirect: 'manual',
-			headers: { Cookie: cookie, Referer: ORIGIN + '/docs/', 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: { Cookie: 'davbox_session=old.token', Referer: ORIGIN + '/docs/', 'Content-Type': 'application/x-www-form-urlencoded' },
 			body: '',
 		});
 		expect(res.status).toBe(303);
 		expect(res.headers.get('Location')).toBe('/docs/');
 		expect(res.headers.get('Set-Cookie')).toContain('davbox_session=;');
 		expect(res.headers.get('Set-Cookie')).toContain('Max-Age=0');
-		// The token is stateless — what makes logout real is the browser
-		// dropping the cookie. Post-logout state = no cookie on the request.
-		const after = await SELF.fetch(ORIGIN + '/docs/', { headers: { Accept: BROWSER_ACCEPT } });
-		const body = await after.text();
-		expect(body).toContain('action="/.dav-login"');
-		expect(body).not.toContain(VIEWER_MARKER);
 	});
 
 	it('is idempotent: logout without a session still redirects cleanly', async () => {
@@ -367,19 +337,84 @@ describe('session sign-in form and cookie', () => {
 	it('keeps the endpoints POST-only', async () => {
 		for (const path of ['/.dav-login', '/.dav-logout']) {
 			const res = await SELF.fetch(ORIGIN + path);
-			expect(res.status).toBe(405);
+			expect(res.status, path).toBe(405);
 			expect(res.headers.get('Allow')).toBe('POST');
 		}
+		// /.dav-sign is inside the gate: unauthenticated → 401 (pinned
+		// above), authenticated-only clients may probe it → 405 here.
+		const res = await SELF.fetch(ORIGIN + '/.dav-sign', { headers: { ...AUTH } });
+		expect(res.status).toBe(405);
+		expect(res.headers.get('Allow')).toBe('POST');
+	});
+});
+
+describe('open tokens (signed 60 s download links)', () => {
+	// A file open/download is a real navigation — it cannot carry
+	// sessionStorage credentials. The page mints a short-lived signed URL
+	// and navigates to that: stateless HMAC, bound to the exact decoded
+	// path, GET/HEAD only, one minute to live.
+	const USERS = 'test:pass,üser:pässword';
+	const sign = (path: string) =>
+		SELF.fetch(ORIGIN + '/.dav-sign', {
+			method: 'POST',
+			headers: { ...AUTH, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path }),
+		});
+
+	it('mints and verifies a token bound to the exact decoded path', async () => {
+		const t = await createOpenToken(USERS, '/docs/readme.md', 1000);
+		expect(await verifyOpenToken(USERS, '/docs/readme.md', t, 1059)).toBe(true);
+		expect(await verifyOpenToken(USERS, '/docs/other.md', t, 1000)).toBe(false);
+		expect(await verifyOpenToken(USERS, '/docs/readme.md', t, 1060)).toBe(false);
 	});
 
-	it('sanitizes an open redirect in next', async () => {
-		const res = await SELF.fetch(ORIGIN + '/.dav-login', {
+	it('rejects forged and malformed tokens', async () => {
+		const t = await createOpenToken(USERS, '/docs/readme.md', 1000);
+		expect(await verifyOpenToken('other:key', '/docs/readme.md', t, 1000)).toBe(false);
+		expect(await verifyOpenToken(USERS, '/docs/readme.md', 'nope', 1000)).toBe(false);
+		expect(await verifyOpenToken(USERS, '/docs/readme.md', 'a.b.c', 1000)).toBe(false);
+		expect(await verifyOpenToken(USERS, '/docs/readme.md', '', 1000)).toBe(false);
+	});
+
+	it('signs for an authenticated client and the URL opens with no other credentials', async () => {
+		const res = await sign('/docs/readme.md');
+		expect(res.status).toBe(200);
+		const { url, ttl } = (await res.json()) as { url: string; ttl: number };
+		expect(ttl).toBe(60);
+		expect(url).toMatch(/^\/docs\/readme\.md\?ot=/);
+		const dl = await SELF.fetch(ORIGIN + url);
+		expect(dl.status).toBe(200);
+		expect(await dl.text()).toBe('# hi\n');
+	});
+
+	it('401s a forged token with the RFC 7235 challenge', async () => {
+		const res = await SELF.fetch(ORIGIN + '/docs/readme.md?ot=forged.sig');
+		expect(res.status).toBe(401);
+		expect(res.headers.get('WWW-Authenticate')).toContain('Basic');
+	});
+
+	it('refuses state-changing methods even with a valid token', async () => {
+		const { url } = (await (await sign('/docs/readme.md')).json()) as { url: string };
+		const put = await SELF.fetch(ORIGIN + url, { method: 'PUT', body: 'overwrite' });
+		expect(put.status).toBe(401);
+		const del = await SELF.fetch(ORIGIN + url, { method: 'DELETE' });
+		expect(del.status).toBe(401);
+	});
+
+	it('refuses signing without credentials', async () => {
+		const res = await SELF.fetch(ORIGIN + '/.dav-sign', {
 			method: 'POST',
-			redirect: 'manual',
-			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-			body: new URLSearchParams({ user: 'test', pass: 'pass', next: '//evil.example/x' }).toString(),
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/docs/readme.md' }),
 		});
-		expect(res.status).toBe(303);
-		expect(res.headers.get('Location')).toBe('/');
+		expect(res.status).toBe(401);
+		expect(res.headers.get('WWW-Authenticate')).toContain('Basic');
+	});
+
+	it('rejects traversal, escapes and junk in sign paths', async () => {
+		for (const p of ['../etc', 'http://evil/x', '/docs/../secret', '', 'docs/x', '/docs//x', '/docs/x?y', '/docs/x#z']) {
+			const res = await sign(p);
+			expect(res.status, JSON.stringify(p)).toBe(400);
+		}
 	});
 });

@@ -1,16 +1,13 @@
 import { TeraboxClient, TeraboxError, errIsNum } from './terabox';
 import { errorResponse, handleWebDav } from './webdav';
 import { createDavStore, DavState } from './davstate';
-import { wantsViewer } from './viewer';
+import { viewerResponse, wantsViewer } from './viewer';
 import {
   crossSitePost,
-  createSessionToken,
-  loginPageResponse,
+  createOpenToken,
   sanitizeNext,
   sessionClearCookie,
-  sessionCookieValue,
-  sessionSetCookie,
-  sessionUsername,
+  verifyOpenToken,
 } from './login';
 import type { Env } from './types';
 
@@ -196,31 +193,47 @@ const worker: ExportedHandler<Env> = {
       return withSecurityHeaders(await handleSessionEndpoint(request, url.pathname, env, configuredCreds));
     }
 
-    // Basic first (WebDAV clients and scripts send it on every request),
-    // then the browser session cookie. Fail closed for every method,
-    // CORS preflight included: a preflight branch that answered 204
-    // without credentials was both an auth bypass on an otherwise
-    // airtight surface and a config-state oracle — and it emitted no
-    // Access-Control-Allow-* headers anyway, so it never enabled
-    // cross-origin use in the first place.
+    // Basic first (WebDAV clients and scripts send it on every request).
+    // Fail closed for every method, CORS preflight included: a preflight
+    // branch that answered 204 without credentials was both an auth bypass
+    // on an otherwise airtight surface and a config-state oracle — and it
+    // emitted no Access-Control-Allow-* headers anyway, so it never
+    // enabled cross-origin use in the first place.
     const basicOk = validBasicAuth(request, env);
-    let sessionUser: string | null = null;
+    let otOk = false;
     if (!basicOk) {
-      const token = sessionCookieValue(request);
-      if (token) sessionUser = await sessionUsername(token, env.USERS as string, configuredCreds);
+      // A `?ot=` download token authenticates GET/HEAD on its exact path:
+      // it is how the viewer opens/downloads files without any cookie.
+      const ot = url.searchParams.get('ot');
+      if (ot && (request.method === 'GET' || request.method === 'HEAD')) {
+        try {
+          otOk = await verifyOpenToken(env.USERS as string, decodeURIComponent(url.pathname), ot);
+        } catch {
+          otOk = false; // malformed %-escapes in the pathname
+        }
+      }
     }
-    if (!basicOk && sessionUser === null) {
+    if (!basicOk && !otOk) {
       // A browser page navigation with no credentials at all gets the
-      // sign-in form: Basic prompts aren't reliably cached (close the tab,
-      // the prompt returns — and a PUT without credentials fails as a bare
-      // network error). Anything that *presented* Basic keeps the RFC 7235
-      // challenge; so does every non-browser method.
+      // viewer shell: per-tab sessions keep the credential in
+      // sessionStorage (closing the tab ends them), so the shell is
+      // public — it is static and ships no data; every real request still
+      // 401s below, where the page shows its own sign-in card. Anything
+      // that *presented* Basic keeps the RFC 7235 challenge; so does every
+      // non-browser method and the reserved dot-paths (a credential-less
+      // fetch at a control path is probing, not browsing).
       const presentedBasic =
         (request.headers.get('Authorization') || '').slice(0, 6).toLowerCase() === 'basic ';
-      if (!presentedBasic && wantsViewer(request)) {
-        return withSecurityHeaders(loginPageResponse(url.pathname));
+      if (!presentedBasic && wantsViewer(request) && !url.pathname.startsWith('/.')) {
+        return withSecurityHeaders(viewerResponse(env.PATH || ''));
       }
       return withSecurityHeaders(errorResponse('Unauthorized', 401, undefined, WWW_AUTHENTICATE));
+    }
+
+    // The sign minter lives inside the gate: it never touches Terabox and
+    // must never answer a caller with no credentials of its own.
+    if (url.pathname === '/.dav-sign') {
+      return withSecurityHeaders(await handleSign(request, env));
     }
 
     const client = new TeraboxClient(env.COOKIE, env.TERABOX_DOMAIN, {
@@ -239,7 +252,7 @@ const worker: ExportedHandler<Env> = {
       const response = await handleWebDav(
         request,
         client,
-        { basePath: env.PATH, rootId: env.ROOT_ID, sessionAuthed: sessionUser !== null },
+        { basePath: env.PATH, rootId: env.ROOT_ID },
         createDavStore(env),
       );
       const elapsed = Date.now() - started;
@@ -323,10 +336,14 @@ async function readFormBody(request: Request): Promise<string | null> {
 }
 
 /**
- * `POST /.dav-login` validates the form and answers 303 + session cookie;
- * `POST /.dav-logout` clears it (idempotent — an absent cookie still
- * gets a clean redirect). Both are POST-only and cross-site-post
- * resistant; neither ever touches Terabox.
+ * `POST /.dav-login` validates credentials for the page's sign-in card —
+ * ok JSON on a hit, 401 JSON on a miss (never a challenge: a
+ * WWW-Authenticate here would pop a native Basic dialog over the card).
+ * `POST /.dav-logout` clears any legacy session cookie and redirects
+ * (idempotent — an absent cookie still gets a clean redirect). Neither
+ * ever issues the session cookie any more: the browser keeps the
+ * per-tab credential in sessionStorage instead. Both are POST-only,
+ * cross-site-post resistant, and never touch Terabox.
  */
 async function handleSessionEndpoint(
   request: Request,
@@ -343,43 +360,89 @@ async function handleSessionEndpoint(
   const body = await readFormBody(request);
   if (body === null) return errorResponse('Payload Too Large', 413);
   const params = new URLSearchParams(body);
-  let next = sanitizeNext(params.get('next'));
 
-  if (pathname === '/.dav-logout') {
-    // The sign-out form ships an empty next on purpose (the page URL is
-    // dynamic): fall back to the same-origin Referer so the redirect
-    // lands back on the collection the user was viewing.
-    if (!next) {
-      const referer = request.headers.get('Referer');
-      if (referer) {
-        try {
-          const ref = new URL(referer);
-          if (ref.origin === new URL(request.url).origin) next = ref.pathname + ref.search;
-        } catch {
-          // malformed referer — use the root below
-        }
+  if (pathname === '/.dav-login') {
+    const username = params.get('user') ?? '';
+    const password = params.get('pass') ?? '';
+    if (credsMatch(creds, username, password)) {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    }
+    // Same branchless compare as Basic, plus a floor on guessing speed.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return new Response(JSON.stringify({ error: 'Wrong user or password.' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  // Legacy-cookie wipe. The sign-out button ships an empty next on
+  // purpose (the page URL is dynamic): fall back to the same-origin
+  // Referer so the redirect lands back on the collection being viewed.
+  let next = sanitizeNext(params.get('next'));
+  if (!next) {
+    const referer = request.headers.get('Referer');
+    if (referer) {
+      try {
+        const ref = new URL(referer);
+        if (ref.origin === new URL(request.url).origin) next = ref.pathname + ref.search;
+      } catch {
+        // malformed referer — use the root below
       }
     }
-    next = next || '/';
-    return new Response(null, {
-      status: 303,
-      headers: { Location: next, 'Set-Cookie': sessionClearCookie(), 'Cache-Control': 'no-store' },
-    });
   }
-
   next = next || '/';
-  const username = params.get('user') ?? '';
-  const password = params.get('pass') ?? '';
-  if (credsMatch(creds, username, password)) {
-    const token = await createSessionToken(username, env.USERS as string);
-    return new Response(null, {
-      status: 303,
-      headers: { Location: next, 'Set-Cookie': sessionSetCookie(token), 'Cache-Control': 'no-store' },
-    });
+  return new Response(null, {
+    status: 303,
+    headers: { Location: next, 'Set-Cookie': sessionClearCookie(), 'Cache-Control': 'no-store' },
+  });
+}
+
+/**
+ * `POST /.dav-sign` mints a 60 s download token for an exact path. The
+ * caller presents Basic (the viewer's sessionStorage credential); the
+ * result is a URL the browser can navigate to without any headers at
+ * all. The token binds the DECODED path so benign %-escape
+ * normalization by the browser on the way back out cannot mismatch it.
+ */
+async function handleSign(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') {
+    return errorResponse('Method Not Allowed', 405, undefined, { Allow: 'POST' });
   }
-  // Same branchless compare as Basic, plus a floor on guessing speed.
-  await new Promise((resolve) => setTimeout(resolve, 400));
-  return loginPageResponse(next, 'Wrong user or password.', username);
+  const body = await readFormBody(request);
+  if (body === null) return errorResponse('Payload Too Large', 413);
+  let parsed: { path?: unknown };
+  try {
+    parsed = JSON.parse(body) as { path?: unknown };
+  } catch {
+    return errorResponse('Bad Request', 400);
+  }
+  const raw = typeof parsed.path === 'string' ? parsed.path : null;
+  if (!raw || !raw.startsWith('/') || raw.includes('\\') || raw.includes('?') || raw.includes('#')) {
+    return errorResponse('Bad Request', 400);
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return errorResponse('Bad Request', 400);
+  }
+  // Traversal can never be signed: any '..' segment is refused, and empty
+  // interior segments (`//`) are malformed. One trailing empty segment is
+  // just the folder-marker slash — signable, harmless.
+  const segs = decoded.split('/');
+  if (segs.length > 1 && segs[segs.length - 1] === '') segs.pop();
+  if (segs.includes('..') || segs.slice(1).includes('')) {
+    return errorResponse('Bad Request', 400);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const token = await createOpenToken(env.USERS as string, decoded, now);
+  return new Response(JSON.stringify({ url: `${raw}?ot=${token}`, ttl: 60 }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
 }
 
 // RFC 7235 §3.1: a 401 must carry the challenge on EVERY code path.

@@ -843,6 +843,41 @@ tier's larger premium buckets: fewer, larger parts, and CPU headroom.
   deployments list` (davbox lives in the `tes1ing` account; three accounts
   share the token).
 
+## Campaign 9 — per-tab viewer sessions: closing the tab signs out (2026-10-18)
+
+The user requirement: **whenever this tab closes, the session must end — no
+saved cookie, ever.** Campaign 7's HttpOnly cookie (`davbox_session`,
+`Max-Age=30d`) was the direct opposite, so the browser auth model is replaced:
+
+- **The credential lives in `sessionStorage`** (`davbox_auth` = the Basic
+  header value), which the browser destroys with the tab. Reload (F5) keeps
+  working in place; a new tab or middle-click signs in again — that IS the
+  requirement. The server never issues a session cookie any more; legacy
+  cookies are inert (the gate ignores them) and the sign-out button still
+  wipes them via `/.dav-logout`.
+- **The viewer shell is served without auth** (static, ships no data): an
+  unauthenticated browser navigation gets the page, which opens an in-page
+  sign-in card (`#authov`); everything real still 401s without the
+  credential. Reserved dot-paths keep the bare 401 challenge.
+- **Folder navigation is JS-driven** (`history.pushState` + re-render): a
+  folder click can no longer be a full page load, because such a load could
+  never carry a per-tab credential. Breadcrumbs, name links, row clicks and
+  the sheet's Open all route through it; `popstate` re-lists on
+  Back/Forward.
+- **File opens/downloads mint a 60 s signed URL** (`POST /.dav-sign` →
+  `?ot=<token>`): a navigation-grade request cannot carry sessionStorage, so
+  the page signs the decoded path first — a stateless HMAC over the raw
+  USERS string, bound to the exact path, GET/HEAD only, verified at the
+  gate. A copied link works for a minute, then 401s.
+- WebDAV clients (mpv/gvfs/rclone) unchanged: per-request Basic.
+- `src/login.ts` shrank to the sign minter + logout clear + form-hardening
+  helpers (the login page HTML and session-mint code are gone); the viewer
+  gained the card, the nav and the sign flow (bundle 219 → 224 KiB).
+- Pins (suite 425/425): JSON login (ok / 401-without-challenge / unicode),
+  inert legacy cookie, public shell, reserved-path 401, token
+  mint/verify (path-bound, 60 s expiry, forgery, PUT/DELETE-with-token
+  refusal, sign-path traversal/junk 400s), POST-only contracts.
+
 ## Repo map (context for AI sessions)
 
 Branch state (2026-10-17, post Campaign 8 — premium limits + the free-plan chunk cap; deploy target is `davbox` in the `tes1ing` account via the Workers Builds git integration, hence `https://davbox.tes1ing.workers.dev/dav/` and creds `test:test`):

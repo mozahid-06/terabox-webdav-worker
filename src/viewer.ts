@@ -74,13 +74,15 @@ export function wantsViewer(request: Request): boolean {
  * page needs it to render a home crumb that always points at the WebDAV
  * root; it cannot derive that from location.pathname alone (the first
  * segment is the base only when a base exists).
+ *
+ * The shell is served without authentication these days: sessions are
+ * per-tab (sessionStorage), so the document itself is public — it is
+ * static and ships no data; every real request 401s without the
+ * credential and the page shows its own sign-in card.
  */
-export function viewerResponse(basePath: string, viaSession = false): Response {
+export function viewerResponse(basePath: string): Response {
   const escaped = basePath.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
-  const html = VIEWER_HTML.replace('data-base=""', `data-base="${escaped}"`).replace(
-    'data-session=""',
-    viaSession ? 'data-session="1"' : 'data-session=""',
-  );
+  const html = VIEWER_HTML.replace('data-base=""', `data-base="${escaped}"`);
   return new Response(html, {
     status: 200,
     headers: {
@@ -139,10 +141,74 @@ body {
   flex-direction: column;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-/* Sign-out is a real form (no JS); it only shows for cookie sessions —
-   a Basic-authenticated script user has nothing to sign out of. */
+/* Sign-out is a page button: the per-tab credential lives in
+   sessionStorage, so the page reveals it only when it actually holds
+   credentials — a Basic client has nothing to sign out of. */
 #signout { display: flex; margin: 0; margin-left: auto; }
-body:not([data-session="1"]) #signout { display: none; }
+#signout[hidden] { display: none; }
+
+/* Per-tab sign-in card. The shell is public; the data is not. */
+#authov {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: none;
+  place-items: center;
+  padding: 20px;
+  background: color-mix(in srgb, var(--void) 78%, transparent);
+}
+#authov:not([hidden]) { display: grid; }
+#authform {
+  width: min(330px, 100%);
+  background: var(--petrol);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--brass);
+  border-radius: 12px;
+  padding: 26px 24px 24px;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.5);
+  animation: authIn 260ms var(--ease-out);
+}
+@keyframes authIn { from { opacity: 0; transform: translateY(14px) scale(.97); } }
+#authform h1 { margin: 0 0 14px; font-size: 20px; font-weight: 600; letter-spacing: -0.015em; }
+#authform h1 .dot { color: var(--brass); }
+#authform label { display: block; margin-bottom: 13px; font-size: 12.5px; color: var(--fog); }
+#authform input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--void);
+  color: var(--paper);
+  font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  transition: border-color 120ms ease;
+}
+#authform input:focus { outline: 2px solid var(--brass); outline-offset: 1px; border-color: var(--brass); }
+#authform button {
+  width: 100%;
+  margin-top: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--brass);
+  border-radius: 8px;
+  background: var(--brass);
+  color: var(--brass-ink);
+  font: 600 14px ui-sans-serif, system-ui, sans-serif;
+  cursor: pointer;
+  transition: filter 120ms ease;
+}
+#authform button:hover { filter: brightness(1.07); }
+#authform button:active { filter: brightness(0.93); }
+#authform button:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+#autherr {
+  margin: 0 0 14px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--coral) 45%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--coral) 10%, var(--void));
+  color: #F2A08D;
+  font-size: 13px;
+}
 
 /* Path line — the signature: the current location, brass, in mono. */
 .top {
@@ -433,7 +499,7 @@ body.uploading main { padding-bottom: 68px; }
 @media (max-width: 640px) {
   .top { padding: 10px 12px; gap: 8px; }
   #upload { display: none; }
-  #mkdir, #refresh, #signout button {
+  #mkdir, #refresh, #signout {
     width: 34px; height: 34px;
     padding: 0;
     border-radius: 50%;
@@ -450,7 +516,7 @@ body.uploading main { padding-bottom: 68px; }
   #refresh {
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23E6F0EE' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.2 8a5.2 5.2 0 1 1-1.6-3.75'/%3E%3Cpath d='M13.4 1.8v2.6h-2.6'/%3E%3C/svg%3E");
   }
-  #signout button {
+  #signout {
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23E6F0EE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 2.5h5a.8.8 0 0 1 .8.8v9.4a.8.8 0 0 1-.8.8h-5'/%3E%3Cpath d='M2.5 8h6.2M6.5 5.8 8.7 8l-2.2 2.2'/%3E%3C/svg%3E");
   }
 
@@ -592,20 +658,18 @@ body.sheeton .sheet { transform: none; }
   tbody tr, .row-actions, .name .ic-dir, .name a, .upchip, .sheet, .scrim, .mmore, .sbtn { transition: none !important; }
   body.dropping main::before { animation: none !important; }
   .pline.indet i { animation: none; }
+  #authform { animation: none !important; }
 }
 </style>
 </head>
-<body data-viewer="1" data-base="" data-session="">
+<body data-viewer="1" data-base="">
 <header class="top">
   <nav id="crumbs" class="mono" aria-label="Path"></nav>
   <button id="upload" class="primary">Upload files</button>
   <span id="upchip" class="upchip" hidden><em><i></i></em><span class="pct"></span></span>
   <button id="mkdir" aria-label="New folder">New folder</button>
   <button id="refresh" aria-label="Refresh listing">Refresh</button>
-  <form id="signout" method="post" action="/.dav-logout">
-    <input type="hidden" name="next" value="">
-    <button type="submit">Sign out</button>
-  </form>
+  <button id="signout" type="button" hidden>Sign out</button>
   <input id="picker" type="file" multiple hidden>
 </header>
 <main>
@@ -634,6 +698,15 @@ body.sheeton .sheet { transform: none; }
   <button class="sbtn danger" id="sheetDel" type="button"><span class="si"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.75 4.5h10.5M6.25 4.5v-.9a.9.9 0 0 1 .9-.9h1.7a.9.9 0 0 1 .9.9v.9M4.4 4.5l.55 8.2A1.15 1.15 0 0 0 6.09 13.75h3.82a1.15 1.15 0 0 0 1.14-1.05l.55-8.2M6.6 7v4.4M9.4 7v4.4"/></svg></span>Delete</button>
   <button class="scancel" id="sheetCancel" type="button">Cancel</button>
 </div>
+<div id="authov" hidden>
+  <form id="authform" autocomplete="on">
+    <h1>davbox<span class="dot">.</span></h1>
+    <p id="autherr" hidden></p>
+    <label>User <input id="authuser" name="user" autocomplete="username" required></label>
+    <label>Password <input id="authpass" name="pass" type="password" autocomplete="current-password" required></label>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
 <div id="uploads" class="uploads" aria-live="polite"></div>
 <script>
 (function () {
@@ -643,6 +716,30 @@ body.sheeton .sheet { transform: none; }
   // a protocol-relative (cross-origin) URL.
   var base = location.pathname.replace(/^\\/+/, '/');
   if (base.charAt(base.length - 1) !== '/') base += '/';
+
+  // Per-tab credential: sessionStorage dies with the tab — closing it
+  // signs out, and nothing is saved anywhere. The server keeps no cookie
+  // for the page; WebDAV clients still send Basic on every request.
+  var AUTH_KEY = 'davbox_auth';
+  var AUTH = null;
+  try { AUTH = sessionStorage.getItem(AUTH_KEY); } catch (e) {}
+
+  // Every data call rides the stored credential; a 401 opens the
+  // sign-in card instead of a dead-end error.
+  function api(url, opts) {
+    opts = opts || {};
+    if (AUTH) {
+      var h = {};
+      if (opts.headers) {
+        for (var k in opts.headers) {
+          if (Object.prototype.hasOwnProperty.call(opts.headers, k)) h[k] = opts.headers[k];
+        }
+      }
+      h['Authorization'] = AUTH;
+      opts = Object.assign({}, opts, { headers: h });
+    }
+    return fetch(url, opts);
+  }
 
   var PROPFIND_BODY =
     '<?xml version="1.0" encoding="utf-8"?>' +
@@ -887,6 +984,7 @@ body.sheeton .sheet { transform: none; }
     tr.className = 'up';
     tr.style.setProperty('--i', '0');
     tr.setAttribute('data-href', base.slice(0, base.lastIndexOf('/', base.length - 2) + 1));
+    tr.setAttribute('data-dir', '1');
     var tdName = document.createElement('td');
     tdName.className = 'nm';
     var wrap = el('div', 'name');
@@ -961,6 +1059,7 @@ body.sheeton .sheet { transform: none; }
     tdName.appendChild(wrap);
     tr.appendChild(tdName);
     tr.setAttribute('data-href', link.href);
+    if (entry.isDir) tr.setAttribute('data-dir', '1');
 
     var tdSize = el('td', 'num size mono', entry.isDir ? '—' : fmtSize(entry.size));
     tr.appendChild(tdSize);
@@ -980,7 +1079,13 @@ body.sheeton .sheet { transform: none; }
     dl.title = 'Download ' + entry.name;
     dl.setAttribute('aria-label', 'Download ' + entry.name);
     dl.appendChild(svg(ICON_DLO));
-    dl.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    // A plain navigation to href can't carry the per-tab credential: sign
+    // it first, like every other file open.
+    dl.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      signAndOpen(entry.href);
+    });
     acts.appendChild(dl);
 
     var ren = document.createElement('button');
@@ -1049,6 +1154,7 @@ body.sheeton .sheet { transform: none; }
     return new Promise(function (resolve) {
       var xhr = new XMLHttpRequest();
       xhr.open(opts.method || 'PUT', url);
+      if (AUTH) xhr.setRequestHeader('Authorization', AUTH);
       if (opts.headers) {
         for (var key in opts.headers) {
           if (Object.prototype.hasOwnProperty.call(opts.headers, key)) {
@@ -1239,10 +1345,11 @@ body.sheeton .sheet { transform: none; }
     }
     var line = statusLine(entry.name, '', 'renaming…');
     var dest = new URL(base + encodeURIComponent(next), location.origin).toString();
-    fetch(entry.href, {
+    api(entry.href, {
       method: 'MOVE',
       headers: { Destination: dest, Overwrite: 'F' },
     }).then(function (res) {
+      if (res.status === 401) { needAuth(); throw new Error('sign in to continue'); }
       if (res.status === 412) throw new Error('a file with that name already exists');
       if (res.status === 409) throw new Error('folder missing or conflict');
       if (!res.ok) throw new Error('failed with HTTP ' + res.status);
@@ -1258,7 +1365,8 @@ body.sheeton .sheet { transform: none; }
   function deleteEntry(entry) {
     if (!window.confirm('Delete ' + entry.name + (entry.isDir ? ' and everything inside it' : '') + '?')) return;
     var line = statusLine(entry.name, '', 'deleting…');
-    fetch(entry.href, { method: 'DELETE' }).then(function (res) {
+    api(entry.href, { method: 'DELETE' }).then(function (res) {
+      if (res.status === 401) { needAuth(); throw new Error('sign in to continue'); }
       if (res.status === 409) throw new Error('locked or not empty — check LOCKs');
       if (!res.ok && res.status !== 204) throw new Error('failed with HTTP ' + res.status);
       line.className = 'ok';
@@ -1280,7 +1388,8 @@ body.sheeton .sheet { transform: none; }
       return;
     }
     var line = statusLine(name, '', 'creating…');
-    fetch(base + encodeURIComponent(name), { method: 'MKCOL' }).then(function (res) {
+    api(base + encodeURIComponent(name), { method: 'MKCOL' }).then(function (res) {
+      if (res.status === 401) { needAuth(); throw new Error('sign in to continue'); }
       if (res.status === 405) throw new Error('that name is taken (405)');
       if (res.status === 409) throw new Error('parent folder missing (409)');
       if (!res.ok && res.status !== 201) throw new Error('failed with HTTP ' + res.status);
@@ -1310,11 +1419,54 @@ body.sheeton .sheet { transform: none; }
     picker.value = '';
   });
 
-  // ===== Full-row activation + bottom action sheet =====
-  // Clicking anywhere in a row does what clicking the name would (folders
-  // navigate, files open); the name link, download link and sheet button keep
-  // their native/own behavior, and an in-progress text selection is never
-  // hijacked.
+  // ===== Per-tab navigation + full-row activation + action sheet =====
+  // Folders stay inside this document (a full page load could never
+  // re-authenticate with a sessionStorage credential); files mint a
+  // one-minute signed URL and navigate to it. The name link and the
+  // sheet buttons route through the same two paths, and an in-progress
+  // text selection is never hijacked.
+
+  function navTo(href) {
+    var u = new URL(href, location);
+    base = u.pathname.replace(/^\\/+/, '/');
+    if (base.charAt(base.length - 1) !== '/') base += '/';
+    history.pushState(null, '', base);
+    load();
+  }
+
+  function signAndOpen(href) {
+    // The browser asks for files as a plain navigation, which can never
+    // carry the per-tab credential — get a 60 s signed URL first.
+    var path = new URL(href, location).pathname;
+    api('/.dav-sign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: path }),
+    }).then(function (res) {
+      if (res.status === 401) { needAuth(); return; }
+      if (!res.ok) throw new Error('could not open — HTTP ' + res.status);
+      return res.json();
+    }).then(function (info) {
+      if (info && info.url) window.location.href = info.url;
+    }).catch(function (err) {
+      showError(err && err.message ? err.message : 'could not open');
+    });
+  }
+
+  window.addEventListener('popstate', function () {
+    base = location.pathname.replace(/^\\/+/, '/');
+    if (base.charAt(base.length - 1) !== '/') base += '/';
+    load();
+  });
+
+  crumbs.addEventListener('click', function (ev) {
+    var a = ev.target.closest('a');
+    if (!a) return;
+    if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    ev.preventDefault();
+    navTo(a.getAttribute('href'));
+  });
+
   var sheetOpenBtn = document.getElementById('sheetOpen');
   var sheetDl = document.getElementById('sheetDl');
   var sheetRenBtn = document.getElementById('sheetRen');
@@ -1349,20 +1501,31 @@ body.sheeton .sheet { transform: none; }
       return;
     }
     if (lpFired) { lpFired = false; return; }
-    if (ev.target.closest('a, button')) return;
+    var link = ev.target.closest('a');
+    if (ev.target.closest('button') || (link && link.closest('.row-actions'))) return;
     if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
     var sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;
-    var href = tr.getAttribute('data-href');
-    if (href) window.location.href = href;
+    var href = link ? link.getAttribute('href') : tr.getAttribute('data-href');
+    if (!href) return;
+    ev.preventDefault();
+    if (tr.getAttribute('data-dir') === '1') navTo(href);
+    else signAndOpen(href);
   });
 
   sheetOpenBtn.addEventListener('click', function () {
     if (!currentEntry) return;
-    var slash = currentEntry.isDir && currentEntry.href.charAt(currentEntry.href.length - 1) !== '/' ? '/' : '';
-    window.location.href = currentEntry.href + slash;
+    var href = currentEntry.href;
+    if (currentEntry.isDir && href.charAt(href.length - 1) !== '/') href += '/';
+    closeSheet();
+    if (currentEntry.isDir) navTo(href);
+    else signAndOpen(href);
   });
-  sheetDl.addEventListener('click', function () { closeSheet(); });
+  sheetDl.addEventListener('click', function (ev) {
+    ev.preventDefault();
+    closeSheet();
+    if (currentEntry) signAndOpen(currentEntry.href);
+  });
   sheetRenBtn.addEventListener('click', function () {
     var entry = currentEntry;
     closeSheet();
@@ -1380,7 +1543,7 @@ body.sheeton .sheet { transform: none; }
   });
   document.getElementById('fab').addEventListener('click', function () { picker.click(); });
   document.addEventListener('keydown', function (ev) {
-    if (ev.key === 'Escape') closeSheet();
+    if (ev.key === 'Escape') { closeSheet(); authov.hidden = true; }
   });
 
   // Long-press (touch) and right-click open the sheet on phones only — a
@@ -1440,12 +1603,12 @@ body.sheeton .sheet { transform: none; }
   function load() {
     clearError();
     renderCrumbs();
-    fetch(base, {
+    api(base, {
       method: 'PROPFIND',
       headers: { Depth: '1', 'Content-Type': 'text/xml; charset=utf-8' },
       body: PROPFIND_BODY,
     }).then(function (res) {
-      if (res.status === 401) throw new Error('session expired — reload the page');
+      if (res.status === 401) { needAuth(); throw new Error('sign in to view this folder'); }
       if (res.status === 500) throw new Error('server error — check the worker logs');
       if (!res.ok) throw new Error('listing failed (HTTP ' + res.status + ')');
       return res.text();
@@ -1457,6 +1620,63 @@ body.sheeton .sheet { transform: none; }
       showError(err && err.message ? err.message : 'listing failed');
     });
   }
+
+  // ===== Per-tab sign-in card =====
+  var authov = document.getElementById('authov');
+  var authform = document.getElementById('authform');
+  var authuser = document.getElementById('authuser');
+  var authpass = document.getElementById('authpass');
+  var autherr = document.getElementById('autherr');
+  var signoutBtn = document.getElementById('signout');
+
+  function needAuth() {
+    autherr.hidden = true;
+    authov.hidden = false;
+    try { authuser.focus(); } catch (e) {}
+  }
+
+  // btoa throws on chars > 0xFF: credentials may be unicode ('üser'), so
+  // base64 the UTF-8 bytes (the RFC 7617 charset="UTF-8" form the server
+  // decodes).
+  function b64utf8(s) {
+    var bytes = new TextEncoder().encode(s), bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  authform.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var user = authuser.value;
+    var pass = authpass.value;
+    autherr.hidden = true;
+    api('/.dav-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ user: user, pass: pass }).toString(),
+    }).then(function (res) {
+      if (res.status === 401) throw new Error('Wrong user or password.');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      AUTH = 'Basic ' + b64utf8(user + ':' + pass);
+      try { sessionStorage.setItem(AUTH_KEY, AUTH); } catch (e) {}
+      authov.hidden = true;
+      signoutBtn.hidden = false;
+      load();
+    }).catch(function (err) {
+      autherr.textContent = err && err.message === 'Wrong user or password.'
+        ? err.message
+        : 'Sign-in failed — try again';
+      autherr.hidden = false;
+    });
+  });
+
+  signoutBtn.addEventListener('click', function () {
+    try { sessionStorage.removeItem(AUTH_KEY); } catch (e) {}
+    // also wipe any legacy cookie from the pre-per-tab era
+    try { navigator.sendBeacon('/.dav-logout', ''); } catch (e) {}
+    location.reload();
+  });
+
+  if (AUTH) signoutBtn.hidden = false;
 
   try { document.title = decodeURIComponent(base); } catch (e) { document.title = base; }
   load();

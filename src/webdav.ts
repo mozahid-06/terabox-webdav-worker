@@ -1344,7 +1344,7 @@ function multistatus(
 export async function handleWebDav(
   request: Request,
   client: TeraboxClient,
-  opts?: { basePath?: string; rootId?: string; sessionAuthed?: boolean },
+  opts?: { basePath?: string; rootId?: string },
   store: DavStore & UploadStore = createDavStore({}),
 ): Promise<Response> {
   const mount = makeMount(opts);
@@ -1462,7 +1462,7 @@ export async function handleWebDav(
 
     case 'GET':
     case 'HEAD':
-      return handleGet(request, client, absPath, method === 'HEAD', mountBasePath(mount.base), opts?.sessionAuthed === true);
+      return handleGet(request, client, absPath, method === 'HEAD', mountBasePath(mount.base));
 
     case 'PUT':
       return handlePut(request, client, store, absPath, mount);
@@ -1921,7 +1921,6 @@ async function handleGet(
   absPath: string,
   isHead: boolean,
   basePath = '',
-  sessionAuthed = false,
 ): Promise<Response> {
   let item;
   try {
@@ -1940,7 +1939,7 @@ async function handleGet(
     if (!isHead && wantsViewer(request)) {
       const pathname = new URL(request.url).pathname;
       if (!pathname.endsWith('/')) return viewerRedirect(request);
-      return viewerResponse(basePath, sessionAuthed);
+      return viewerResponse(basePath);
     }
     return errorResponse('Method Not Allowed', 405, undefined, { Allow: ALLOW_HEADER });
   }
